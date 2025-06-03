@@ -1,0 +1,37 @@
+.venv/
+
+
+# Large binary files
+*.mp4
+*.avi
+*.mkv
+*.npy
+*.npz
+*.pt
+*.ckpt
+*.bin
+*.log
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+*.ipynb
+
+# Folders with generated frames or outputs
+frames/
+frames_fixed/
+frames_ok/
+frames_v2/
+outputs/
+overlay/
+image/
+attn_frames/
+attention_heatmaps/
+pigeons_frames/
+
+# Temporary or test folders
+test/
+assets/
+backups.ipynb
+
+# Python cache
+__pycache__/
