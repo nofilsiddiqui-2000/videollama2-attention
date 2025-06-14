@@ -35,3 +35,8 @@ backups.ipynb
 
 # Python cache
 __pycache__/
+vllama-env/
+*.png
+*.tar.gz
+results*/
+attention_frames/
