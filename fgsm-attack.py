@@ -2,7 +2,7 @@
 """
 Adversarial Attention Rollout on Video Frames with CLIP ViT-L/14-336
 
-This script:
+This script :
 1. Loads the pretrained OpenAI CLIP ViT-L/14-336 model (Vision Transformer) via HuggingFace Transformers.
 2. Reads an input video, samples 16 evenly spaced frames.
 3. Applies a Fast Gradient Sign Method (FGSM) adversarial attack to each frame to perturb the image (maximizing classification loss).
