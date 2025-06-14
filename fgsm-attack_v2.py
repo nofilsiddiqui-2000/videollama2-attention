@@ -1,182 +1,194 @@
-import argparse
-import os
-import cv2
+#!/usr/bin/env python3
+"""
+FGSM + ViT-attention rollout on video frames (CLIP ViT-L/14-336) + VideoLLaMA caption
+––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+1. 16 frames are sampled uniformly from the input video.
+2. Untargeted FGSM is applied in *processor space* (after CLIP’s own resize-crop-norm),
+   so the tensor has the expected 577 tokens (1 CLS + 24×24 patches).
+3. For every adversarial frame:
+      • Attention-rollout heat-map is computed and over-laid.
+      • Mean attention “energy” is stored to draw a temporal curve (optional).
+4. All overlays are saved as PNGs **inside `<output_dir>/frames_adv/`**.
+5. An adversarial video (`adversarial.mp4`) is written for quick viewing.
+6. That video is captioned with **VideoLLaMA-2 (7B-16F)** and the caption is written
+   to `--output_caption`.
+"""
+
+import os, cv2, math, argparse, pathlib, warnings, matplotlib
 import numpy as np
-import torch
-from torch.nn import functional as F
+import torch, torch.nn.functional as F
 from transformers import CLIPModel, CLIPProcessor
-import matplotlib.pyplot as plt
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--input_video', type=str, required=True,
-                        help="Path to input video")
-    parser.add_argument('--output_dir', type=str, required=True,
-                        help="Directory to save outputs")
-    parser.add_argument('--epsilon', type=float, required=True,
-                        help="FGSM perturbation magnitude (in [0,1] range)")
-    parser.add_argument('--batch_size', type=int, default=4,
-                        help="Batch size for processing frames")
-    parser.add_argument('--save_curve', action='store_true',
-                        help="Whether to save temporal attention curve")
-    parser.add_argument('--output_caption', type=str, required=True,
-                        help="File to save the VideoLLaMA caption")
-    args = parser.parse_args()
+# ──────────────────────────── helpers ────────────────────────────
+def ensure_dir(p):
+    p = pathlib.Path(p)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Load CLIP model and processor (ViT-L/14-336)
-    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14-336").to(device)
-    model.eval()
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
-    # CLIP normalization parameters
-    clip_mean = torch.tensor(processor.image_processor.image_mean, device=device).view(3,1,1)
-    clip_std  = torch.tensor(processor.image_processor.image_std, device=device).view(3,1,1)
-
-    # Load video and sample 16 evenly spaced frames
-    cap = cv2.VideoCapture(args.input_video)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
-        raise ValueError("Could not read video or no frames found")
-    frame_idxs = np.linspace(0, total_frames-1, 16, dtype=int)
-    frames = []
-    for idx in frame_idxs:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret:
-            raise ValueError(f"Could not read frame {idx}")
-        frames.append(frame)
+def sample_frames(path, num=16):
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise IOError(f"Cannot open {path}")
+    tot = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    idxs = np.linspace(0, tot-1, num, dtype=int)
+    frames, fps = [], cap.get(cv2.CAP_PROP_FPS) or 25
+    for i in idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+        ok, f = cap.read()
+        if ok: frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
     cap.release()
+    if not frames:
+        raise RuntimeError("No frames extracted")
+    return frames, fps
 
-    # Compute original CLIP features for each frame
-    orig_feats = []
-    for frame in frames:
-        # Convert BGR->RGB, to [0,1] tensor
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        x = torch.from_numpy(img_rgb.astype(np.float32)/255.0).permute(2,0,1).to(device)
-        x_norm = (x - clip_mean) / clip_std  # normalize
-        with torch.no_grad():
-            feat = model.get_image_features(pixel_values=x_norm.unsqueeze(0))
-        orig_feats.append(feat.squeeze(0))
+def fgsm_batch(model, px_norm, eps):
+    """
+    px_norm : (B,3,336,336) **requires_grad=True** in CLIP-norm space.
+    Untargeted FGSM that *repels* the features from their clean version.
+    """
+    with torch.no_grad():
+        feat_clean = F.normalize(model.get_image_features(px_norm), dim=-1)
 
-    # FGSM attack: perturb frames to maximize loss (untargeted)
-    adv_frames = []
-    adv_feats = []
-    for frame, orig_feat in zip(frames, orig_feats):
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        x = torch.from_numpy(img_rgb.astype(np.float32)/255.0).permute(2,0,1).to(device)
-        x_norm = (x - clip_mean) / clip_std
-        x_norm_adv = x_norm.clone().detach().unsqueeze(0).requires_grad_(True)
-        # Forward pass
-        feat_adv = model.get_image_features(pixel_values=x_norm_adv)
-        # Loss = - cosine_similarity(orig, adv) to push them apart
-        loss = -F.cosine_similarity(feat_adv, orig_feat.unsqueeze(0)).mean()
-        loss.backward()
-        # FGSM perturbation
-        grad_sign = x_norm_adv.grad.sign()
-        x_norm_adv = x_norm_adv + args.epsilon * grad_sign
-        # Clamp to ensure pixel values stay in [0,1] range after un-normalizing
-        min_norm = (0.0 - clip_mean) / clip_std
-        max_norm = (1.0 - clip_mean) / clip_std
-        # Clamp per channel
-        x_norm_adv[:,0] = torch.clamp(x_norm_adv[:,0], min_norm[0], max_norm[0])
-        x_norm_adv[:,1] = torch.clamp(x_norm_adv[:,1], min_norm[1], max_norm[1])
-        x_norm_adv[:,2] = torch.clamp(x_norm_adv[:,2], min_norm[2], max_norm[2])
-        adv_norm = x_norm_adv.detach().squeeze(0)
-        # Convert back to uint8 image
-        adv_img = (adv_norm * clip_std + clip_mean).permute(1,2,0).cpu().numpy()
-        adv_img = np.clip(adv_img, 0, 1) * 255
-        adv_img = adv_img.astype(np.uint8)
-        adv_frames.append(adv_img)
-        # Compute adversarial CLIP feature
-        with torch.no_grad():
-            adv_feat = model.get_image_features(pixel_values=x_norm_adv)
-        adv_feats.append(adv_feat.squeeze(0))
+    feat_adv = model.get_image_features(px_norm)
+    loss = -F.cosine_similarity(feat_adv, feat_clean, dim=-1).mean()  # push away
+    loss.backward()
+    adv = px_norm + eps * px_norm.grad.sign()
+    return adv.detach()
 
-    # Compute cosine similarity metric
+def rollout(attn_list):
+    """
+    Attention rollout (Abnar & Zuidema 2020) for a single image batch =1.
+    attn_list: tuple[24] with shape (1, heads, 577, 577)
+    Returns mask as (24,24) ndarray in [0,1].
+    """
+    out = None
+    for A in attn_list:                # average heads
+        A = A[0].mean(0)               # (seq,seq)
+        A = A + torch.eye(A.size(0), device=A.device)
+        A = A / A.sum(dim=-1, keepdim=True)
+        out = A if out is None else A @ out
+    cls2patch = out[0,1:]              # drop CLS→CLS
+    mask = cls2patch[:576].reshape(24,24)
+    mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-8)
+    return mask.cpu().numpy()
+
+def overlay_heat(frame_rgb, mask):
+    h,w,_ = frame_rgb.shape
+    heat  = cv2.resize(mask, (w,h), cv2.INTER_LINEAR)
+    heat  = np.uint8(255*heat)
+    jet   = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+    jet   = cv2.cvtColor(jet, cv2.COLOR_BGR2RGB)
+    return cv2.addWeighted(frame_rgb, 0.6, jet, 0.4, 0)
+
+# ─────────────────────────── main ────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input_video",   required=True)
+    ap.add_argument("--output_dir",    required=True)
+    ap.add_argument("--epsilon",       type=float, default=0.03)
+    ap.add_argument("--batch_size",    type=int,   default=4)
+    ap.add_argument("--save_curve",    action="store_true")
+    ap.add_argument("--output_caption",required=True)
+    args = ap.parse_args()
+
+    # make Matplotlib happy on quota-restricted systems
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp")
+    warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+
+    out_root  = ensure_dir(args.output_dir)
+    out_frames= ensure_dir(out_root / "frames_adv")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1. CLIP model
+    clip_id = "openai/clip-vit-large-patch14-336"
+    processor = CLIPProcessor.from_pretrained(clip_id)
+    model = CLIPModel.from_pretrained(clip_id,
+                                      torch_dtype=torch.float16).to(device).eval()
+
+    mean = torch.tensor(processor.image_processor.image_mean,
+                        dtype=torch.float16, device=device).view(1,3,1,1)
+    std  = torch.tensor(processor.image_processor.image_std,
+                        dtype=torch.float16, device=device).view(1,3,1,1)
+    min_norm, max_norm = (0-mean)/std, (1-mean)/std
+
+    # 2. Load & preprocess frames
+    raw_frames, fps = sample_frames(args.input_video, 16)
+    adv_frames = []        # RGB uint8 outputs
+    energy_curve = []
     cos_sims = []
-    for f0, f1 in zip(orig_feats, adv_feats):
-        cos = F.cosine_similarity(f0, f1, dim=0).item()
-        cos_sims.append(cos)
-    avg_cos = sum(cos_sims) / len(cos_sims)
-    print(f"Average cosine similarity (orig vs adv features): {avg_cos:.4f}")
 
-    # Save attention heatmaps for each adversarial frame
-    attn_means = []
-    for i, adv_img in enumerate(adv_frames):
-        # Prepare input for CLIP and get attentions
-        inputs = processor(images=adv_img, return_tensors="pt")
-        for k in inputs:
-            inputs[k] = inputs[k].to(device)
-        outputs = model(**inputs, output_attentions=True)
-        attn_list = outputs.vision_model_output.attentions  # list of (1, head, seq, seq)
-        # Compute rollout
-        rollout = None
-        for attn in attn_list:
-            # Average over heads
-            a = attn[0].mean(0)  # (seq, seq)
-            # Add identity (residual) and renormalize
-            a = a + torch.eye(a.size(0), device=device)
-            a = a / a.sum(dim=1, keepdim=True)
-            rollout = a if rollout is None else rollout.matmul(a)
-        # Extract [CLS] token attention to patches
-        # Vision seq len = 1 + num_patches (class token first)
-        cls_attn = rollout[0,1:]  # skip CLS to CLS (itself)
-        num_patches = int(cls_attn.size(0))
-        side = int(np.sqrt(num_patches))
-        mask = cls_attn.reshape(side, side).cpu().numpy()
-        # Normalize mask
-        mask = mask / (mask.max() if mask.max()>0 else 1)
-        attn_means.append(mask.std())  # use std dev as a simple metric
-        # Resize mask to image size
-        h, w, _ = adv_img.shape
-        mask_resized = cv2.resize(mask, (w,h), interpolation=cv2.INTER_LINEAR)
-        heatmap = cv2.applyColorMap(np.uint8(255*mask_resized), cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(cv2.cvtColor(adv_img, cv2.COLOR_RGB2BGR), 0.6, heatmap, 0.4, 0)
-        heatmap_path = os.path.join(args.output_dir, f"frame_{i:02d}_heatmap.png")
-        cv2.imwrite(heatmap_path, overlay)
+    for i in range(0, len(raw_frames), args.batch_size):
+        batch = raw_frames[i:i+args.batch_size]
 
-    # Save temporal attention curve if requested
+        # processor handles resize-crop-norm to 3×336×336
+        inputs = processor(images=batch, return_tensors="pt").to(device)
+        x_norm = inputs.pixel_values.half().clone().detach().requires_grad_(True)
+
+        # FGSM
+        adv_norm = fgsm_batch(model, x_norm, args.epsilon)
+        adv_norm = torch.max(torch.min(adv_norm, max_norm), min_norm)
+
+        # cosine similarity metric
+        with torch.no_grad():
+            feat_clean = F.normalize(model.get_image_features(x_norm), dim=-1)
+            feat_adv   = F.normalize(model.get_image_features(adv_norm), dim=-1)
+        cos_sims += F.cosine_similarity(feat_clean, feat_adv, dim=-1).tolist()
+
+        # un-norm → RGB uint8
+        adv_rgb = (adv_norm*std + mean).clamp(0,1).cpu()
+        adv_rgb = (adv_rgb.permute(0,2,3,1).numpy()*255).astype(np.uint8)
+
+        # attention & overlays
+        with torch.no_grad():
+            attn = model.vision_model(pixel_values=adv_norm, output_attentions=True).attentions
+        for j, img in enumerate(adv_rgb):
+            mask = rollout(attn)
+            overlay = overlay_heat(img, mask)
+            idx = i+j
+            cv2.imwrite(str(out_frames / f"frame_{idx:04d}.png"),
+                        cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+            adv_frames.append(img)
+            energy_curve.append(mask.mean())
+
+    print(f"[FGSM] avg cosine(orig vs adv) = {np.mean(cos_sims):.4f}")
+
+    # 3. Write adversarial video
+    h,w,_ = adv_frames[0].shape
+    vout  = cv2.VideoWriter(str(out_root/"adversarial.mp4"),
+                            cv2.VideoWriter_fourcc(*"mp4v"), fps, (w,h))
+    for f in adv_frames:
+        vout.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+    vout.release()
+
+    # 4. Temporal curve
     if args.save_curve:
-        plt.figure(figsize=(4,3))
-        plt.plot(attn_means, marker='o')
-        plt.title("Attention (std) per frame")
-        plt.xlabel("Frame index")
-        plt.ylabel("Mask std dev")
-        curve_path = os.path.join(args.output_dir, "attention_curve.png")
-        plt.savefig(curve_path)
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(6,3))
+        plt.plot(energy_curve, marker="o")
+        plt.title("Temporal attention (mean energy)")
+        plt.xlabel("frame"); plt.ylabel("mean mask value"); plt.grid()
+        plt.tight_layout()
+        plt.savefig(out_root/"attention_curve.png")
         plt.close()
 
-    # Save adversarial video
-    video_out_path = os.path.join(args.output_dir, "adversarial_video.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    h, w, _ = adv_frames[0].shape
-    writer = cv2.VideoWriter(video_out_path, fourcc, fps, (w, h))
-    for adv_img in adv_frames:
-        # adv_img is RGB, convert to BGR for cv2
-        writer.write(cv2.cvtColor(adv_img, cv2.COLOR_RGB2BGR))
-    writer.release()
-
-    # Generate caption with VideoLLaMA
+    # 5. Caption with VideoLLaMA-2
     try:
         from videollama2 import model_init, mm_infer, disable_torch_init
-    except ImportError:
-        raise ImportError("Please install the VideoLLaMA2 package (videollama2) to perform captioning.")
+    except ImportError as e:
+        print("⚠️  VideoLLaMA2 not installed – skipping caption."); return
     disable_torch_init()
-    model_vl, processor_vl, tokenizer_vl = model_init("DAMO-NLP-SG/VideoLLaMA2-7B-16F")
-    # Prepare video input (processor expects file path or frames)
-    # Here we saved adversarial video as file; we can feed its path
-    vid_input = processor_vl["video"](video_out_path)
-    # Instruction prompt for captioning
-    instr = "Describe the video."
-    output = mm_infer(vid_input, instr, model=model_vl, tokenizer=tokenizer_vl,
-                      do_sample=False, modal='video')
-    caption = output.strip()
-    with open(args.output_caption, 'w') as f:
-        f.write(caption)
-    print("Generated caption:", caption)
+    vlm, vproc, vtok = model_init("DAMO-NLP-SG/VideoLLaMA2-7B-16F",
+                                  torch_dtype=torch.float16,
+                                  device_map=device,
+                                  attn_implementation="eager")
+    vid_tensor = vproc["video"](str(out_root/"adversarial.mp4")).to(torch.float16).to(device)
+    caption = mm_infer(vid_tensor, "Describe the video.",
+                       model=vlm, tokenizer=vtok,
+                       modal="video", do_sample=False).strip()
+    with open(args.output_caption, "w", encoding="utf-8") as f:
+        f.write(caption + "\n")
+    print("📝 caption:", caption)
 
 if __name__ == "__main__":
     main()
