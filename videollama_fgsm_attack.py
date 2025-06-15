@@ -54,10 +54,6 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     vid_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float32)
     vid_tensor.requires_grad_(True)
     
-    # CRITICAL FIX: Freeze model parameters (we want input gradients, not weight gradients)
-    for p in vlm.model.vision_tower.parameters():
-        p.requires_grad_(False)
-    
     # VideoLLaMA inputs are normalized to [-1, 1] range
     min_val, max_val = -1.0, 1.0
     
@@ -70,7 +66,6 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
         ).strip()
     
     # KEY FIX: Create a DIFFERENT target to avoid saturation
-    # Option 1: Add small noise instead of shuffling to maintain contiguity
     with torch.no_grad():
         noise = 0.01 * torch.randn_like(vid_tensor)
         noisy_vid = (vid_tensor + noise).half()
@@ -79,10 +74,11 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     print(f"Target features shape: {target_features.shape}")
     clear_memory()
     
-    # CRITICAL: Set vision tower to train mode for gradient computation
+    # CRITICAL FIX: Set vision tower to train mode but DON'T freeze parameters
+    # We need gradients to flow through the computation graph
     vlm.model.vision_tower.train()
     
-    # Forward pass - NO autocast to ensure gradients flow properly
+    # Forward pass - ensure gradients can flow
     adv_features = vlm.model.vision_tower(vid_tensor)
     
     print(f"Adversarial features shape: {adv_features.shape}")
@@ -123,9 +119,10 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
         perturbation = epsilon * vid_tensor.grad.sign()
         vid_adv = torch.clamp(vid_tensor + perturbation, min_val, max_val)
     
-    # Clean up gradients properly
+    # Clean up gradients and reset model state
     vid_tensor.grad.zero_()
     vlm.model.vision_tower.eval()  # Reset to eval mode
+    vlm.zero_grad()  # Clear any accumulated gradients in model
     del target_features, adv_features  # Explicit cleanup
     clear_memory()
     
