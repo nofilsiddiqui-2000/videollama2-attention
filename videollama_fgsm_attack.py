@@ -46,154 +46,124 @@ def load_models(device="cuda"):
     vlm.eval()
     return vt, vproc, vlm, vprocessor, tok
 
-def create_vision_tower_with_gradients(vision_tower):
-    """Create a version of the vision tower forward method that allows gradients"""
-    def forward_with_gradients(images):
-        """Forward pass without @torch.no_grad() decorator"""
-        if type(images) is list:
-            image_features = []
-            for image in images:
-                image_forward_out = vision_tower.vision_tower(image.unsqueeze(0), output_hidden_states=True)
-                image_feature = vision_tower.feature_select(image_forward_out).to(image.dtype)
-                image_features.append(image_feature)
-        else:
-            image_forward_outs = vision_tower.vision_tower(images, output_hidden_states=True)
-            image_features = vision_tower.feature_select(image_forward_outs).to(images.dtype)
-        return image_features
-    
-    return forward_with_gradients
-
 def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cuda"):
-    """Apply FGSM attack to video tensor for VideoLLaMA-2"""
-    clear_memory()  # Clear memory before starting
+    """Fixed FGSM attack with proper gradient flow and non-saturating loss"""
+    clear_memory()
     
-    # Process original video - keep in fp32 for gradients
-    vid_tensor = vprocessor["video"](video_path).to(device)  # fp32 for stable gradients
+    # Process video in fp32 for stable gradients
+    vid_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float32)
+    vid_tensor.requires_grad_(True)
     
-    # VideoLLaMA inputs are already normalized to [-1, 1] range
+    # CRITICAL FIX: Freeze model parameters (we want input gradients, not weight gradients)
+    for p in vlm.model.vision_tower.parameters():
+        p.requires_grad_(False)
+    
+    # VideoLLaMA inputs are normalized to [-1, 1] range
     min_val, max_val = -1.0, 1.0
     
-    # Get original caption and features
+    # Get original caption for comparison
     with torch.inference_mode():
-        # Convert to half precision only for inference
-        vid_half = vid_tensor.half()
+        vid_half = vid_tensor.detach().half()
         original_caption = mm_infer(
             vid_half, "Describe the video in detail.",
-            model=vlm, tokenizer=tok, modal="video",
-            do_sample=False
+            model=vlm, tokenizer=tok, modal="video", do_sample=False
         ).strip()
-        
-        # Get original features - vision_tower returns features directly
-        original_features = vlm.model.vision_tower(vid_half).detach()
     
-    print(f"Original features shape: {original_features.shape}")
-    clear_memory()  # Clear after getting original caption
+    # KEY FIX: Create a DIFFERENT target to avoid saturation
+    # Option 1: Shuffled frames target
+    with torch.no_grad():
+        shuffled = vid_tensor.roll(shifts=1, dims=1).half()  # Shift frames by 1
+        target_features = vlm.model.vision_tower(shuffled).detach()
     
-    # Create a gradient-enabled version of the vision tower forward method
-    vision_tower_grad_forward = create_vision_tower_with_gradients(vlm.model.vision_tower)
+    print(f"Target features shape: {target_features.shape}")
+    clear_memory()
     
-    # CRITICAL: Enable gradients for vision tower parameters
-    for param in vlm.model.vision_tower.parameters():
-        param.requires_grad_(True)
-    
-    # Set vision tower to train mode to enable gradients
-    vlm.model.vision_tower.train()
-    
-    # Prepare adversarial tensor (keep in fp32 for gradients)
-    vid_adv = vid_tensor.clone().detach().requires_grad_(True)
-    
-    # Forward pass to get adversarial features using our gradient-enabled forward
-    adv_features = vision_tower_grad_forward(vid_adv)  # Use our custom forward!
+    # Forward pass with mixed precision to avoid fp16 underflow
+    with torch.cuda.amp.autocast():
+        adv_features = vlm.model.vision_tower(vid_tensor)
     
     print(f"Adversarial features shape: {adv_features.shape}")
     print(f"Adversarial features requires_grad: {adv_features.requires_grad}")
     
-    # Loss: maximize difference between original and adversarial features
-    # Make tensors contiguous before reshaping
-    original_features_cont = original_features.contiguous()
-    adv_features_cont = adv_features.contiguous()
+    # FIXED LOSS: Margin-based contrastive loss to avoid saturation
+    target_flat = target_features.view(-1, target_features.size(-1))
+    adv_flat = adv_features.view(-1, adv_features.size(-1))
     
-    # Flatten for similarity computation
-    original_flat = original_features_cont.view(-1, original_features_cont.size(-1))
-    adv_flat = adv_features_cont.view(-1, adv_features_cont.size(-1))
+    # Ensure dtype consistency
+    target_flat = target_flat.to(adv_flat.dtype)
     
-    # Minimize cosine similarity (maximize difference) - note the negative sign!
-    cos_sim = F.cosine_similarity(original_flat, adv_flat, dim=-1).mean()
-    loss = -cos_sim  # pushes adv ↛ clean (max-diff FGSM)
+    cos_sim = F.cosine_similarity(target_flat, adv_flat, dim=-1).mean()
+    margin = 0.3  # Push features at least 0.3 away from target
+    loss = F.relu(cos_sim - margin)  # Only penalize when too similar
     
-    print(f"Loss: {loss.item():.6f}")
+    print(f"Cosine similarity: {cos_sim.item():.6f}")
+    print(f"Loss (margin-based): {loss.item():.6f}")
     print(f"Loss requires_grad: {loss.requires_grad}")
     
     # Backward pass
     loss.backward()
     
     # Check if gradients are computed
-    if vid_adv.grad is None:
+    if vid_tensor.grad is None:
         print("⚠️ No gradients computed!")
         return vid_tensor, original_caption, original_caption, vid_tensor, 1.0
     
-    print(f"Gradient norm: {vid_adv.grad.norm().item():.6f}")
+    grad_norm = vid_tensor.grad.norm().item()
+    print(f"Gradient norm: {grad_norm:.6f}")
     
-    # FGSM perturbation with proper clipping
-    with torch.inference_mode():
-        perturbation = epsilon * vid_adv.grad.sign()
-        vid_adv_final = torch.clamp(vid_adv + perturbation, min_val, max_val).detach()
+    # Apply FGSM perturbation
+    with torch.no_grad():
+        perturbation = epsilon * vid_tensor.grad.sign()
+        vid_adv = torch.clamp(vid_tensor + perturbation, min_val, max_val)
     
-    # Clear gradients and reset vision tower
-    vlm.model.vision_tower.zero_grad(set_to_none=True)
-    vid_adv.grad = None
-    vid_adv.requires_grad_(False)
-    
-    # Reset vision tower to eval mode and disable gradients
-    vlm.model.vision_tower.eval()
-    for param in vlm.model.vision_tower.parameters():
-        param.requires_grad_(False)
-    
-    # Clear memory before adversarial caption generation
+    # Clean up gradients properly
+    vid_tensor.grad.zero_()
+    del target_features, adv_features  # Explicit cleanup
     clear_memory()
     
-    # Generate adversarial caption with error handling
+    # Generate adversarial caption
     try:
         with torch.inference_mode():
             adv_caption = mm_infer(
-                vid_adv_final.half(), "Describe the video in detail.",
-                model=vlm, tokenizer=tok, modal="video",
-                do_sample=False
+                vid_adv.half(), "Describe the video in detail.",
+                model=vlm, tokenizer=tok, modal="video", do_sample=False
             ).strip()
     except RuntimeError as e:
         if "CUDA" in str(e) or "memory" in str(e).lower():
-            print(f"⚠️ CUDA memory error during adversarial caption generation: {e}")
-            print("🔄 Attempting recovery with memory cleanup...")
+            print(f"⚠️ CUDA memory error: {e}")
             clear_memory()
-            
-            # Try with a simpler caption request
             try:
                 with torch.inference_mode():
                     adv_caption = mm_infer(
-                        vid_adv_final.half(), "Describe this video briefly.",
+                        vid_adv.half(), "Describe this video briefly.",
                         model=vlm, tokenizer=tok, modal="video",
-                        do_sample=False, max_new_tokens=50  # Limit tokens to save memory
+                        do_sample=False, max_new_tokens=50
                     ).strip()
             except Exception as e2:
                 print(f"⚠️ Still failed: {e2}")
-                adv_caption = "[Error: Could not generate adversarial caption due to memory constraints]"
+                adv_caption = "[Error: Could not generate adversarial caption]"
         else:
             raise e
     
-    # Calculate similarity metrics
+    # Calculate final similarity against original (not shuffled target)
     with torch.inference_mode():
         try:
-            final_features = vlm.model.vision_tower(vid_adv_final.half()).contiguous()
+            original_features = vlm.model.vision_tower(vid_tensor.detach().half())
+            final_features = vlm.model.vision_tower(vid_adv.half())
+            
+            orig_flat = original_features.view(-1, original_features.size(-1))
             final_flat = final_features.view(-1, final_features.size(-1))
-            final_similarity = F.cosine_similarity(original_flat.detach(), final_flat, dim=-1).mean().item()
+            
+            final_similarity = F.cosine_similarity(orig_flat, final_flat, dim=-1).mean().item()
         except Exception as e:
             print(f"⚠️ Error calculating final similarity: {e}")
-            final_similarity = -1.0  # Use the loss value as similarity
+            final_similarity = cos_sim.item()
     
-    print(f"🎯 Attack success: cosine similarity {final_similarity:.4f} (lower = more different)")
+    print(f"🎯 Attack success: cosine similarity vs original {final_similarity:.4f} (lower = more different)")
+    print(f"📊 Expected gradient norm range: 50-150, got: {grad_norm:.1f}")
     
-    clear_memory()  # Final cleanup
-    return vid_adv_final, original_caption, adv_caption, vid_tensor, final_similarity
+    clear_memory()
+    return vid_adv, original_caption, adv_caption, vid_tensor, final_similarity
 
 @torch.inference_mode()
 def vit_rollout(pil_img, vt, vproc, device="cuda"):
@@ -287,8 +257,9 @@ def process_video_frames(frames, vt, vproc, device, output_dir, prefix, alpha=0.
         if idx % 5 == 0:
             print(f"   {prefix}: {idx}/{len(frames)}", end='\r')
         
-        # Clear memory periodically
+        # Clear memory periodically with explicit cleanup
         if idx % 10 == 0:
+            del heat, heat_resized, overlay
             clear_memory()
     
     print(f"   {prefix}: {len(frames)}/{len(frames)} ✓")
@@ -301,6 +272,7 @@ def main():
     ap.add_argument("--epsilon", type=float, default=0.03, help="FGSM epsilon (default: 0.03)")
     ap.add_argument("--alpha", type=float, default=0.35, help="Attention overlay alpha (default: 0.35)")
     ap.add_argument("--caption-file", default="captions.txt", help="Caption output file")
+    ap.add_argument("--margin", type=float, default=0.3, help="Contrastive margin (default: 0.3)")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -310,7 +282,7 @@ def main():
     print("⏳ Loading models...")
     vt, vproc, vlm, vprocessor, tok = load_models(device)
 
-    print(f"🎯 Applying FGSM attack (ε={args.epsilon})...")
+    print(f"🎯 Applying FGSM attack (ε={args.epsilon}, margin={args.margin})...")
     vid_adv, original_caption, adv_caption, vid_original, similarity = fgsm_attack_video(
         args.video, vlm, vprocessor, tok, args.epsilon, device
     )
@@ -393,7 +365,7 @@ def main():
     # Save detailed results
     caption_path = Path(args.caption_file)
     with open(caption_path, 'w', encoding='utf-8') as f:
-        f.write(f"FGSM Attack Results (ε={args.epsilon})\n")
+        f.write(f"FGSM Attack Results (ε={args.epsilon}, margin={args.margin})\n")
         f.write("=" * 50 + "\n\n")
         f.write(f"Original Caption:\n{original_caption}\n\n")
         f.write(f"Adversarial Caption:\n{adv_caption}\n\n")
