@@ -3,6 +3,7 @@
 
 import os, sys, cv2, argparse, math, gc
 from pathlib import Path
+from types import MethodType
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -28,6 +29,32 @@ def clear_memory():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
     gc.collect()
+
+def enable_grad_vision_tower(vlm):
+    """
+    CRITICAL FIX: Monkey-patch VisionTower.forward to remove @torch.no_grad() decorator
+    This is the surgical fix that enables gradient flow through the vision tower.
+    """
+    vt = vlm.model.vision_tower  # ← the VisionTower instance
+
+    def forward_with_grad(self, imgs):
+        """
+        Drop-in replacement for VisionTower.forward
+        that keeps the autograd graph intact.
+        """
+        if isinstance(imgs, list):  # VideoLLaMA handles lists & tensors
+            feats = []
+            for im in imgs:
+                out = self.vision_tower(im.unsqueeze(0), output_hidden_states=True)
+                feats.append(self.feature_select(out).to(im.dtype))
+            return torch.cat(feats, dim=0)
+        else:
+            out = self.vision_tower(imgs, output_hidden_states=True)
+            return self.feature_select(out).to(imgs.dtype)
+
+    # Monkey-patch the forward method
+    vt.forward = MethodType(forward_with_grad, vt)
+    print("✅ VisionTower monkey-patched to enable gradients")
 
 def load_models(device="cuda"):
     """Load both CLIP (for attention visualization) and VideoLLaMA-2 (for attacks)"""
@@ -65,7 +92,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
             model=vlm, tokenizer=tok, modal="video", do_sample=False
         ).strip()
     
-    # KEY FIX: Create a DIFFERENT target to avoid saturation
+    # KEY FIX: Create a DIFFERENT target to avoid saturation (simplified)
     with torch.no_grad():
         noise = 0.01 * torch.randn_like(vid_tensor)
         noisy_vid = (vid_tensor + noise).half()
@@ -74,11 +101,10 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     print(f"Target features shape: {target_features.shape}")
     clear_memory()
     
-    # CRITICAL FIX: Set vision tower to train mode but DON'T freeze parameters
-    # We need gradients to flow through the computation graph
-    vlm.model.vision_tower.train()
+    # Keep vision tower in eval mode but allow gradients to flow
+    vlm.model.vision_tower.eval()
     
-    # Forward pass - ensure gradients can flow
+    # Forward pass - gradients should now flow thanks to monkey patch
     adv_features = vlm.model.vision_tower(vid_tensor)
     
     print(f"Adversarial features shape: {adv_features.shape}")
@@ -106,9 +132,6 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     # Check if gradients are computed
     if vid_tensor.grad is None:
         print("⚠️ No gradients computed!")
-        print("🔍 Debugging gradient flow...")
-        print(f"   Vision tower training mode: {vlm.model.vision_tower.training}")
-        print(f"   Any vision tower params require grad: {any(p.requires_grad for p in vlm.model.vision_tower.parameters())}")
         return vid_tensor, original_caption, original_caption, vid_tensor, 1.0
     
     grad_norm = vid_tensor.grad.norm().item()
@@ -119,10 +142,8 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
         perturbation = epsilon * vid_tensor.grad.sign()
         vid_adv = torch.clamp(vid_tensor + perturbation, min_val, max_val)
     
-    # Clean up gradients and reset model state
+    # Clean up gradients
     vid_tensor.grad.zero_()
-    vlm.model.vision_tower.eval()  # Reset to eval mode
-    vlm.zero_grad()  # Clear any accumulated gradients in model
     del target_features, adv_features  # Explicit cleanup
     clear_memory()
     
@@ -286,6 +307,9 @@ def main():
     device = "cuda"
     print("⏳ Loading models...")
     vt, vproc, vlm, vprocessor, tok = load_models(device)
+    
+    # CRITICAL: Apply the monkey patch to enable gradients
+    enable_grad_vision_tower(vlm)
 
     print(f"🎯 Applying FGSM attack (ε={args.epsilon}, margin={args.margin})...")
     vid_adv, original_caption, adv_caption, vid_original, similarity = fgsm_attack_video(
