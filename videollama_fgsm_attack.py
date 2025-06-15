@@ -86,6 +86,8 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
         # Get original features - vision_tower returns features directly
         original_features = vlm.model.vision_tower(vid_half).detach()
     
+    print(f"Original features shape: {original_features.shape}")
+    
     # Prepare adversarial tensor (keep in fp32 for gradients)
     vid_adv = vid_tensor.clone().detach().requires_grad_(True)
     
@@ -94,16 +96,33 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     adv_features = vlm.model.vision_tower(vid_adv.half())
     
     # Loss: maximize difference between original and adversarial features
-    # Using cosine similarity loss for better gradient flow
-    original_flat = original_features.view(-1, original_features.size(-1))
-    adv_flat = adv_features.view(-1, adv_features.size(-1))
+    # Make tensors contiguous before reshaping
+    original_features_cont = original_features.contiguous()
+    adv_features_cont = adv_features.contiguous()
+    
+    # Flatten for similarity computation
+    original_flat = original_features_cont.view(-1, original_features_cont.size(-1))
+    adv_flat = adv_features_cont.view(-1, adv_features_cont.size(-1))
+    
+    # Alternative: use MSE loss if cosine similarity doesn't work well
+    # loss = F.mse_loss(adv_flat, original_flat)
+    # loss = -loss  # Negative to maximize difference
     
     # Minimize cosine similarity (maximize difference)
     cos_sim = F.cosine_similarity(original_flat, adv_flat, dim=-1).mean()
     loss = cos_sim  # Minimize similarity
     
+    print(f"Loss: {loss.item():.6f}")
+    
     # Backward pass
     loss.backward()
+    
+    # Check if gradients are computed
+    if vid_adv.grad is None:
+        print("⚠️ No gradients computed!")
+        return vid_tensor, original_caption, original_caption, vid_tensor, 1.0
+    
+    print(f"Gradient norm: {vid_adv.grad.norm().item():.6f}")
     
     # FGSM perturbation with proper clipping
     with torch.inference_mode():
@@ -124,9 +143,9 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     
     # Calculate similarity metrics
     with torch.inference_mode():
-        final_features = vlm.model.vision_tower(vid_adv_final.half())
+        final_features = vlm.model.vision_tower(vid_adv_final.half()).contiguous()
         final_flat = final_features.view(-1, final_features.size(-1))
-        final_similarity = F.cosine_similarity(original_flat, final_flat, dim=-1).mean().item()
+        final_similarity = F.cosine_similarity(original_flat.detach(), final_flat, dim=-1).mean().item()
     
     print(f"🎯 Attack success: cosine similarity {final_similarity:.4f} (lower = more different)")
     
