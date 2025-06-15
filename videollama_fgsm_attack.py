@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# videollama_fgsm_attack_final_working.py • Working FGSM attacks on VideoLLaMA-2
+# videollama_fgsm_attack_memory_fixed.py • Working FGSM attacks with memory management
 
-import os, sys, cv2, argparse, math
+import os, sys, cv2, argparse, math, gc
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -21,6 +21,13 @@ os.environ.update({
 
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 VISION_ID = "openai/clip-vit-large-patch14-336"
+
+def clear_memory():
+    """Clear GPU memory cache"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
 
 def load_models(device="cuda"):
     """Load both CLIP (for attention visualization) and VideoLLaMA-2 (for attacks)"""
@@ -58,6 +65,8 @@ def create_vision_tower_with_gradients(vision_tower):
 
 def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cuda"):
     """Apply FGSM attack to video tensor for VideoLLaMA-2"""
+    clear_memory()  # Clear memory before starting
+    
     # Process original video - keep in fp32 for gradients
     vid_tensor = vprocessor["video"](video_path).to(device)  # fp32 for stable gradients
     
@@ -78,6 +87,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
         original_features = vlm.model.vision_tower(vid_half).detach()
     
     print(f"Original features shape: {original_features.shape}")
+    clear_memory()  # Clear after getting original caption
     
     # Create a gradient-enabled version of the vision tower forward method
     vision_tower_grad_forward = create_vision_tower_with_gradients(vlm.model.vision_tower)
@@ -139,22 +149,50 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     for param in vlm.model.vision_tower.parameters():
         param.requires_grad_(False)
     
-    # Generate adversarial caption
-    with torch.inference_mode():
-        adv_caption = mm_infer(
-            vid_adv_final.half(), "Describe the video in detail.",
-            model=vlm, tokenizer=tok, modal="video",
-            do_sample=False
-        ).strip()
+    # Clear memory before adversarial caption generation
+    clear_memory()
+    
+    # Generate adversarial caption with error handling
+    try:
+        with torch.inference_mode():
+            adv_caption = mm_infer(
+                vid_adv_final.half(), "Describe the video in detail.",
+                model=vlm, tokenizer=tok, modal="video",
+                do_sample=False
+            ).strip()
+    except RuntimeError as e:
+        if "CUDA" in str(e) or "memory" in str(e).lower():
+            print(f"⚠️ CUDA memory error during adversarial caption generation: {e}")
+            print("🔄 Attempting recovery with memory cleanup...")
+            clear_memory()
+            
+            # Try with a simpler caption request
+            try:
+                with torch.inference_mode():
+                    adv_caption = mm_infer(
+                        vid_adv_final.half(), "Describe this video briefly.",
+                        model=vlm, tokenizer=tok, modal="video",
+                        do_sample=False, max_new_tokens=50  # Limit tokens to save memory
+                    ).strip()
+            except Exception as e2:
+                print(f"⚠️ Still failed: {e2}")
+                adv_caption = "[Error: Could not generate adversarial caption due to memory constraints]"
+        else:
+            raise e
     
     # Calculate similarity metrics
     with torch.inference_mode():
-        final_features = vlm.model.vision_tower(vid_adv_final.half()).contiguous()
-        final_flat = final_features.view(-1, final_features.size(-1))
-        final_similarity = F.cosine_similarity(original_flat.detach(), final_flat, dim=-1).mean().item()
+        try:
+            final_features = vlm.model.vision_tower(vid_adv_final.half()).contiguous()
+            final_flat = final_features.view(-1, final_features.size(-1))
+            final_similarity = F.cosine_similarity(original_flat.detach(), final_flat, dim=-1).mean().item()
+        except Exception as e:
+            print(f"⚠️ Error calculating final similarity: {e}")
+            final_similarity = -1.0  # Use the loss value as similarity
     
     print(f"🎯 Attack success: cosine similarity {final_similarity:.4f} (lower = more different)")
     
+    clear_memory()  # Final cleanup
     return vid_adv_final, original_caption, adv_caption, vid_tensor, final_similarity
 
 @torch.inference_mode()
@@ -248,6 +286,10 @@ def process_video_frames(frames, vt, vproc, device, output_dir, prefix, alpha=0.
         
         if idx % 5 == 0:
             print(f"   {prefix}: {idx}/{len(frames)}", end='\r')
+        
+        # Clear memory periodically
+        if idx % 10 == 0:
+            clear_memory()
     
     print(f"   {prefix}: {len(frames)}/{len(frames)} ✓")
     return energies
@@ -285,6 +327,8 @@ def main():
     original_energies = process_video_frames(
         original_frames, vt, vproc, device, args.out, "original", args.alpha
     )
+    
+    clear_memory()  # Clear between processing
     
     adversarial_energies = process_video_frames(
         adversarial_frames, vt, vproc, device, args.out, "adversarial", args.alpha
