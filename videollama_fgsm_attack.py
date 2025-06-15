@@ -70,24 +70,28 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
         ).strip()
     
     # KEY FIX: Create a DIFFERENT target to avoid saturation
-    # Option 1: Shuffled frames target
+    # Option 1: Add small noise instead of shuffling to maintain contiguity
     with torch.no_grad():
-        shuffled = vid_tensor.roll(shifts=1, dims=1).half()  # Shift frames by 1
-        target_features = vlm.model.vision_tower(shuffled).detach()
+        noise = 0.01 * torch.randn_like(vid_tensor)
+        noisy_vid = (vid_tensor + noise).half()
+        target_features = vlm.model.vision_tower(noisy_vid).detach().contiguous()
     
     print(f"Target features shape: {target_features.shape}")
     clear_memory()
     
-    # Forward pass with mixed precision to avoid fp16 underflow
-    with torch.cuda.amp.autocast():
-        adv_features = vlm.model.vision_tower(vid_tensor)
+    # CRITICAL: Set vision tower to train mode for gradient computation
+    vlm.model.vision_tower.train()
+    
+    # Forward pass - NO autocast to ensure gradients flow properly
+    adv_features = vlm.model.vision_tower(vid_tensor)
     
     print(f"Adversarial features shape: {adv_features.shape}")
     print(f"Adversarial features requires_grad: {adv_features.requires_grad}")
+    print(f"Vid tensor requires_grad: {vid_tensor.requires_grad}")
     
-    # FIXED LOSS: Margin-based contrastive loss to avoid saturation
-    target_flat = target_features.view(-1, target_features.size(-1))
-    adv_flat = adv_features.view(-1, adv_features.size(-1))
+    # FIXED LOSS: Use .contiguous() before reshaping
+    target_flat = target_features.contiguous().view(-1, target_features.size(-1))
+    adv_flat = adv_features.contiguous().view(-1, adv_features.size(-1))
     
     # Ensure dtype consistency
     target_flat = target_flat.to(adv_flat.dtype)
@@ -106,6 +110,9 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     # Check if gradients are computed
     if vid_tensor.grad is None:
         print("⚠️ No gradients computed!")
+        print("🔍 Debugging gradient flow...")
+        print(f"   Vision tower training mode: {vlm.model.vision_tower.training}")
+        print(f"   Any vision tower params require grad: {any(p.requires_grad for p in vlm.model.vision_tower.parameters())}")
         return vid_tensor, original_caption, original_caption, vid_tensor, 1.0
     
     grad_norm = vid_tensor.grad.norm().item()
@@ -118,6 +125,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     
     # Clean up gradients properly
     vid_tensor.grad.zero_()
+    vlm.model.vision_tower.eval()  # Reset to eval mode
     del target_features, adv_features  # Explicit cleanup
     clear_memory()
     
@@ -145,14 +153,14 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
         else:
             raise e
     
-    # Calculate final similarity against original (not shuffled target)
+    # Calculate final similarity against original (not noisy target)
     with torch.inference_mode():
         try:
             original_features = vlm.model.vision_tower(vid_tensor.detach().half())
             final_features = vlm.model.vision_tower(vid_adv.half())
             
-            orig_flat = original_features.view(-1, original_features.size(-1))
-            final_flat = final_features.view(-1, final_features.size(-1))
+            orig_flat = original_features.contiguous().view(-1, original_features.size(-1))
+            final_flat = final_features.contiguous().view(-1, final_features.size(-1))
             
             final_similarity = F.cosine_similarity(orig_flat, final_flat, dim=-1).mean().item()
         except Exception as e:
