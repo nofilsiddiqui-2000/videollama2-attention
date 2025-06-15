@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# videollama_fgsm_attack_fixed.py • Fixed FGSM attacks on VideoLLaMA-2
+# videollama_fgsm_attack_corrected.py • Fixed FGSM attacks on VideoLLaMA-2
 
 import os, sys, cv2, argparse, math
 from pathlib import Path
@@ -39,39 +39,13 @@ def load_models(device="cuda"):
     vlm.eval()
     return vt, vproc, vlm, vprocessor, tok
 
-def get_processor_normalization_params(vprocessor):
-    """Extract normalization parameters from VideoLLaMA processor"""
-    # VideoLLaMA typically uses standard CLIP normalization
-    try:
-        # Try to get from processor config
-        if hasattr(vprocessor['video'], 'image_mean'):
-            mean = vprocessor['video'].image_mean
-            std = vprocessor['video'].image_std
-        else:
-            # Default CLIP normalization
-            mean = [0.48145466, 0.4578275, 0.40821073]
-            std = [0.26862954, 0.26130258, 0.27577711]
-    except:
-        # Fallback to common values
-        mean = [0.48145466, 0.4578275, 0.40821073]
-        std = [0.26862954, 0.26130258, 0.27577711]
-    
-    return mean, std
-
 def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cuda"):
     """Apply FGSM attack to video tensor for VideoLLaMA-2"""
     # Process original video - keep in fp32 for gradients
     vid_tensor = vprocessor["video"](video_path).to(device)  # fp32 for stable gradients
     
-    # Get normalization bounds
-    mean, std = get_processor_normalization_params(vprocessor)
-    mean = torch.tensor(mean, device=device).view(1, 1, 3, 1, 1)
-    std = torch.tensor(std, device=device).view(1, 1, 3, 1, 1)
-    
-    # Calculate proper clipping bounds 
-    # Most vision models expect inputs in [0, 1] range after preprocessing
-    min_val = torch.zeros_like(vid_tensor)
-    max_val = torch.ones_like(vid_tensor)
+    # VideoLLaMA inputs are already normalized to [-1, 1] range
+    min_val, max_val = -1.0, 1.0
     
     # Get original caption and features
     with torch.inference_mode():
@@ -91,9 +65,8 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     # Prepare adversarial tensor (keep in fp32 for gradients)
     vid_adv = vid_tensor.clone().detach().requires_grad_(True)
     
-    # Forward pass to get adversarial features
-    # Note: vision_tower returns features directly, not an object with last_hidden_state
-    adv_features = vlm.model.vision_tower(vid_adv.half())
+    # Forward pass to get adversarial features - keep in fp32 for gradients
+    adv_features = vlm.model.vision_tower(vid_adv)  # No .half() here!
     
     # Loss: maximize difference between original and adversarial features
     # Make tensors contiguous before reshaping
@@ -104,18 +77,17 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     original_flat = original_features_cont.view(-1, original_features_cont.size(-1))
     adv_flat = adv_features_cont.view(-1, adv_features_cont.size(-1))
     
-    # Alternative: use MSE loss if cosine similarity doesn't work well
-    # loss = F.mse_loss(adv_flat, original_flat)
-    # loss = -loss  # Negative to maximize difference
-    
-    # Minimize cosine similarity (maximize difference)
+    # Minimize cosine similarity (maximize difference) - note the negative sign!
     cos_sim = F.cosine_similarity(original_flat, adv_flat, dim=-1).mean()
-    loss = cos_sim  # Minimize similarity
+    loss = -cos_sim  # pushes adv ↛ clean (max-diff FGSM)
     
     print(f"Loss: {loss.item():.6f}")
     
     # Backward pass
     loss.backward()
+    
+    # Clear gradients after backward pass
+    vlm.model.vision_tower.zero_grad(set_to_none=True)
     
     # Check if gradients are computed
     if vid_adv.grad is None:
@@ -190,7 +162,8 @@ def tensor_to_frames(vid_tensor, mean=None, std=None):
     frames = []
     vid_np = vid_tensor.squeeze(0).cpu().numpy()  # [T, C, H, W]
     
-    # Clip to valid range and convert to uint8
+    # VideoLLaMA tensors are in [-1, 1], convert to [0, 1] for display
+    vid_np = (vid_np + 1.0) / 2.0  # Convert from [-1, 1] to [0, 1]
     vid_np = np.clip(vid_np, 0, 1)
     
     for i in range(vid_np.shape[0]):
@@ -268,9 +241,6 @@ def main():
     
     print(f"\n📝 Original caption: {original_caption}")
     print(f"📝 Adversarial caption: {adv_caption}")
-    
-    # Get normalization parameters for proper frame conversion
-    mean, std = get_processor_normalization_params(vprocessor)
     
     # Convert tensors to frames
     print("🖼️ Converting tensors to frames...")
