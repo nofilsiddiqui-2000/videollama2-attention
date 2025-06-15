@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# videollama_fgsm_attack_corrected.py • Fixed FGSM attacks on VideoLLaMA-2
+# videollama_fgsm_attack_working.py • Working FGSM attacks on VideoLLaMA-2
 
 import os, sys, cv2, argparse, math
 from pathlib import Path
@@ -62,11 +62,21 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     
     print(f"Original features shape: {original_features.shape}")
     
+    # CRITICAL: Enable gradients for vision tower parameters
+    for param in vlm.model.vision_tower.parameters():
+        param.requires_grad_(True)
+    
+    # Set vision tower to train mode to enable gradients
+    vlm.model.vision_tower.train()
+    
     # Prepare adversarial tensor (keep in fp32 for gradients)
     vid_adv = vid_tensor.clone().detach().requires_grad_(True)
     
     # Forward pass to get adversarial features - keep in fp32 for gradients
     adv_features = vlm.model.vision_tower(vid_adv)  # No .half() here!
+    
+    print(f"Adversarial features shape: {adv_features.shape}")
+    print(f"Adversarial features requires_grad: {adv_features.requires_grad}")
     
     # Loss: maximize difference between original and adversarial features
     # Make tensors contiguous before reshaping
@@ -82,12 +92,10 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     loss = -cos_sim  # pushes adv ↛ clean (max-diff FGSM)
     
     print(f"Loss: {loss.item():.6f}")
+    print(f"Loss requires_grad: {loss.requires_grad}")
     
     # Backward pass
     loss.backward()
-    
-    # Clear gradients after backward pass
-    vlm.model.vision_tower.zero_grad(set_to_none=True)
     
     # Check if gradients are computed
     if vid_adv.grad is None:
@@ -101,9 +109,15 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
         perturbation = epsilon * vid_adv.grad.sign()
         vid_adv_final = torch.clamp(vid_adv + perturbation, min_val, max_val).detach()
     
-    # Clear gradients to free memory
+    # Clear gradients and reset vision tower
+    vlm.model.vision_tower.zero_grad(set_to_none=True)
     vid_adv.grad = None
     vid_adv.requires_grad_(False)
+    
+    # Reset vision tower to eval mode and disable gradients
+    vlm.model.vision_tower.eval()
+    for param in vlm.model.vision_tower.parameters():
+        param.requires_grad_(False)
     
     # Generate adversarial caption
     with torch.inference_mode():
