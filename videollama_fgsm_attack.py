@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# videollama_fgsm_attack_corrected.py • Fixed FGSM attacks on VideoLLaMA-2
+# videollama_fgsm_attack_fixed.py • Fixed FGSM attacks on VideoLLaMA-2
 
 import os, sys, cv2, argparse, math
 from pathlib import Path
@@ -41,15 +41,14 @@ def load_models(device="cuda"):
 
 def get_processor_normalization_params(vprocessor):
     """Extract normalization parameters from VideoLLaMA processor"""
-    # VideoLLaMA typically uses [-1, 1] normalization
-    # We need to find the actual parameters used by the processor
+    # VideoLLaMA typically uses standard CLIP normalization
     try:
         # Try to get from processor config
         if hasattr(vprocessor['video'], 'image_mean'):
             mean = vprocessor['video'].image_mean
             std = vprocessor['video'].image_std
         else:
-            # Default CLIP normalization converted to [-1, 1] range
+            # Default CLIP normalization
             mean = [0.48145466, 0.4578275, 0.40821073]
             std = [0.26862954, 0.26130258, 0.27577711]
     except:
@@ -69,9 +68,10 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     mean = torch.tensor(mean, device=device).view(1, 1, 3, 1, 1)
     std = torch.tensor(std, device=device).view(1, 1, 3, 1, 1)
     
-    # Calculate proper clipping bounds (typically [-1, 1] after normalization)
-    min_val = (-1 - mean) / std
-    max_val = (1 - mean) / std
+    # Calculate proper clipping bounds 
+    # Most vision models expect inputs in [0, 1] range after preprocessing
+    min_val = torch.zeros_like(vid_tensor)
+    max_val = torch.ones_like(vid_tensor)
     
     # Get original caption and features
     with torch.inference_mode():
@@ -83,15 +83,15 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
             do_sample=False
         ).strip()
         
-        # Get original features for comparison
-        original_features = vlm.model.vision_tower(vid_half).last_hidden_state.detach()
+        # Get original features - vision_tower returns features directly
+        original_features = vlm.model.vision_tower(vid_half).detach()
     
     # Prepare adversarial tensor (keep in fp32 for gradients)
     vid_adv = vid_tensor.clone().detach().requires_grad_(True)
     
     # Forward pass to get adversarial features
-    vision_outputs = vlm.model.vision_tower(vid_adv.half())
-    adv_features = vision_outputs.last_hidden_state
+    # Note: vision_tower returns features directly, not an object with last_hidden_state
+    adv_features = vlm.model.vision_tower(vid_adv.half())
     
     # Loss: maximize difference between original and adversarial features
     # Using cosine similarity loss for better gradient flow
@@ -124,7 +124,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     
     # Calculate similarity metrics
     with torch.inference_mode():
-        final_features = vlm.model.vision_tower(vid_adv_final.half()).last_hidden_state
+        final_features = vlm.model.vision_tower(vid_adv_final.half())
         final_flat = final_features.view(-1, final_features.size(-1))
         final_similarity = F.cosine_similarity(original_flat, final_flat, dim=-1).mean().item()
     
@@ -170,12 +170,6 @@ def tensor_to_frames(vid_tensor, mean=None, std=None):
     # vid_tensor shape: [1, T, C, H, W]
     frames = []
     vid_np = vid_tensor.squeeze(0).cpu().numpy()  # [T, C, H, W]
-    
-    # Denormalize if parameters provided
-    if mean is not None and std is not None:
-        mean = np.array(mean).reshape(1, 3, 1, 1)
-        std = np.array(std).reshape(1, 3, 1, 1)
-        vid_np = vid_np * std + mean
     
     # Clip to valid range and convert to uint8
     vid_np = np.clip(vid_np, 0, 1)
@@ -259,10 +253,10 @@ def main():
     # Get normalization parameters for proper frame conversion
     mean, std = get_processor_normalization_params(vprocessor)
     
-    # Convert tensors to frames with proper denormalization
+    # Convert tensors to frames
     print("🖼️ Converting tensors to frames...")
-    original_frames = tensor_to_frames(vid_original, mean, std)
-    adversarial_frames = tensor_to_frames(vid_adv, mean, std)
+    original_frames = tensor_to_frames(vid_original)
+    adversarial_frames = tensor_to_frames(vid_adv)
     
     # Process frames and generate attention visualizations
     original_energies = process_video_frames(
@@ -337,12 +331,14 @@ def main():
         f.write(f"Original Caption:\n{original_caption}\n\n")
         f.write(f"Adversarial Caption:\n{adv_caption}\n\n")
         f.write(f"Feature Similarity: {similarity:.6f}\n")
-        f.write(f"Attention MSE: {np.mean((orig_curve - adv_curve) ** 2):.6f}\n")
+        if len(orig_curve) == len(adv_curve):
+            f.write(f"Attention MSE: {np.mean((orig_curve - adv_curve) ** 2):.6f}\n")
     
     print(f"✅ Results saved to {args.out}")
     print(f"📝 Captions saved to {args.caption_file}")
     print(f"📊 Feature similarity: {similarity:.6f}")
-    print(f"📊 Attention MSE: {np.mean((orig_curve - adv_curve) ** 2):.6f}")
+    if len(orig_curve) == len(adv_curve):
+        print(f"📊 Attention MSE: {np.mean((orig_curve - adv_curve) ** 2):.6f}")
 
 if __name__ == "__main__":
     main()
