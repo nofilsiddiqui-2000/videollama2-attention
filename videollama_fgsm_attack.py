@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# videollama_fgsm_attack_working.py • Working FGSM attacks on VideoLLaMA-2
+# videollama_fgsm_attack_final_working.py • Working FGSM attacks on VideoLLaMA-2
 
 import os, sys, cv2, argparse, math
 from pathlib import Path
@@ -39,6 +39,23 @@ def load_models(device="cuda"):
     vlm.eval()
     return vt, vproc, vlm, vprocessor, tok
 
+def create_vision_tower_with_gradients(vision_tower):
+    """Create a version of the vision tower forward method that allows gradients"""
+    def forward_with_gradients(images):
+        """Forward pass without @torch.no_grad() decorator"""
+        if type(images) is list:
+            image_features = []
+            for image in images:
+                image_forward_out = vision_tower.vision_tower(image.unsqueeze(0), output_hidden_states=True)
+                image_feature = vision_tower.feature_select(image_forward_out).to(image.dtype)
+                image_features.append(image_feature)
+        else:
+            image_forward_outs = vision_tower.vision_tower(images, output_hidden_states=True)
+            image_features = vision_tower.feature_select(image_forward_outs).to(images.dtype)
+        return image_features
+    
+    return forward_with_gradients
+
 def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cuda"):
     """Apply FGSM attack to video tensor for VideoLLaMA-2"""
     # Process original video - keep in fp32 for gradients
@@ -62,6 +79,9 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     
     print(f"Original features shape: {original_features.shape}")
     
+    # Create a gradient-enabled version of the vision tower forward method
+    vision_tower_grad_forward = create_vision_tower_with_gradients(vlm.model.vision_tower)
+    
     # CRITICAL: Enable gradients for vision tower parameters
     for param in vlm.model.vision_tower.parameters():
         param.requires_grad_(True)
@@ -72,8 +92,8 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok, epsilon=0.03, device="cu
     # Prepare adversarial tensor (keep in fp32 for gradients)
     vid_adv = vid_tensor.clone().detach().requires_grad_(True)
     
-    # Forward pass to get adversarial features - keep in fp32 for gradients
-    adv_features = vlm.model.vision_tower(vid_adv)  # No .half() here!
+    # Forward pass to get adversarial features using our gradient-enabled forward
+    adv_features = vision_tower_grad_forward(vid_adv)  # Use our custom forward!
     
     print(f"Adversarial features shape: {adv_features.shape}")
     print(f"Adversarial features requires_grad: {adv_features.requires_grad}")
