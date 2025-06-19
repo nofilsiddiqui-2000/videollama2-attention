@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (Fixed Device Mismatch)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (Fixed Vision Tower Processing)
 import os, sys, cv2, argparse, math, gc
 from pathlib import Path
 from types import MethodType
@@ -28,7 +28,7 @@ def setup_environment():
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64",
     })
     
-    # Set up cache directories with correct username
+    # Set up cache directories
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     os.environ["HF_HOME"] = f"{scratch_dir}/hf_cache"
     os.environ["MPLCONFIGDIR"] = f"{scratch_dir}/matplotlib_cache"
@@ -106,14 +106,12 @@ def load_models(device="cuda"):
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",  # GPU first, spill-over to CPU
-        max_memory={0: "30GiB", "cpu": "64GiB"},  # Raised from 18GiB
+        max_memory={0: "30GiB", "cpu": "64GiB"},
         offload_folder=offload_dir,
         offload_state_dict=True
     )
     vlm.eval()
     
-    # REMOVED: Don't move LM head to CPU - causes device mismatch during inference
-    # The device_map="auto" should handle memory allocation appropriately
     print("✅ Using automatic device mapping for optimal memory allocation")
     
     clear_memory()
@@ -169,16 +167,33 @@ def fix_video_tensor_channels(video_tensor):
     print(f"📐 Final tensor shape: {video_tensor.shape}")
     return video_tensor
 
+def process_video_frames_for_vision_tower(video_frames_4d, vision_tower):
+    """Process video frames through vision tower - handle frame-by-frame"""
+    # video_frames_4d: (num_frames, C, H, W)
+    frame_features = []
+    
+    for i in range(video_frames_4d.shape[0]):
+        # Get single frame: (C, H, W)
+        single_frame = video_frames_4d[i]
+        # Add batch dimension: (1, C, H, W) - this is what CLIP expects
+        single_frame_batched = single_frame.unsqueeze(0)
+        
+        # Process through vision tower
+        frame_feat = vision_tower(single_frame_batched)
+        frame_features.append(frame_feat)
+    
+    # Concatenate all frame features
+    return torch.cat(frame_features, dim=0)
+
 def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                       epsilon=0.03, device="cuda", margin=0.3):
-    """FGSM attack with proper tensor format and robust gradient handling"""
+    """FGSM attack with proper frame-by-frame vision processing"""
     clear_memory()
     
     print(f"💾 GPU memory before processing: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     
     # Process video using the correct processor method
     print("Processing video...")
-    # Try different processor methods to find the right one
     try:
         if hasattr(vprocessor, 'process_video'):
             vid_tensor4d = vprocessor.process_video(video_path).to(device, dtype=torch.float16)
@@ -212,7 +227,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         print(f"📐 Video tensor format: {video_tensor_for_caption.shape}")
         
         original_caption = mm_infer(
-            video_tensor_for_caption,  # Direct tensor, not [video_tensor]
+            video_tensor_for_caption,
             "Describe the video in detail.",
             model=vlm, tokenizer=tok, modal="video", do_sample=False
         ).strip()
@@ -220,7 +235,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     clear_memory()
     print(f"💾 GPU memory after original caption: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # FGSM attack with robust gradient handling
+    # FGSM attack with frame-by-frame processing
     print("Performing FGSM attack...")
     
     with torch.enable_grad():
@@ -235,18 +250,15 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
             
             print(f"🔍 Processing chunk {i//chunk_size + 1}/{(frame_count + chunk_size - 1)//chunk_size}, shape: {chunk4d.shape}")
             
-            # Convert to 5D for vision_tower
-            chunk5d = chunk4d.unsqueeze(0)  # (1, chunk_frames, C, H, W)
-            
-            # Get features for this chunk
-            chunk_features = vlm.model.vision_tower(chunk5d)
+            # FIXED: Process frames individually through vision tower
+            chunk_features = process_video_frames_for_vision_tower(chunk4d, vlm.model.vision_tower)
             
             # More robust loss that avoids zeros
             chunk_loss = -torch.mean(torch.abs(chunk_features)) - 0.01 * chunk_features.norm()
             total_loss += chunk_loss
             
             # Clear intermediate tensors
-            del chunk_features, chunk5d
+            del chunk_features
             clear_memory()
         
         loss = total_loss / max(1, (frame_count + chunk_size - 1) // chunk_size)  # Normalize
@@ -289,7 +301,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     print("Generating adversarial caption...")
     with torch.inference_mode():
         adv_caption = mm_infer(
-            vid_adv4d.detach(),  # Direct tensor, not [vid_adv4d]
+            vid_adv4d.detach(),
             "Describe the video in detail.",
             model=vlm, tokenizer=tok, modal="video", do_sample=False
         ).strip()
@@ -297,7 +309,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     # Compute similarity with chunked processing
     print("Computing feature similarity...")
     with torch.inference_mode():
-        # Process similarity in small chunks
+        # Process similarity in small chunks using frame-by-frame processing
         chunk_size = 2
         similarities = []
         
@@ -307,17 +319,14 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
             orig_chunk4d = vid_tensor4d[i:end_idx].detach()
             adv_chunk4d = vid_adv4d[i:end_idx].detach()
             
-            # Convert to 5D for vision_tower
-            orig_chunk5d = orig_chunk4d.unsqueeze(0)
-            adv_chunk5d = adv_chunk4d.unsqueeze(0)
-            
-            orig_feat = vlm.model.vision_tower(orig_chunk5d).view(-1)
-            adv_feat = vlm.model.vision_tower(adv_chunk5d).view(-1)
+            # Process frames individually
+            orig_feat = process_video_frames_for_vision_tower(orig_chunk4d, vlm.model.vision_tower).view(-1)
+            adv_feat = process_video_frames_for_vision_tower(adv_chunk4d, vlm.model.vision_tower).view(-1)
             
             chunk_sim = F.cosine_similarity(orig_feat, adv_feat, dim=0).item()
             similarities.append(chunk_sim)
             
-            del orig_feat, adv_feat, orig_chunk5d, adv_chunk5d
+            del orig_feat, adv_feat
             clear_memory()
         
         sim = np.mean(similarities)
