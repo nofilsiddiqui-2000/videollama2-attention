@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (Memory Optimized with Offloading)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (Fixed Video Channel Issue)
 import os, sys, cv2, argparse, math, gc
 from pathlib import Path
 from types import MethodType
@@ -14,7 +14,7 @@ from transformers import CLIPVisionModel, CLIPImageProcessor
 from videollama2 import model_init, mm_infer
 from videollama2.utils import disable_torch_init
 
-# Enable TF32 for A100 (GPT suggestion #3)
+# Enable TF32 for A100
 torch.backends.cuda.matmul.allow_tf32 = True
 
 def setup_environment():
@@ -23,11 +23,11 @@ def setup_environment():
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # Tighter memory allocation (GPT suggestion #3)
+        # Tighter memory allocation
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:32",
     })
     
-    # Set up cache directories with correct username
+    # Set up cache directories
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     os.environ["HF_HOME"] = f"{scratch_dir}/hf_cache"
     os.environ["MPLCONFIGDIR"] = f"{scratch_dir}/matplotlib_cache"
@@ -47,24 +47,24 @@ def clear_memory():
         torch.cuda.synchronize()
 
 def enable_grad_vision_tower(vlm):
-    """Enable gradients with proper checkpointing (GPT fixes)"""
+    """Enable gradients with proper checkpointing"""
     vt = vlm.model.vision_tower
     
-    # 1️⃣ Monkey-patch to remove @torch.no_grad() - FIXED: correct call path
+    # 1️⃣ Monkey-patch to remove @torch.no_grad()
     def forward_with_grad(self, imgs):
         if isinstance(imgs, list):
             feats = [self.feature_select(
-                     self.vision_tower(im.unsqueeze(0), output_hidden_states=True)  # FIXED: keep wrapper logic
+                     self.vision_tower(im.unsqueeze(0), output_hidden_states=True)
                      ).to(im.dtype) for im in imgs]
             return torch.cat(feats, dim=0)
-        out = self.vision_tower(imgs, output_hidden_states=True)  # FIXED: use vision_tower, not vision_model
+        out = self.vision_tower(imgs, output_hidden_states=True)
         return self.feature_select(out).to(imgs.dtype)
     
     vt.forward = MethodType(forward_with_grad, vt)
     
-    # 2️⃣ Enable gradient checkpointing - FIXED: correct attribute path (GPT suggestion #3)
+    # 2️⃣ Enable gradient checkpointing
     try:
-        vt.vision_tower.gradient_checkpointing_enable()  # FIXED: direct on vision_tower
+        vt.vision_tower.gradient_checkpointing_enable()
         print("✅ Gradient checkpointing enabled - saves ~3GB")
     except Exception as e:
         print(f"⚠️ Could not enable gradient checkpointing: {e}")
@@ -82,14 +82,14 @@ def enable_grad_vision_tower(vlm):
     print("✅ VisionTower patched with gradient support")
 
 def load_models(device="cuda"):
-    """Load models with aggressive memory optimization (GPT suggestions #1 & #2)"""
+    """Load models with aggressive memory optimization"""
     clear_memory()
     
-    # GPT Suggestion #2: Load CLIP model on CPU only (or skip it entirely)
+    # Load CLIP model on CPU only to save GPU memory
     print("Loading CLIP vision model on CPU...")
     vt = CLIPVisionModel.from_pretrained(VISION_ID, 
                                         torch_dtype=torch.float16,
-                                        device_map="cpu")  # Keep on CPU to save GPU memory
+                                        device_map="cpu")
     vproc = CLIPImageProcessor.from_pretrained(VISION_ID)
     
     print("Loading VideoLLaMA-2 with device offloading...")
@@ -99,14 +99,14 @@ def load_models(device="cuda"):
     offload_dir = "/tmp/vllama_offload"
     Path(offload_dir).mkdir(exist_ok=True)
     
-    # GPT Suggestion #1: Use device_map="auto" with memory limits
+    # Use device_map="auto" with memory limits
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",  # GPU first, spill-over to CPU
-        max_memory={0: "18GiB", "cpu": "64GiB"},  # Limit GPU to 18GB, rest to CPU
-        offload_folder=offload_dir,  # Fast local SSD
+        max_memory={0: "18GiB", "cpu": "64GiB"},
+        offload_folder=offload_dir,
         offload_state_dict=True
     )
     vlm.eval()
@@ -122,13 +122,50 @@ def tensor_to_frames(video_tensor):
         video_tensor = video_tensor.squeeze(0)
     
     frames = []
-    for i in range(min(8, video_tensor.shape[0])):  # Back to 8 frames since we have more memory
+    for i in range(min(8, video_tensor.shape[0])):
         t = video_tensor[i].cpu()
         img = ((t + 1) / 2).clamp(0, 1)
         img = (img * 255).byte().permute(1, 2, 0).numpy()
         frames.append(img)
     
     return frames
+
+def fix_video_channels(video_tensor):
+    """Fix video tensor to ensure it has 3 RGB channels"""
+    print(f"📐 Video tensor shape: {video_tensor.shape}")
+    
+    if video_tensor.dim() == 5:
+        batch, frames, channels, height, width = video_tensor.shape
+    elif video_tensor.dim() == 4:
+        frames, channels, height, width = video_tensor.shape
+        batch = 1
+        video_tensor = video_tensor.unsqueeze(0)
+    else:
+        raise ValueError(f"Unexpected video tensor dimensions: {video_tensor.shape}")
+    
+    print(f"📐 Detected: batch={batch}, frames={frames}, channels={channels}, height={height}, width={width}")
+    
+    # Fix channel issues
+    if channels == 1:
+        # Grayscale - repeat to get 3 channels
+        video_tensor = video_tensor.repeat(1, 1, 3, 1, 1)
+        print("🔧 Fixed: Converted grayscale (1 channel) to RGB (3 channels)")
+    elif channels == 2:
+        # 2 channels - add a third channel (duplicate one of them)
+        third_channel = video_tensor[:, :, 0:1, :, :]  # Use first channel
+        video_tensor = torch.cat([video_tensor, third_channel], dim=2)
+        print("🔧 Fixed: Added third channel to make RGB (was 2 channels)")
+    elif channels == 4:
+        # RGBA - drop alpha channel
+        video_tensor = video_tensor[:, :, :3, :, :]
+        print("🔧 Fixed: Removed alpha channel from RGBA (was 4 channels)")
+    elif channels == 3:
+        print("✅ Video already has 3 RGB channels")
+    else:
+        raise ValueError(f"Unsupported number of channels: {channels}")
+    
+    print(f"📐 Final tensor shape: {video_tensor.shape}")
+    return video_tensor
 
 def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                       epsilon=0.03, device="cuda", margin=0.3):
@@ -141,7 +178,10 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     print("Processing video...")
     vid_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float16)
     
-    # Reduce to maximum 8 frames (back from 4 since we have more memory)
+    # Fix channel issues before proceeding
+    vid_tensor = fix_video_channels(vid_tensor)
+    
+    # Reduce to maximum 8 frames
     if vid_tensor.shape[1] > 8:
         indices = torch.linspace(0, vid_tensor.shape[1]-1, 8).long()
         vid_tensor = vid_tensor[:, indices]
@@ -163,18 +203,20 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     clear_memory()
     print(f"💾 GPU memory after original caption: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # FGSM attack with small chunks (GPT suggestion #4)
+    # FGSM attack with small chunks
     print("Performing FGSM attack...")
     
     with torch.enable_grad():
-        # Process in very small chunks (GPT suggestion #4: 1-2 frames)
+        # Process in very small chunks
         frame_count = vid_tensor.shape[1]
-        chunk_size = 2  # Process 2 frames at a time (reduced from 4)
+        chunk_size = 2  # Process 2 frames at a time
         
         total_loss = 0
         for i in range(0, frame_count, chunk_size):
             end_idx = min(i + chunk_size, frame_count)
             chunk = vid_tensor[:, i:end_idx]
+            
+            print(f"🔍 Processing chunk {i//chunk_size + 1}/{(frame_count + chunk_size - 1)//chunk_size}, shape: {chunk.shape}")
             
             # Get features for this chunk
             chunk_features = vlm.model.vision_tower(chunk)
@@ -224,7 +266,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     print("Computing feature similarity...")
     with torch.inference_mode():
         # Process similarity in small chunks
-        chunk_size = 2  # Small chunks for similarity too
+        chunk_size = 2
         similarities = []
         
         for i in range(0, vid_tensor.shape[1], chunk_size):
@@ -281,10 +323,7 @@ def main():
         )
     except torch.cuda.OutOfMemoryError as e:
         print(f"❌ GPU OOM Error: {e}")
-        print("💡 Even with offloading, still OOM. Try:")
-        print("   1. Using ViT-base model instead of ViT-large")
-        print("   2. Further reducing frames to 4")
-        print("   3. Processing 1 frame at a time")
+        print("💡 Try reducing frames further or using ViT-base model")
         sys.exit(1)
     except Exception as e:
         print(f"❌ Error during FGSM attack: {e}")
