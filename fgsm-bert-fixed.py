@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (Fixed mm_infer Format)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (Fixed Device Mismatch)
 import os, sys, cv2, argparse, math, gc
 from pathlib import Path
 from types import MethodType
@@ -112,14 +112,9 @@ def load_models(device="cuda"):
     )
     vlm.eval()
     
-    # Optional: Move only LM head to CPU for extra memory
-    try:
-        vlm.config.torch_dtype = torch.float16
-        vlm = vlm.half()
-        vlm.lm_head = vlm.lm_head.cpu()
-        print("✅ LM head moved to CPU for extra memory savings")
-    except Exception as e:
-        print(f"⚠️ Could not move LM head to CPU: {e}")
+    # REMOVED: Don't move LM head to CPU - causes device mismatch during inference
+    # The device_map="auto" should handle memory allocation appropriately
+    print("✅ Using automatic device mapping for optimal memory allocation")
     
     clear_memory()
     print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
@@ -210,10 +205,9 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
 
     print(f"💾 GPU memory after video loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # Generate original caption - CRITICAL: Pass tensor directly, not in list
+    # Generate original caption - Pass tensor directly to mm_infer
     print("Generating original caption...")
     with torch.inference_mode():
-        # FIXED: Pass the 4D tensor directly, not wrapped in a list
         video_tensor_for_caption = vid_tensor4d.detach()
         print(f"📐 Video tensor format: {video_tensor_for_caption.shape}")
         
@@ -291,7 +285,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     vid_tensor4d.grad = None
     clear_memory()
 
-    # Generate adversarial caption - Again, pass tensor directly
+    # Generate adversarial caption - Pass tensor directly
     print("Generating adversarial caption...")
     with torch.inference_mode():
         adv_caption = mm_infer(
