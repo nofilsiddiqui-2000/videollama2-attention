@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (v16 Fixed - Working Version)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (FINAL with Real Gradients)
 import os, sys, cv2, argparse, math, gc
 from pathlib import Path
 from types import MethodType
@@ -80,7 +80,7 @@ def load_models(device="cuda"):
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",
-        max_memory={0: "16GiB", "cpu": "64GiB"},  # Conservative limit
+        max_memory={0: "16GiB", "cpu": "64GiB"},
         offload_folder=offload_dir,
         offload_state_dict=True
     )
@@ -138,12 +138,12 @@ def fix_video_tensor_channels(video_tensor):
 
 def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                       epsilon=0.03, device="cuda", margin=0.3):
-    """FGSM attack with detached backbone approach"""
+    """FGSM attack with proper gradient computation"""
     clear_memory()
     
     print(f"💾 GPU memory before processing: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     
-    # Process video - KEEP v16 working approach (dictionary access)
+    # Process video
     print("Processing video...")
     try:
         vid_tensor4d = vprocessor["video"](video_path).to(device, dtype=torch.float16)
@@ -181,63 +181,54 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     clear_memory()
     print(f"💾 GPU memory after original caption: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # FIXED: Detached backbone FGSM attack with proper gradient handling
-    print("Performing FGSM attack with detached backbone...")
+    # CRITICAL FIX: Use simple pixel-space loss for true FGSM
+    print("Performing FGSM attack with pixel-space gradients...")
     
-    frame_count = vid_tensor4d.shape[0]
+    # Simple approach: maximize L2 norm of features but compute gradients properly
+    total_loss = 0
     
-    # Initialize gradients to zero
-    if vid_tensor4d.grad is None:
-        vid_tensor4d.grad = torch.zeros_like(vid_tensor4d)
-    
-    # Process each frame individually with detached backbone
-    for i in range(frame_count):
-        # CRITICAL FIX: Create a new tensor from the slice that requires grad
-        single_frame_data = vid_tensor4d[i:i+1].clone()  # Clone the data
-        single_frame = single_frame_data.requires_grad_(True)  # Create new tensor with grad
-        
-        print(f"🔍 Processing frame {i+1}/{frame_count}, shape: {single_frame.shape}")
-        
+    with torch.enable_grad():
+        # Process all frames at once but with minimal memory
         try:
-            # Use autocast for better memory efficiency
-            with torch.autocast("cuda", dtype=torch.float16):
-                # CRITICAL: Detach the vision backbone to avoid storing gradients through CLIP
-                with torch.no_grad():  # <- no grad for CLIP backbone
-                    feat = vlm.model.vision_tower(single_frame)  # Pass 4D tensor directly
+            # Process just one frame at a time but keep gradients
+            for i in range(vid_tensor4d.shape[0]):
+                single_frame = vid_tensor4d[i:i+1]  # (1, C, H, W) - this maintains gradients
                 
-                feat = feat.detach()  # stop computation graph
+                print(f"🔍 Processing frame {i+1}/4 for gradients, shape: {single_frame.shape}")
                 
-                # Simple energy function - any differentiable scalar works
-                energy = -(feat ** 2).mean()
+                # Get features WITHOUT detaching - this keeps gradients
+                feat = vlm.model.vision_tower(single_frame)
                 
-                # Ask autograd only for ∂E/∂input (not through CLIP backbone)
-                grad, = torch.autograd.grad(
-                    energy, single_frame, 
-                    retain_graph=False, 
-                    create_graph=False
-                )
-            
-            # Report per-frame grad norm
-            grad_norm_frame = grad.norm().item()
-            print(f"   - grad norm {grad_norm_frame:.4f}")
-            
-            # Accumulate gradient for this frame
-            vid_tensor4d.grad[i:i+1] += grad  # Add gradient for this frame
-            
-            # Immediate cleanup
-            del feat, energy, grad, single_frame
-            clear_memory()
-            
+                # Simple loss - maximize feature magnitudes 
+                frame_loss = -(feat ** 2).mean()
+                total_loss += frame_loss
+                
+                print(f"   - frame loss: {frame_loss.item():.6f}")
+                
+                # Clear intermediate
+                del feat
+                clear_memory()
+        
         except torch.cuda.OutOfMemoryError:
-            print(f"⚠️ OOM on frame {i+1}, skipping...")
-            continue
-        except Exception as e:
-            print(f"⚠️ Error on frame {i+1}: {e}, skipping...")
-            continue
-    
-    # Check final gradients
-    grad_norm = vid_tensor4d.grad.norm().item()
-    print(f"📈 Total gradient norm: {grad_norm:.6f}")
+            print("⚠️ OOM during gradient computation, using fallback loss")
+            # Fallback: simple pixel loss
+            total_loss = -(vid_tensor4d ** 2).mean()
+        
+        print(f"🔍 Total loss: {total_loss.item():.6f}")
+        
+        # Backward pass
+        vlm.zero_grad()
+        total_loss.backward()
+        
+        # Check gradients
+        if vid_tensor4d.grad is not None:
+            grad_norm = vid_tensor4d.grad.norm().item()
+            print(f"📈 Real gradient norm: {grad_norm:.6f}")
+        else:
+            print("⚠️ No gradients computed, creating zero gradients")
+            vid_tensor4d.grad = torch.zeros_like(vid_tensor4d)
+            grad_norm = 0.0
+
     print(f"💾 GPU memory after attack: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
     # FGSM step
@@ -271,8 +262,8 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         
         for i in range(vid_tensor4d.shape[0]):
             try:
-                orig_frame = vid_tensor4d[i:i+1].detach()  # (1, C, H, W) - correct format
-                adv_frame = vid_adv4d[i:i+1].detach()     # (1, C, H, W) - correct format
+                orig_frame = vid_tensor4d[i:i+1].detach()
+                adv_frame = vid_adv4d[i:i+1].detach()
                 
                 orig_feat = vlm.model.vision_tower(orig_frame).view(-1)
                 adv_feat = vlm.model.vision_tower(adv_frame).view(-1)
