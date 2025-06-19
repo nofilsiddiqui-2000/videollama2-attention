@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (Enhanced with GPT Review Fixes)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (Final Memory-Optimized)
 import os, sys, cv2, argparse, math, gc, tempfile
 from pathlib import Path
 from types import MethodType
@@ -25,8 +25,8 @@ def setup_environment():
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # Conservative memory allocation to avoid expandable_segment bug
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:32,roundup_power2_divisions:16",
+        # Ultra-conservative to avoid OOM
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:16,roundup_power2_divisions:32",
     })
     
     # Set up cache directories
@@ -103,12 +103,12 @@ def enable_grad_vision_tower(vlm):
     print("✅ VisionTower patched with gradient support")
 
 def load_models(device="cuda", verbose=True):
-    """Load models with aggressive memory optimization"""
+    """Load models with ultra-conservative memory settings"""
     clear_memory()
     
-    # GPT FIX: Better seed initialization (before model loading)
+    # Better seed initialization
     torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)  # Also seed GPU RNG
+    torch.cuda.manual_seed_all(42)
     
     if verbose:
         print("Loading VideoLLaMA-2 with device offloading...")
@@ -117,13 +117,13 @@ def load_models(device="cuda", verbose=True):
     # Use tempfile for offload directory
     offload_dir = tempfile.mkdtemp(prefix="vllama_offload_")
     
-    # Conservative memory limit to avoid allocator issues
+    # ULTRA-CONSERVATIVE: Even lower memory limit
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",
-        max_memory={0: "15GiB", "cpu": "64GiB"},  # Conservative limit
+        max_memory={0: "14GiB", "cpu": "64GiB"},  # Even more conservative
         offload_folder=offload_dir,
         offload_state_dict=True
     )
@@ -192,7 +192,7 @@ def fix_video_tensor_channels(video_tensor, verbose=True):
 
 def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                       epsilon=0.03, device="cuda", verbose=True):
-    """FGSM attack with enhanced gradient handling and metrics"""
+    """FGSM attack with frame-by-frame gradient computation to avoid OOM"""
     clear_memory()
     
     if verbose:
@@ -211,14 +211,14 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     # Fix channel issues
     vid_tensor4d = fix_video_tensor_channels(vid_tensor4d, verbose)
     
-    # GPT FIX: Apply channels_last BEFORE slicing for zero-copy operations
+    # Apply channels_last BEFORE slicing
     vid_tensor4d = vid_tensor4d.to(memory_format=torch.channels_last)
     
-    # GPT CRITICAL FIX: Make tensor a proper leaf and retain gradients
+    # Make tensor a proper leaf and retain gradients
     vid_tensor4d = vid_tensor4d.detach().requires_grad_(True)
-    vid_tensor4d.retain_grad()  # Ensure gradients are kept alive
+    vid_tensor4d.retain_grad()
     
-    # Better frame sampling (uniform stride)
+    # Better frame sampling
     target_frames = 4
     if vid_tensor4d.shape[0] > target_frames:
         T = vid_tensor4d.shape[0]
@@ -257,59 +257,72 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"Performing FGSM attack (ε={epsilon:.3f} → {scaled_epsilon:.3f} for [-1,1] range)...")
 
-    # Enhanced gradient computation
+    # MEMORY-CONSERVATIVE: Frame-by-frame gradient computation
+    grad_norm = 0.0
     try:
-        # Clear memory before gradient computation
-        clear_memory()
+        if verbose:
+            print("🔍 Computing gradients frame-by-frame to avoid OOM...")
         
-        # Use mixed precision if available and safe
-        autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else None
-        autocast_context = torch.cuda.amp.autocast(dtype=autocast_dtype) if autocast_dtype else torch.nullcontext()
-        
-        with autocast_context:
-            # Process all frames at once
-            features = vlm.model.vision_tower(vid_tensor4d)  # (T, num_tokens, dim)
-            
-            # Focus on CLS token for stronger signal
-            if features.dim() == 3:  # (T, num_tokens, dim)
-                cls_features = features[:, 0]  # (T, dim) - only CLS tokens
-                loss = -(cls_features.pow(2).mean())
-                if verbose:
-                    print(f"🔍 Using CLS token loss for stronger gradient signal")
-            else:
-                loss = -(features.pow(2).mean())
-                if verbose:
-                    print(f"🔍 Using full feature loss (fallback)")
-            
-            if verbose:
-                print(f"🔍 Processing all {vid_tensor4d.shape[0]} frames together")
-                print(f"   - total loss: {loss.item():.6f}")
-        
-        # Single backward pass
-        vlm.zero_grad(set_to_none=True)
-        loss.backward()
-        
-        # Check gradients
-        if vid_tensor4d.grad is not None:
-            # GPT FIX: Gradient normalization for stronger attacks
-            g = vid_tensor4d.grad
-            # Normalize gradient to unit L1 per frame for better perturbation distribution
-            g_norm = g.abs().mean(dim=[1,2,3], keepdim=True) + 1e-8
-            g_normalized = g / g_norm
-            vid_tensor4d.grad = g_normalized
-            
-            grad_norm = vid_tensor4d.grad.norm().item()
-            if verbose:
-                print(f"📈 Total gradient norm (normalized): {grad_norm:.6f}")
-        else:
-            if verbose:
-                print("⚠️ No gradients computed, creating zero gradients")
+        # Initialize gradient accumulator
+        if vid_tensor4d.grad is None:
             vid_tensor4d.grad = torch.zeros_like(vid_tensor4d)
-            grad_norm = 0.0
         
-        # Immediate cleanup
-        del features, loss
-        clear_memory()
+        # Process each frame individually
+        for i in range(vid_tensor4d.shape[0]):
+            try:
+                clear_memory()  # Clear before each frame
+                
+                # Extract single frame (maintains gradient connection)
+                single_frame = vid_tensor4d[i:i+1]
+                
+                if verbose:
+                    print(f"   - Processing frame {i+1}/{vid_tensor4d.shape[0]}")
+                
+                # Compute features for this frame only
+                features = vlm.model.vision_tower(single_frame)
+                
+                # Focus on CLS token
+                if features.dim() == 3:
+                    cls_features = features[:, 0]
+                    loss = -(cls_features.pow(2).mean())
+                else:
+                    loss = -(features.pow(2).mean())
+                
+                # Backward for this frame
+                vlm.zero_grad(set_to_none=True)
+                loss.backward()
+                
+                # Accumulate gradient if computed
+                if single_frame.grad is not None:
+                    # Normalize per-frame gradient
+                    g = single_frame.grad
+                    g_norm = g.abs().mean() + 1e-8
+                    g_normalized = g / g_norm
+                    
+                    # Add to accumulated gradient
+                    vid_tensor4d.grad[i:i+1] += g_normalized
+                    
+                    frame_grad_norm = g_normalized.norm().item()
+                    grad_norm += frame_grad_norm
+                    
+                    if verbose:
+                        print(f"     - Frame {i+1} grad norm: {frame_grad_norm:.6f}")
+                
+                # Cleanup
+                del features, loss
+                clear_memory()
+                
+            except torch.cuda.OutOfMemoryError:
+                if verbose:
+                    print(f"     - Frame {i+1} OOM, skipping")
+                continue
+            except Exception as e:
+                if verbose:
+                    print(f"     - Frame {i+1} error: {e}")
+                continue
+        
+        if verbose:
+            print(f"📈 Total accumulated gradient norm: {grad_norm:.6f}")
         
     except Exception as e:
         if verbose:
@@ -356,7 +369,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
             model=vlm, tokenizer=tok, modal="video", do_sample=False
         ).strip()
 
-    # Enhanced similarity computation (per-frame logging)
+    # Enhanced similarity computation
     if verbose:
         print("Computing feature similarity...")
     with torch.inference_mode():
@@ -386,7 +399,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         
         sim = np.mean(similarities) if similarities else 0.5
 
-    # GPT FIX: Calculate Sentence-BERT similarity for better semantic drift measurement
+    # Calculate semantic similarity
     if verbose:
         print("Computing semantic similarity...")
     sbert_sim = calculate_sbert_similarity(original_caption, adv_caption)
@@ -400,7 +413,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     
     if verbose:
         print(f"💾 Final GPU memory: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        # GPT FIX: Memory fragmentation insight
+        # Memory diagnostics
         if hasattr(torch.cuda, 'memory_summary'):
             print("🔍 CUDA Memory Summary:")
             print(torch.cuda.memory_summary(device=device, abbreviated=True))
@@ -423,7 +436,7 @@ def main():
         sys.exit("❌ CUDA GPU required for VideoLLaMA-2")
 
     if args.verbose:
-        print("🚀 Loading models with optimized memory allocation...")
+        print("🚀 Loading models with ultra-conservative memory allocation...")
     vlm, vprocessor, tok, offload_dir = load_models("cuda", args.verbose)
     enable_grad_vision_tower(vlm)
 
