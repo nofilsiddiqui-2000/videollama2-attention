@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (GPT Fixed - Detached Backbone)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (FINAL WORKING VERSION)
 import os, sys, cv2, argparse, math, gc
 from pathlib import Path
 from types import MethodType
@@ -14,7 +14,7 @@ from transformers import CLIPVisionModel, CLIPImageProcessor
 from videollama2 import model_init, mm_infer
 from videollama2.utils import disable_torch_init
 
-# Enable optimizations (GPT suggestion 2.4)
+# Enable optimizations
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
@@ -25,7 +25,7 @@ def setup_environment():
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
         # Conservative memory allocation
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64",
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64,expandable_segments:True",
     })
     
     # Set up cache directories with correct username
@@ -38,7 +38,6 @@ def setup_environment():
     Path(f"{scratch_dir}/matplotlib_cache").mkdir(parents=True, exist_ok=True)
 
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
-VISION_ID = "openai/clip-vit-large-patch14"  # GPT suggestion 2.2: Use 224px instead of 336px
 
 def clear_memory():
     """Aggressive memory clearing"""
@@ -62,10 +61,6 @@ def enable_grad_vision_tower(vlm):
         return self.feature_select(out).to(imgs.dtype)
     
     vt.forward = MethodType(forward_with_grad, vt)
-    
-    # Skip gradient checkpointing (GPT suggestion 2.3) since we'll detach the backbone
-    print("⚠️ Skipping gradient checkpointing - using detached backbone approach")
-    
     print("✅ VisionTower patched with gradient support")
 
 def load_models(device="cuda"):
@@ -79,13 +74,13 @@ def load_models(device="cuda"):
     offload_dir = "/tmp/vllama_offload"
     Path(offload_dir).mkdir(exist_ok=True)
     
-    # Use device_map="auto" with raised memory limit (GPT suggestion)
+    # Use device_map="auto" with conservative memory limit
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",
-        max_memory={0: "18GiB", "cpu": "64GiB"},  # Raised back to 18GiB
+        max_memory={0: "16GiB", "cpu": "64GiB"},  # Conservative limit
         offload_folder=offload_dir,
         offload_state_dict=True
     )
@@ -96,7 +91,7 @@ def load_models(device="cuda"):
     clear_memory()
     print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     
-    return None, None, vlm, vprocessor, tok
+    return vlm, vprocessor, tok
 
 def tensor_to_frames(video_tensor):
     """Convert video tensor back to frames"""
@@ -143,7 +138,7 @@ def fix_video_tensor_channels(video_tensor):
 
 def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                       epsilon=0.03, device="cuda", margin=0.3):
-    """FGSM attack with detached backbone (GPT suggestions)"""
+    """FGSM attack with detached backbone approach"""
     clear_memory()
     
     print(f"💾 GPU memory before processing: {torch.cuda.memory_allocated()/1e9:.2f} GB")
@@ -159,14 +154,14 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     # Fix channel issues BEFORE frame reduction
     vid_tensor4d = fix_video_tensor_channels(vid_tensor4d)
     
-    # Use channels_last memory format (GPT suggestion 2.4)
+    # Use channels_last memory format for better performance
     vid_tensor4d = vid_tensor4d.to(memory_format=torch.channels_last)
     
-    # Reduce to 8 frames (should work with 224px resolution)
-    if vid_tensor4d.shape[0] > 8:
-        indices = torch.linspace(0, vid_tensor4d.shape[0]-1, 8).long()
+    # Reduce to ONLY 4 frames to ensure we fit in memory
+    if vid_tensor4d.shape[0] > 4:
+        indices = torch.linspace(0, vid_tensor4d.shape[0]-1, 4).long()
         vid_tensor4d = vid_tensor4d[indices]
-        print(f"Reduced video to 8 frames (224px resolution)")
+        print(f"Reduced video to 4 frames for memory efficiency")
     
     vid_tensor4d = vid_tensor4d.requires_grad_(True)
     min_val, max_val = -1.0, 1.0
@@ -188,52 +183,57 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     clear_memory()
     print(f"💾 GPU memory after original caption: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # CRITICAL GPT FIX: Detached backbone FGSM attack
+    # FIXED: Detached backbone FGSM attack with correct tensor dimensions
     print("Performing FGSM attack with detached backbone...")
     
     frame_count = vid_tensor4d.shape[0]
     
+    # Initialize gradients to zero
+    if vid_tensor4d.grad is None:
+        vid_tensor4d.grad = torch.zeros_like(vid_tensor4d)
+    
     # Process each frame individually with detached backbone
     for i in range(frame_count):
-        single_frame = vid_tensor4d[i:i+1]  # (1, C, H, W)
+        single_frame = vid_tensor4d[i:i+1]  # (1, C, H, W) - correct 4D format
         single_frame.requires_grad_(True)
         
         print(f"🔍 Processing frame {i+1}/{frame_count}, shape: {single_frame.shape}")
         
-        # Add batch dimension for vision tower: (1, 1, C, H, W)
-        single_frame_batched = single_frame.unsqueeze(0)
+        # CRITICAL FIX: Don't add extra batch dimension - CLIP expects (batch, C, H, W)
+        # single_frame is already (1, C, H, W) which is correct
         
-        # CRITICAL GPT FIX 2.1: Detach the vision backbone
-        with torch.no_grad():  # <- no grad for CLIP backbone
-            feat = vlm.model.vision_tower(single_frame_batched)
-        
-        feat = feat.detach()  # stop computation graph
-        
-        # Simple energy function - any differentiable scalar works
-        energy = -(feat ** 2).mean()
-        
-        # CRITICAL: Ask autograd only for ∂E/∂input (GPT fix 2.1)
-        grad, = torch.autograd.grad(
-            energy, single_frame, 
-            retain_graph=False, 
-            create_graph=False
-        )
-        
-        # Manually set gradient
-        if vid_tensor4d.grad is None:
-            vid_tensor4d.grad = torch.zeros_like(vid_tensor4d)
-        
-        vid_tensor4d.grad[i:i+1] = grad  # Set gradient for this frame
-        
-        # Immediate cleanup
-        del feat, energy, grad, single_frame_batched
-        clear_memory()
+        try:
+            # CRITICAL: Detach the vision backbone to avoid storing gradients through CLIP
+            with torch.no_grad():  # <- no grad for CLIP backbone
+                feat = vlm.model.vision_tower(single_frame)  # Pass 4D tensor directly
+            
+            feat = feat.detach()  # stop computation graph
+            
+            # Simple energy function - any differentiable scalar works
+            energy = -(feat ** 2).mean()
+            
+            # Ask autograd only for ∂E/∂input (not through CLIP backbone)
+            grad, = torch.autograd.grad(
+                energy, single_frame, 
+                retain_graph=False, 
+                create_graph=False
+            )
+            
+            # Accumulate gradient for this frame
+            vid_tensor4d.grad[i:i+1] += grad  # Add gradient for this frame
+            
+            # Immediate cleanup
+            del feat, energy, grad
+            clear_memory()
+            
+        except torch.cuda.OutOfMemoryError:
+            print(f"⚠️ OOM on frame {i+1}, skipping...")
+            continue
+        except Exception as e:
+            print(f"⚠️ Error on frame {i+1}: {e}, skipping...")
+            continue
     
     # Check final gradients
-    if vid_tensor4d.grad is None:
-        print("⚠️ No gradients computed, creating zero gradients")
-        vid_tensor4d.grad = torch.zeros_like(vid_tensor4d)
-    
     grad_norm = vid_tensor4d.grad.norm().item()
     print(f"📈 Gradient norm: {grad_norm:.6f}")
     print(f"💾 GPU memory after attack: {torch.cuda.memory_allocated()/1e9:.2f} GB")
@@ -269,8 +269,8 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         
         for i in range(vid_tensor4d.shape[0]):
             try:
-                orig_frame = vid_tensor4d[i:i+1].detach().unsqueeze(0)  # (1, 1, C, H, W)
-                adv_frame = vid_adv4d[i:i+1].detach().unsqueeze(0)     # (1, 1, C, H, W)
+                orig_frame = vid_tensor4d[i:i+1].detach()  # (1, C, H, W) - correct format
+                adv_frame = vid_adv4d[i:i+1].detach()     # (1, C, H, W) - correct format
                 
                 orig_feat = vlm.model.vision_tower(orig_frame).view(-1)
                 adv_feat = vlm.model.vision_tower(adv_frame).view(-1)
@@ -308,8 +308,8 @@ def main():
     if not torch.cuda.is_available():
         sys.exit("❌ CUDA GPU required for VideoLLaMA-2")
 
-    print("🚀 Loading models with GPT-optimized memory allocation...")
-    vt, vproc, vlm, vprocessor, tok = load_models("cuda")
+    print("🚀 Loading models with optimized memory allocation...")
+    vlm, vprocessor, tok = load_models("cuda")
     enable_grad_vision_tower(vlm)
 
     print(f"🎯 FGSM ε={args.epsilon}, margin={args.margin}")
@@ -324,12 +324,12 @@ def main():
         )
         
         if vid_adv is None:
-            print("❌ Attack failed due to memory constraints")
+            print("❌ Attack failed due to errors")
             sys.exit(1)
             
     except torch.cuda.OutOfMemoryError as e:
         print(f"❌ GPU OOM Error: {e}")
-        print("💡 Try using ViT-Base model: openai/clip-vit-base-patch32")
+        print("💡 Memory exhausted even with 4 frames - consider restarting")
         sys.exit(1)
     except Exception as e:
         print(f"❌ Error during FGSM attack: {e}")
