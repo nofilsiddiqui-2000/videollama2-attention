@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (Memory Allocator Fix)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (Enhanced with GPT Review Fixes)
 import os, sys, cv2, argparse, math, gc, tempfile
 from pathlib import Path
 from types import MethodType
@@ -25,7 +25,7 @@ def setup_environment():
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # FIX: More conservative memory allocation to avoid expandable_segment bug
+        # Conservative memory allocation to avoid expandable_segment bug
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:32,roundup_power2_divisions:16",
     })
     
@@ -58,6 +58,26 @@ def calculate_linf_norm(delta):
     """Calculate L-infinity norm of perturbation"""
     return torch.max(torch.abs(delta)).item()
 
+def calculate_sbert_similarity(text1, text2):
+    """Calculate Sentence-BERT similarity for better semantic drift measurement"""
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        embeddings = model.encode([text1, text2])
+        similarity = F.cosine_similarity(
+            torch.tensor(embeddings[0:1]), 
+            torch.tensor(embeddings[1:2]), 
+            dim=1
+        ).item()
+        return similarity
+    except ImportError:
+        # Fallback to simple token overlap if sentence-transformers not available
+        tokens1 = set(text1.lower().split())
+        tokens2 = set(text2.lower().split())
+        if not tokens1 or not tokens2:
+            return 0.0
+        return len(tokens1 & tokens2) / len(tokens1 | tokens2)
+
 def enable_grad_vision_tower(vlm):
     """Enable gradients with proper checkpointing"""
     vt = vlm.model.vision_tower
@@ -86,9 +106,9 @@ def load_models(device="cuda", verbose=True):
     """Load models with aggressive memory optimization"""
     clear_memory()
     
-    # Better seed initialization
+    # GPT FIX: Better seed initialization (before model loading)
     torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
+    torch.cuda.manual_seed_all(42)  # Also seed GPU RNG
     
     if verbose:
         print("Loading VideoLLaMA-2 with device offloading...")
@@ -97,13 +117,13 @@ def load_models(device="cuda", verbose=True):
     # Use tempfile for offload directory
     offload_dir = tempfile.mkdtemp(prefix="vllama_offload_")
     
-    # Use device_map="auto" with conservative memory limit
+    # Conservative memory limit to avoid allocator issues
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",
-        max_memory={0: "15GiB", "cpu": "64GiB"},  # Slightly more conservative
+        max_memory={0: "15GiB", "cpu": "64GiB"},  # Conservative limit
         offload_folder=offload_dir,
         offload_state_dict=True
     )
@@ -172,7 +192,7 @@ def fix_video_tensor_channels(video_tensor, verbose=True):
 
 def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                       epsilon=0.03, device="cuda", verbose=True):
-    """FGSM attack with memory allocator fix"""
+    """FGSM attack with enhanced gradient handling and metrics"""
     clear_memory()
     
     if verbose:
@@ -186,18 +206,19 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     except Exception as e:
         if verbose:
             print(f"⚠️ Processor failed: {e}")
-        return None, "Error", "Error", None, 0.0, 0.0, 0.0
+        return None, "Error", "Error", None, 0.0, 0.0, 0.0, 0.0
 
     # Fix channel issues
     vid_tensor4d = fix_video_tensor_channels(vid_tensor4d, verbose)
     
-    # Apply channels_last BEFORE slicing
+    # GPT FIX: Apply channels_last BEFORE slicing for zero-copy operations
     vid_tensor4d = vid_tensor4d.to(memory_format=torch.channels_last)
     
-    # Make tensor a proper leaf after all transformations
+    # GPT CRITICAL FIX: Make tensor a proper leaf and retain gradients
     vid_tensor4d = vid_tensor4d.detach().requires_grad_(True)
+    vid_tensor4d.retain_grad()  # Ensure gradients are kept alive
     
-    # Reduce to frames with better sampling
+    # Better frame sampling (uniform stride)
     target_frames = 4
     if vid_tensor4d.shape[0] > target_frames:
         T = vid_tensor4d.shape[0]
@@ -236,13 +257,16 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"Performing FGSM attack (ε={epsilon:.3f} → {scaled_epsilon:.3f} for [-1,1] range)...")
 
-    # FIX: More conservative gradient computation to avoid allocator bug
+    # Enhanced gradient computation
     try:
         # Clear memory before gradient computation
         clear_memory()
         
-        # Use regular precision (not mixed) to avoid allocator issues
-        with torch.enable_grad():
+        # Use mixed precision if available and safe
+        autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else None
+        autocast_context = torch.cuda.amp.autocast(dtype=autocast_dtype) if autocast_dtype else torch.nullcontext()
+        
+        with autocast_context:
             # Process all frames at once
             features = vlm.model.vision_tower(vid_tensor4d)  # (T, num_tokens, dim)
             
@@ -267,9 +291,16 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         
         # Check gradients
         if vid_tensor4d.grad is not None:
+            # GPT FIX: Gradient normalization for stronger attacks
+            g = vid_tensor4d.grad
+            # Normalize gradient to unit L1 per frame for better perturbation distribution
+            g_norm = g.abs().mean(dim=[1,2,3], keepdim=True) + 1e-8
+            g_normalized = g / g_norm
+            vid_tensor4d.grad = g_normalized
+            
             grad_norm = vid_tensor4d.grad.norm().item()
             if verbose:
-                print(f"📈 Total gradient norm: {grad_norm:.6f}")
+                print(f"📈 Total gradient norm (normalized): {grad_norm:.6f}")
         else:
             if verbose:
                 print("⚠️ No gradients computed, creating zero gradients")
@@ -302,7 +333,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         perturbation = vid_adv4d - vid_tensor4d
         perturbation_norm = perturbation.norm().item()
         
-        # Calculate both PSNR and L-inf norm
+        # Calculate metrics
         psnr = calculate_psnr(vid_tensor4d, vid_adv4d).item()
         linf_norm = calculate_linf_norm(perturbation)
         
@@ -354,6 +385,13 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                 similarities.append(0.5)
         
         sim = np.mean(similarities) if similarities else 0.5
+
+    # GPT FIX: Calculate Sentence-BERT similarity for better semantic drift measurement
+    if verbose:
+        print("Computing semantic similarity...")
+    sbert_sim = calculate_sbert_similarity(original_caption, adv_caption)
+    if verbose:
+        print(f"📊 SBERT similarity: {sbert_sim:.4f}")
     
     # Better cleanup
     vid_orig = vid_tensor4d.clone().detach()
@@ -362,8 +400,12 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     
     if verbose:
         print(f"💾 Final GPU memory: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+        # GPT FIX: Memory fragmentation insight
+        if hasattr(torch.cuda, 'memory_summary'):
+            print("🔍 CUDA Memory Summary:")
+            print(torch.cuda.memory_summary(device=device, abbreviated=True))
     
-    return vid_adv4d.cpu(), original_caption, adv_caption, vid_orig.cpu(), sim, psnr, linf_norm
+    return vid_adv4d.cpu(), original_caption, adv_caption, vid_orig.cpu(), sim, psnr, linf_norm, sbert_sim
 
 def main():
     # Set up environment first
@@ -393,7 +435,7 @@ def main():
         print(f"💾 Available GPU memory: {free_memory/1e9:.2f} GB")
     
     try:
-        (vid_adv, orig_cap, adv_cap, vid_orig, feat_sim, psnr, linf_norm) = fgsm_attack_video(
+        (vid_adv, orig_cap, adv_cap, vid_orig, feat_sim, psnr, linf_norm, sbert_sim) = fgsm_attack_video(
             args.video, vlm, vprocessor, tok, args.epsilon, "cuda", args.verbose
         )
         
@@ -424,6 +466,7 @@ def main():
         print(f"📝 Original: {orig_cap}")
         print(f"🔴 Adversarial: {adv_cap}")
         print(f"📊 Feature similarity: {feat_sim:.4f}")
+        print(f"📊 SBERT similarity: {sbert_sim:.4f}")
         print(f"📊 PSNR: {psnr:.2f} dB")
         print(f"📊 L∞ norm: {linf_norm:.6f}")
 
@@ -448,8 +491,8 @@ def main():
     need_header = not cap_path.exists() or cap_path.stat().st_size == 0
     with cap_path.open("a", encoding="utf-8") as f:
         if need_header:
-            f.write("Original\tAdversarial\tFeatureCosSim\tBERTScoreF1\tPSNR_dB\tLinf_Norm\n")
-        f.write(f"{orig_cap}\t{adv_cap}\t{feat_sim:.4f}\t{bert_f1:.4f}\t{psnr:.2f}\t{linf_norm:.6f}\n")
+            f.write("Original\tAdversarial\tFeatureCosSim\tSBERT_Sim\tBERTScoreF1\tPSNR_dB\tLinf_Norm\n")
+        f.write(f"{orig_cap}\t{adv_cap}\t{feat_sim:.4f}\t{sbert_sim:.4f}\t{bert_f1:.4f}\t{psnr:.2f}\t{linf_norm:.6f}\n")
     
     if args.verbose:
         print(f"✅ Results saved to {cap_path}")
@@ -473,7 +516,7 @@ def main():
         if args.verbose:
             print(f"✅ Sample frames saved to {out_dir}")
     except Exception as e:
-        if verbose:
+        if args.verbose:
             print(f"⚠️ Frame saving failed: {e}")
 
     print("🏁 Complete!")
