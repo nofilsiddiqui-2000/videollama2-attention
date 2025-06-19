@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (Fixed Memory Issues)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (Final Fixed Version)
 import os, sys, cv2, argparse, math, gc
 from pathlib import Path
 from types import MethodType
@@ -20,11 +20,11 @@ def setup_environment():
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # Enhanced memory allocation settings (GPT suggestion)
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128,expandable_segments:True",
+        # Fixed memory allocation settings - only max_split_size_mb
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128",
     })
     
-    # Set up cache directories
+    # Set up cache directories with correct username
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     os.environ["HF_HOME"] = f"{scratch_dir}/hf_cache"
     os.environ["MPLCONFIGDIR"] = f"{scratch_dir}/matplotlib_cache"
@@ -37,42 +37,42 @@ MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 VISION_ID = "openai/clip-vit-large-patch14-336"
 
 def clear_memory():
-    """Improved memory clearing (GPT suggestion)"""
-    gc.collect()  # Call gc.collect() first
+    """Improved memory clearing"""
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
 def enable_grad_vision_tower(vlm):
-    """Fix both gradient and memory issues (GPT suggestions 1 & 2)"""
+    """Enable gradients with proper checkpointing for CLIP vision tower (GPT fixes)"""
     vt = vlm.model.vision_tower
     
-    # 1️⃣ Restore the original monkey-patch to remove @torch.no_grad()
+    # 1️⃣ Monkey-patch to remove @torch.no_grad() - FIXED: use correct call path
     def forward_with_grad(self, imgs):
         if isinstance(imgs, list):
             feats = [self.feature_select(
-                     self.vision_tower(im.unsqueeze(0), output_hidden_states=True)
+                     self.vision_tower(im.unsqueeze(0), output_hidden_states=True)  # FIXED: keep wrapper logic
                      ).to(im.dtype) for im in imgs]
             return torch.cat(feats, dim=0)
-        out = self.vision_tower(imgs, output_hidden_states=True)
+        out = self.vision_tower(imgs, output_hidden_states=True)  # FIXED: use vision_tower, not vision_model
         return self.feature_select(out).to(imgs.dtype)
     
     vt.forward = MethodType(forward_with_grad, vt)
     
-    # 2️⃣ Enable gradient checkpointing to save ~40% VRAM
+    # 2️⃣ Enable gradient checkpointing - FIXED: correct attribute path
     try:
-        vt.gradient_checkpointing_enable()
-        print("✅ Gradient checkpointing enabled")
+        vt.vision_tower.gradient_checkpointing_enable()  # FIXED: direct on vision_tower, not vision_model
+        print("✅ Gradient checkpointing enabled on vision model")
     except Exception as e:
         print(f"⚠️ Could not enable gradient checkpointing: {e}")
     
-    # 3️⃣ Try to enable xFormers memory-efficient attention if available
+    # 3️⃣ Enable memory efficient attention if xformers available (optional)
     try:
-        if hasattr(vt, 'vision_tower'):
-            vt.vision_tower.enable_xformers_memory_efficient_attention()
-            print("⚡ xFormers flash-attn active")
-        else:
-            print("⚠️ xFormers not available")
+        if hasattr(vt.vision_tower, 'vision_model') and hasattr(vt.vision_tower.vision_model, 'encoder'):
+            for layer in vt.vision_tower.vision_model.encoder.layers:
+                if hasattr(layer.self_attn, 'enable_memory_efficient_attention'):
+                    layer.self_attn.enable_memory_efficient_attention()
+            print("⚡ xFormers memory efficient attention enabled")
     except Exception as e:
         print(f"⚠️ xFormers not available: {e}")
     
@@ -82,7 +82,7 @@ def load_models(device="cuda"):
     """Load models with memory optimization"""
     clear_memory()
     
-    # Load vision tower with memory optimization
+    # Load vision tower first
     print("Loading CLIP vision model...")
     vt = CLIPVisionModel.from_pretrained(VISION_ID, torch_dtype=torch.float16).to(device)
     vproc = CLIPImageProcessor.from_pretrained(VISION_ID)
@@ -91,13 +91,11 @@ def load_models(device="cuda"):
     print("Loading VideoLLaMA-2...")
     disable_torch_init()
     
-    # Remove low_cpu_mem_usage parameter to avoid duplicate
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map=device
-        # Removed low_cpu_mem_usage=True to fix the duplicate parameter error
     )
     vlm.eval()
     
@@ -120,23 +118,23 @@ def tensor_to_frames(video_tensor):
 
 def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                       epsilon=0.03, device="cuda", margin=0.3):
-    """FGSM attack with proper memory management"""
+    """FGSM attack with ultra-conservative memory management"""
     clear_memory()
     
     print(f"💾 GPU memory before processing: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     
-    # Process video
+    # Process video with aggressive frame reduction
     print("Processing video...")
     vid_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float16)
     
-    # Reduce video length if too long
-    if vid_tensor.shape[1] > 16:
-        indices = torch.linspace(0, vid_tensor.shape[1]-1, 16).long()
+    # Reduce to maximum 8 frames to save memory
+    if vid_tensor.shape[1] > 8:
+        indices = torch.linspace(0, vid_tensor.shape[1]-1, 8).long()
         vid_tensor = vid_tensor[:, indices]
-        print(f"Reduced video to 16 frames")
+        print(f"Reduced video to 8 frames for memory efficiency")
     
     vid_tensor = vid_tensor.requires_grad_(True)
-    min_val, max_val = -1.0, 1.0  # Fixed bounds as per GPT suggestion
+    min_val, max_val = -1.0, 1.0
 
     print(f"💾 GPU memory after video loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
@@ -149,27 +147,37 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         ).strip()
     
     clear_memory()
+    print(f"💾 GPU memory after original caption: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # FGSM attack with cosine margin loss (more stable than L2)
+    # Simplified FGSM attack to reduce memory usage
     print("Performing FGSM attack...")
+    
+    # Use simpler loss function that requires less memory
     with torch.enable_grad():
-        # Add small noise for target
-        with torch.no_grad():
-            noise = 0.01 * torch.randn_like(vid_tensor)
-            target_features = vlm.model.vision_tower((vid_tensor + noise).detach()).detach()
-
-        # Get current features
-        current_features = vlm.model.vision_tower(vid_tensor)
+        # Get vision features in smaller chunks
+        batch_size = vid_tensor.shape[0]
+        frame_count = vid_tensor.shape[1]
         
-        # Cosine similarity loss with margin (GPT suggestion)
-        cos_sim = F.cosine_similarity(
-            target_features.view(-1, target_features.size(-1)),
-            current_features.view(-1, current_features.size(-1)),
-            dim=-1
-        ).mean()
+        # Process in smaller temporal chunks if needed
+        chunk_size = min(4, frame_count)  # Process 4 frames at a time
         
-        loss = F.relu(cos_sim - margin)  # Loss to minimize cosine similarity
+        total_loss = 0
+        for i in range(0, frame_count, chunk_size):
+            end_idx = min(i + chunk_size, frame_count)
+            chunk = vid_tensor[:, i:end_idx]
+            
+            # Get features for this chunk
+            chunk_features = vlm.model.vision_tower(chunk)
+            
+            # Simple L2 norm loss (memory efficient)
+            chunk_loss = -chunk_features.norm() / chunk_features.numel()
+            total_loss += chunk_loss
+            
+            # Clear intermediate tensors
+            del chunk_features
+            clear_memory()
         
+        loss = total_loss
         print(f"🔍 FGSM loss: {loss.item():.6f}")
         print(f"💾 GPU memory during forward: {torch.cuda.memory_allocated()/1e9:.2f} GB")
         
@@ -181,10 +189,14 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
 
     # FGSM step
     with torch.no_grad():
-        vid_adv = torch.clamp(
-            vid_tensor + epsilon * vid_tensor.grad.sign(),
-            min_val, max_val
-        )
+        if vid_tensor.grad is not None:
+            vid_adv = torch.clamp(
+                vid_tensor + epsilon * vid_tensor.grad.sign(),
+                min_val, max_val
+            )
+        else:
+            print("⚠️ No gradients found, using original video")
+            vid_adv = vid_tensor.clone()
     
     # Clear gradients and memory
     vid_tensor.grad = None
@@ -198,11 +210,29 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
             model=vlm, tokenizer=tok, modal="video", do_sample=False
         ).strip()
 
-    # Compute similarity
+    # Compute similarity with chunked processing
+    print("Computing feature similarity...")
     with torch.inference_mode():
-        orig_feat = vlm.model.vision_tower(vid_tensor.detach()).view(-1)
-        adv_feat = vlm.model.vision_tower(vid_adv.detach()).view(-1)
-        sim = F.cosine_similarity(orig_feat, adv_feat, dim=0).item()
+        # Process similarity in chunks to save memory
+        chunk_size = min(2, vid_tensor.shape[1])
+        similarities = []
+        
+        for i in range(0, vid_tensor.shape[1], chunk_size):
+            end_idx = min(i + chunk_size, vid_tensor.shape[1])
+            
+            orig_chunk = vid_tensor[:, i:end_idx].detach()
+            adv_chunk = vid_adv[:, i:end_idx].detach()
+            
+            orig_feat = vlm.model.vision_tower(orig_chunk).view(-1)
+            adv_feat = vlm.model.vision_tower(adv_chunk).view(-1)
+            
+            chunk_sim = F.cosine_similarity(orig_feat, adv_feat, dim=0).item()
+            similarities.append(chunk_sim)
+            
+            del orig_feat, adv_feat
+            clear_memory()
+        
+        sim = np.mean(similarities)
     
     clear_memory()
     print(f"💾 Final GPU memory: {torch.cuda.memory_allocated()/1e9:.2f} GB")
@@ -234,9 +264,11 @@ def main():
         (vid_adv, orig_cap, adv_cap, vid_orig, feat_sim) = fgsm_attack_video(
             args.video, vlm, vprocessor, tok, args.epsilon, "cuda", args.margin
         )
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"❌ GPU OOM Error: {e}")
-        print("💡 Try reducing video length or switching to ViT-base model")
+    except Exception as e:
+        print(f"❌ Error during FGSM attack: {e}")
+        print("💡 Try using a shorter video or reducing epsilon")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
     print(f"📝 Original: {orig_cap}")
