@@ -25,7 +25,7 @@ def setup_environment():
     })
     
     # Set up cache directories
-    scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"  # Updated username
+    scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     os.environ["HF_HOME"] = f"{scratch_dir}/hf_cache"
     os.environ["MPLCONFIGDIR"] = f"{scratch_dir}/matplotlib_cache"
     
@@ -60,16 +60,23 @@ def enable_grad_vision_tower(vlm):
     vt.forward = MethodType(forward_with_grad, vt)
     
     # 2️⃣ Enable gradient checkpointing to save ~40% VRAM
-    vt.gradient_checkpointing_enable()
+    try:
+        vt.gradient_checkpointing_enable()
+        print("✅ Gradient checkpointing enabled")
+    except Exception as e:
+        print(f"⚠️ Could not enable gradient checkpointing: {e}")
     
     # 3️⃣ Try to enable xFormers memory-efficient attention if available
     try:
-        vt.vision_tower.enable_xformers_memory_efficient_attention()
-        print("⚡ xFormers flash-attn active")
-    except Exception:
-        pass
+        if hasattr(vt, 'vision_tower'):
+            vt.vision_tower.enable_xformers_memory_efficient_attention()
+            print("⚡ xFormers flash-attn active")
+        else:
+            print("⚠️ xFormers not available")
+    except Exception as e:
+        print(f"⚠️ xFormers not available: {e}")
     
-    print("✅ VisionTower patched + checkpointing enabled")
+    print("✅ VisionTower patched with gradient support")
 
 def load_models(device="cuda"):
     """Load models with memory optimization"""
@@ -83,12 +90,14 @@ def load_models(device="cuda"):
     
     print("Loading VideoLLaMA-2...")
     disable_torch_init()
+    
+    # Remove low_cpu_mem_usage parameter to avoid duplicate
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         torch_dtype=torch.float16, 
-        device_map=device,
-        low_cpu_mem_usage=True
+        device_map=device
+        # Removed low_cpu_mem_usage=True to fix the duplicate parameter error
     )
     vlm.eval()
     
