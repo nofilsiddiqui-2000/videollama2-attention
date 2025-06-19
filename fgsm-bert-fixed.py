@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (FINAL WORKING VERSION)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (v16 Fixed - Working Version)
 import os, sys, cv2, argparse, math, gc
 from pathlib import Path
 from types import MethodType
@@ -143,7 +143,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     
     print(f"💾 GPU memory before processing: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     
-    # Process video
+    # Process video - KEEP v16 working approach (dictionary access)
     print("Processing video...")
     try:
         vid_tensor4d = vprocessor["video"](video_path).to(device, dtype=torch.float16)
@@ -154,14 +154,12 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     # Fix channel issues BEFORE frame reduction
     vid_tensor4d = fix_video_tensor_channels(vid_tensor4d)
     
-    # Use channels_last memory format for better performance
-    vid_tensor4d = vid_tensor4d.to(memory_format=torch.channels_last)
-    
     # Reduce to ONLY 4 frames to ensure we fit in memory
     if vid_tensor4d.shape[0] > 4:
         indices = torch.linspace(0, vid_tensor4d.shape[0]-1, 4).long()
         vid_tensor4d = vid_tensor4d[indices]
         print(f"Reduced video to 4 frames for memory efficiency")
+        print(f"Using frame indices: {indices.tolist()}")
     
     vid_tensor4d = vid_tensor4d.requires_grad_(True)
     min_val, max_val = -1.0, 1.0
@@ -183,7 +181,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     clear_memory()
     print(f"💾 GPU memory after original caption: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # FIXED: Detached backbone FGSM attack with correct tensor dimensions
+    # FIXED: Detached backbone FGSM attack with proper gradient handling
     print("Performing FGSM attack with detached backbone...")
     
     frame_count = vid_tensor4d.shape[0]
@@ -194,36 +192,40 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     
     # Process each frame individually with detached backbone
     for i in range(frame_count):
-        single_frame = vid_tensor4d[i:i+1]  # (1, C, H, W) - correct 4D format
-        single_frame.requires_grad_(True)
+        # CRITICAL FIX: Create a new tensor from the slice that requires grad
+        single_frame_data = vid_tensor4d[i:i+1].clone()  # Clone the data
+        single_frame = single_frame_data.requires_grad_(True)  # Create new tensor with grad
         
         print(f"🔍 Processing frame {i+1}/{frame_count}, shape: {single_frame.shape}")
         
-        # CRITICAL FIX: Don't add extra batch dimension - CLIP expects (batch, C, H, W)
-        # single_frame is already (1, C, H, W) which is correct
-        
         try:
-            # CRITICAL: Detach the vision backbone to avoid storing gradients through CLIP
-            with torch.no_grad():  # <- no grad for CLIP backbone
-                feat = vlm.model.vision_tower(single_frame)  # Pass 4D tensor directly
+            # Use autocast for better memory efficiency
+            with torch.autocast("cuda", dtype=torch.float16):
+                # CRITICAL: Detach the vision backbone to avoid storing gradients through CLIP
+                with torch.no_grad():  # <- no grad for CLIP backbone
+                    feat = vlm.model.vision_tower(single_frame)  # Pass 4D tensor directly
+                
+                feat = feat.detach()  # stop computation graph
+                
+                # Simple energy function - any differentiable scalar works
+                energy = -(feat ** 2).mean()
+                
+                # Ask autograd only for ∂E/∂input (not through CLIP backbone)
+                grad, = torch.autograd.grad(
+                    energy, single_frame, 
+                    retain_graph=False, 
+                    create_graph=False
+                )
             
-            feat = feat.detach()  # stop computation graph
-            
-            # Simple energy function - any differentiable scalar works
-            energy = -(feat ** 2).mean()
-            
-            # Ask autograd only for ∂E/∂input (not through CLIP backbone)
-            grad, = torch.autograd.grad(
-                energy, single_frame, 
-                retain_graph=False, 
-                create_graph=False
-            )
+            # Report per-frame grad norm
+            grad_norm_frame = grad.norm().item()
+            print(f"   - grad norm {grad_norm_frame:.4f}")
             
             # Accumulate gradient for this frame
             vid_tensor4d.grad[i:i+1] += grad  # Add gradient for this frame
             
             # Immediate cleanup
-            del feat, energy, grad
+            del feat, energy, grad, single_frame
             clear_memory()
             
         except torch.cuda.OutOfMemoryError:
@@ -235,7 +237,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     
     # Check final gradients
     grad_norm = vid_tensor4d.grad.norm().item()
-    print(f"📈 Gradient norm: {grad_norm:.6f}")
+    print(f"📈 Total gradient norm: {grad_norm:.6f}")
     print(f"💾 GPU memory after attack: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
     # FGSM step
@@ -351,8 +353,9 @@ def main():
         batch_size=1
     )
     
-    P, R, F1 = scorer.score([adv_cap], [orig_cap])
-    bert_f1 = F1[0].item()
+    # Fixed variable naming
+    P, R, f1_tensor = scorer.score([adv_cap], [orig_cap])
+    bert_f1 = f1_tensor[0].item()
     print(f"🟣 BERTScore-F1: {bert_f1:.4f}")
 
     # Save results
