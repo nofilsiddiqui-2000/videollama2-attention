@@ -14,7 +14,7 @@ from transformers import CLIPVisionModel, CLIPImageProcessor
 from videollama2 import model_init, mm_infer
 from videollama2.utils import disable_torch_init
 
-# Enable TF32 for A100 and benchmarking (GPT suggestions #3)
+# Enable TF32 for A100 and benchmarking
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
@@ -24,7 +24,7 @@ def setup_environment():
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # Optimized memory allocation (GPT suggestion #3)
+        # Optimized memory allocation
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64",
     })
     
@@ -100,19 +100,19 @@ def load_models(device="cuda"):
     offload_dir = "/tmp/vllama_offload"
     Path(offload_dir).mkdir(exist_ok=True)
     
-    # Use device_map="auto" with higher memory limit (GPT suggestion #2)
+    # Use device_map="auto" with higher memory limit
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",  # GPU first, spill-over to CPU
-        max_memory={0: "30GiB", "cpu": "64GiB"},  # Raised from 18GiB (GPT fix)
+        max_memory={0: "30GiB", "cpu": "64GiB"},  # Raised from 18GiB
         offload_folder=offload_dir,
         offload_state_dict=True
     )
     vlm.eval()
     
-    # Optional: Move only LM head to CPU for extra memory (GPT suggestion #3)
+    # Optional: Move only LM head to CPU for extra memory
     try:
         vlm.config.torch_dtype = torch.float16
         vlm = vlm.half()
@@ -124,8 +124,8 @@ def load_models(device="cuda"):
     clear_memory()
     print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     
-    # CRITICAL FIX: Return the correct video processor (GPT fix #2.1)
-    return vt, vproc, vlm, vlm.video_processor, tok  # NOT vprocessor
+    # FIXED: Return the original vprocessor (which is the correct one)
+    return vt, vproc, vlm, vprocessor, tok
 
 def tensor_to_frames(video_tensor):
     """Convert video tensor back to frames - memory efficient"""
@@ -175,7 +175,7 @@ def fix_video_tensor_channels(video_tensor):
     print(f"📐 Final tensor shape: {video_tensor.shape}")
     return video_tensor
 
-def fgsm_attack_video(video_path, vlm, video_processor, tok,
+def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                       epsilon=0.03, device="cuda", margin=0.3):
     """FGSM attack with proper tensor format and robust gradient handling"""
     clear_memory()
@@ -184,11 +184,18 @@ def fgsm_attack_video(video_path, vlm, video_processor, tok,
     
     # Process video using the correct processor method
     print("Processing video...")
+    # Try different processor methods to find the right one
     try:
-        vid_tensor4d = video_processor(video_path).to(device, dtype=torch.float16)
-    except AttributeError:
-        # Fallback for older API
-        vid_tensor4d = video_processor["video"](video_path).to(device, dtype=torch.float16)
+        if hasattr(vprocessor, 'process_video'):
+            vid_tensor4d = vprocessor.process_video(video_path).to(device, dtype=torch.float16)
+        elif hasattr(vprocessor, '__call__'):
+            vid_tensor4d = vprocessor(video_path, modal='video').to(device, dtype=torch.float16)
+        else:
+            # Fallback to dictionary access
+            vid_tensor4d = vprocessor["video"](video_path).to(device, dtype=torch.float16)
+    except Exception as e:
+        print(f"⚠️ Processor method failed: {e}, trying fallback...")
+        vid_tensor4d = vprocessor["video"](video_path).to(device, dtype=torch.float16)
     
     # Fix channel issues BEFORE frame reduction
     vid_tensor4d = fix_video_tensor_channels(vid_tensor4d)
@@ -240,7 +247,7 @@ def fgsm_attack_video(video_path, vlm, video_processor, tok,
             # Get features for this chunk
             chunk_features = vlm.model.vision_tower(chunk5d)
             
-            # More robust loss that avoids zeros (GPT suggestion #2.2)
+            # More robust loss that avoids zeros
             chunk_loss = -torch.mean(torch.abs(chunk_features)) - 0.01 * chunk_features.norm()
             total_loss += chunk_loss
             
@@ -256,12 +263,12 @@ def fgsm_attack_video(video_path, vlm, video_processor, tok,
         vlm.zero_grad()
         loss.backward()
         
-        # CRITICAL FIX: Handle None gradients (GPT fix #2.2)
+        # CRITICAL FIX: Handle None gradients
         if vid_tensor4d.grad is None:
             print("⚠️ No gradients computed, creating zero gradients")
             vid_tensor4d.grad = torch.zeros_like(vid_tensor4d)
         
-        # Save gradient for analysis (GPT suggestion #2.4)
+        # Save gradient for analysis
         attack_grad = vid_tensor4d.grad.clone()
         grad_norm = attack_grad.norm().item()
         print(f"📈 Gradient norm: {grad_norm:.6f}")
@@ -280,7 +287,7 @@ def fgsm_attack_video(video_path, vlm, video_processor, tok,
         perturbation_norm = perturbation.norm().item()
         print(f"📈 Perturbation norm: {perturbation_norm:.6f}")
     
-    # Clear gradients and memory (GPT fix #2.4)
+    # Clear gradients and memory
     vid_tensor4d.grad = None
     clear_memory()
 
@@ -305,7 +312,7 @@ def fgsm_attack_video(video_path, vlm, video_processor, tok,
             end_idx = min(i + chunk_size, vid_tensor4d.shape[0])
             
             orig_chunk4d = vid_tensor4d[i:end_idx].detach()
-            adv_chunk4d = vid_adv4d[i:end_idx].detach()
+            adv_chunk4d = vid_adv4d[i:end_idx].detached()
             
             # Convert to 5D for vision_tower
             orig_chunk5d = orig_chunk4d.unsqueeze(0)
@@ -344,7 +351,7 @@ def main():
         sys.exit("❌ CUDA GPU required for VideoLLaMA-2")
 
     print("🚀 Loading models with memory offloading...")
-    vt, vproc, vlm, video_processor, tok = load_models("cuda")  # Fixed return
+    vt, vproc, vlm, vprocessor, tok = load_models("cuda")  # Back to original return
     enable_grad_vision_tower(vlm)
 
     print(f"🎯 FGSM ε={args.epsilon}, margin={args.margin}")
@@ -355,7 +362,7 @@ def main():
     
     try:
         (vid_adv, orig_cap, adv_cap, vid_orig, feat_sim) = fgsm_attack_video(
-            args.video, vlm, video_processor, tok, args.epsilon, "cuda", args.margin
+            args.video, vlm, vprocessor, tok, args.epsilon, "cuda", args.margin
         )
     except torch.cuda.OutOfMemoryError as e:
         print(f"❌ GPU OOM Error: {e}")
