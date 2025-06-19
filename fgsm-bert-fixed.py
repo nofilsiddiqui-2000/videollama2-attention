@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (GPT Fixed - Real Gradients)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (Fixed Position Embeddings)
 import os, sys, cv2, argparse, math, gc
 from pathlib import Path
 from types import MethodType
@@ -24,7 +24,7 @@ def setup_environment():
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # GPT suggestion 2.4: Fixed memory allocation with expandable_segments
+        # GPT suggestion: Fixed memory allocation with expandable_segments
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64,expandable_segments:True",
     })
     
@@ -62,7 +62,7 @@ def enable_grad_vision_tower(vlm):
     
     vt.forward = MethodType(forward_with_grad, vt)
     
-    # GPT CRITICAL FIX 2.2: Freeze parameters correctly instead of using no_grad()
+    # GPT CRITICAL FIX: Freeze parameters correctly instead of using no_grad()
     for p in vlm.model.vision_tower.parameters():
         p.requires_grad_(False)
     vlm.model.vision_tower.eval()
@@ -77,7 +77,7 @@ def load_models(device="cuda"):
     print("Loading VideoLLaMA-2 with device offloading...")
     disable_torch_init()
     
-    # GPT suggestion 4: Set seed for reproducibility
+    # GPT suggestion: Set seed for reproducibility
     torch.manual_seed(42)
     
     # Create offload directory
@@ -127,10 +127,9 @@ def fix_video_tensor_channels(video_tensor):
     frames, channels, height, width = video_tensor.shape
     print(f"📐 Dimensions: frames={frames}, channels={channels}, height={height}, width={width}")
     
-    # GPT suggestion 2.1: Resize to 224px to reduce memory usage
-    if height > 224 or width > 224:
-        print(f"🔧 Resizing from {height}x{width} to 224x224 for memory efficiency")
-        video_tensor = F.interpolate(video_tensor, size=(224, 224), mode='bilinear', align_corners=False)
+    # CRITICAL FIX: Don't resize! Keep 336x336 to match pre-trained position embeddings
+    # The model expects 336x336 resolution for proper position embedding alignment
+    print(f"✅ Keeping original resolution {height}x{width} to match position embeddings")
     
     # Fix channel issues if any
     if channels == 1:
@@ -153,7 +152,7 @@ def fix_video_tensor_channels(video_tensor):
 
 def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                       epsilon=0.03, device="cuda", margin=0.3):
-    """FGSM attack with real gradients (GPT fixes applied)"""
+    """FGSM attack with real gradients (position embedding fix)"""
     clear_memory()
     
     print(f"💾 GPU memory before processing: {torch.cuda.memory_allocated()/1e9:.2f} GB")
@@ -166,18 +165,18 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         print(f"⚠️ Processor failed: {e}")
         return None, "Error", "Error", None, 0.0
     
-    # Fix channel issues and resize BEFORE frame reduction
+    # Fix channel issues but DON'T resize (keeps 336x336)
     vid_tensor4d = fix_video_tensor_channels(vid_tensor4d)
     
-    # GPT suggestion: Can now handle 8 frames at 224px resolution
-    target_frames = 8
+    # Reduce to fewer frames since we're keeping 336x336 resolution
+    target_frames = 4  # Conservative for 336x336
     if vid_tensor4d.shape[0] > target_frames:
         indices = torch.linspace(0, vid_tensor4d.shape[0]-1, target_frames).long()
         vid_tensor4d = vid_tensor4d[indices]
-        print(f"Reduced video to {target_frames} frames for efficiency")
+        print(f"Reduced video to {target_frames} frames (keeping 336x336 resolution)")
         print(f"Using frame indices: {indices.tolist()}")
     
-    # GPT suggestion 2.3: Apply channels_last format once
+    # Apply channels_last format once
     vid_tensor4d = vid_tensor4d.to(memory_format=torch.channels_last).requires_grad_(True)
     min_val, max_val = -1.0, 1.0
 
@@ -207,15 +206,15 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if vid_tensor4d.grad is not None:
         vid_tensor4d.grad.zero_()
     
-    # GPT FIX: Process each frame with real gradients (not detached)
+    # Process each frame with real gradients (not detached)
     for i in range(frame_count):
-        # GPT CRITICAL FIX 1: Don't clone, use direct slice to maintain gradient connection
+        # GPT CRITICAL FIX: Don't clone, use direct slice to maintain gradient connection
         single_frame = vid_tensor4d[i:i+1]  # This maintains gradient connection
         
         print(f"🔍 Processing frame {i+1}/{frame_count}, shape: {single_frame.shape}")
         
         try:
-            # GPT CRITICAL FIX 1: Remove torch.no_grad() - use torch.set_grad_enabled(True) instead
+            # GPT CRITICAL FIX: Remove torch.no_grad() - use torch.set_grad_enabled(True) instead
             with torch.set_grad_enabled(True):
                 # Vision tower call WITHOUT detaching - keeps gradients
                 feat = vlm.model.vision_tower(single_frame)
@@ -225,7 +224,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                 
                 print(f"   - frame loss: {frame_loss.item():.6f}")
                 
-                # GPT CRITICAL FIX 3: Backward pass per frame to avoid accumulating graphs
+                # GPT CRITICAL FIX: Backward pass per frame to avoid accumulating graphs
                 frame_loss.backward(retain_graph=False)
                 
                 # Check if gradients were computed
@@ -238,7 +237,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                         vid_tensor4d.grad = torch.zeros_like(vid_tensor4d)
                     vid_tensor4d.grad[i:i+1] += single_frame.grad
                     
-                    # Clear frame gradients to free memory (GPT suggestion)
+                    # Clear frame gradients to free memory
                     single_frame.grad.zero_()
                 else:
                     print(f"   - no gradients computed for frame {i+1}")
@@ -364,7 +363,7 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     finally:
-        # GPT suggestion 4.2: Cleanup offload directory
+        # Cleanup offload directory
         try:
             import shutil
             offload_dir = "/tmp/vllama_offload"
@@ -393,13 +392,12 @@ def main():
     bert_f1 = f1_tensor[0].item()
     print(f"🟣 BERTScore-F1: {bert_f1:.4f}")
 
-    # Save results - GPT suggestion 4.1: Use newline separation
+    # Save results
     cap_path = Path(args.caption_file)
     need_header = not cap_path.exists() or cap_path.stat().st_size == 0
     with cap_path.open("a", encoding="utf-8") as f:
         if need_header:
             f.write("Original\tAdversarial\tFeatureCosSim\tBERTScoreF1\n")
-        # Use newlines for long text readability
         f.write(f"{orig_cap}\t{adv_cap}\t{feat_sim:.4f}\t{bert_f1:.4f}\n")
     print(f"✅ Results saved to {cap_path}")
 
