@@ -1,3 +1,6 @@
+# python videollama_fgsm_attack_fixed.py test/abc.mp4 --out results --epsilon 0.03 --alpha 0.35 --caption-file captions.txt --margin 0.3
+
+
 #!/usr/bin/env python3
 # videollama_fgsm_attack_memory_fixed.py • Working FGSM attacks with memory management
 
