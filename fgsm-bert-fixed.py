@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (Battle-tested Final Version)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (Fixed mm_infer Format)
 import os, sys, cv2, argparse, math, gc
 from pathlib import Path
 from types import MethodType
@@ -124,7 +124,6 @@ def load_models(device="cuda"):
     clear_memory()
     print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     
-    # FIXED: Return the original vprocessor (which is the correct one)
     return vt, vproc, vlm, vprocessor, tok
 
 def tensor_to_frames(video_tensor):
@@ -211,14 +210,15 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
 
     print(f"💾 GPU memory after video loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # Generate original caption - CRITICAL: Wrap 4D tensor in list
+    # Generate original caption - CRITICAL: Pass tensor directly, not in list
     print("Generating original caption...")
     with torch.inference_mode():
-        video_batch = [vid_tensor4d.detach()]  # ★ CRITICAL: List of 4D tensors ★
-        print(f"📐 Video batch format: list with tensor shape {video_batch[0].shape}")
+        # FIXED: Pass the 4D tensor directly, not wrapped in a list
+        video_tensor_for_caption = vid_tensor4d.detach()
+        print(f"📐 Video tensor format: {video_tensor_for_caption.shape}")
         
         original_caption = mm_infer(
-            video_batch,  # NOT vid_tensor4d or vid_tensor4d.unsqueeze(0)
+            video_tensor_for_caption,  # Direct tensor, not [video_tensor]
             "Describe the video in detail.",
             model=vlm, tokenizer=tok, modal="video", do_sample=False
         ).strip()
@@ -291,12 +291,11 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     vid_tensor4d.grad = None
     clear_memory()
 
-    # Generate adversarial caption - Again, wrap in list
+    # Generate adversarial caption - Again, pass tensor directly
     print("Generating adversarial caption...")
     with torch.inference_mode():
-        adv_video_batch = [vid_adv4d.detach()]  # ★ CRITICAL: List format ★
         adv_caption = mm_infer(
-            adv_video_batch,
+            vid_adv4d.detach(),  # Direct tensor, not [vid_adv4d]
             "Describe the video in detail.",
             model=vlm, tokenizer=tok, modal="video", do_sample=False
         ).strip()
@@ -312,7 +311,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
             end_idx = min(i + chunk_size, vid_tensor4d.shape[0])
             
             orig_chunk4d = vid_tensor4d[i:end_idx].detach()
-            adv_chunk4d = vid_adv4d[i:end_idx].detached()
+            adv_chunk4d = vid_adv4d[i:end_idx].detach()
             
             # Convert to 5D for vision_tower
             orig_chunk5d = orig_chunk4d.unsqueeze(0)
@@ -351,7 +350,7 @@ def main():
         sys.exit("❌ CUDA GPU required for VideoLLaMA-2")
 
     print("🚀 Loading models with memory offloading...")
-    vt, vproc, vlm, vprocessor, tok = load_models("cuda")  # Back to original return
+    vt, vproc, vlm, vprocessor, tok = load_models("cuda")
     enable_grad_vision_tower(vlm)
 
     print(f"🎯 FGSM ε={args.epsilon}, margin={args.margin}")
