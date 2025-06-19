@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (Final Memory-Optimized)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (Fixed Allocator Settings)
 import os, sys, cv2, argparse, math, gc, tempfile
 from pathlib import Path
 from types import MethodType
@@ -25,8 +25,8 @@ def setup_environment():
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # Ultra-conservative to avoid OOM
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:16,roundup_power2_divisions:32",
+        # FIX: Must be > 20 according to PyTorch requirements
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:32,roundup_power2_divisions:16",
     })
     
     # Set up cache directories
@@ -103,7 +103,7 @@ def enable_grad_vision_tower(vlm):
     print("✅ VisionTower patched with gradient support")
 
 def load_models(device="cuda", verbose=True):
-    """Load models with ultra-conservative memory settings"""
+    """Load models with conservative memory settings"""
     clear_memory()
     
     # Better seed initialization
@@ -117,13 +117,13 @@ def load_models(device="cuda", verbose=True):
     # Use tempfile for offload directory
     offload_dir = tempfile.mkdtemp(prefix="vllama_offload_")
     
-    # ULTRA-CONSERVATIVE: Even lower memory limit
+    # Conservative but valid memory limit
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",
-        max_memory={0: "14GiB", "cpu": "64GiB"},  # Even more conservative
+        max_memory={0: "15GiB", "cpu": "64GiB"},  # Back to 15GiB - still conservative
         offload_folder=offload_dir,
         offload_state_dict=True
     )
@@ -257,7 +257,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"Performing FGSM attack (ε={epsilon:.3f} → {scaled_epsilon:.3f} for [-1,1] range)...")
 
-    # MEMORY-CONSERVATIVE: Frame-by-frame gradient computation
+    # Frame-by-frame gradient computation to avoid OOM
     grad_norm = 0.0
     try:
         if verbose:
@@ -436,7 +436,7 @@ def main():
         sys.exit("❌ CUDA GPU required for VideoLLaMA-2")
 
     if args.verbose:
-        print("🚀 Loading models with ultra-conservative memory allocation...")
+        print("🚀 Loading models with conservative memory allocation...")
     vlm, vprocessor, tok, offload_dir = load_models("cuda", args.verbose)
     enable_grad_vision_tower(vlm)
 
