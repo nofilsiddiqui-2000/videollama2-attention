@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore evaluation for VideoLLaMA-2 (GPT Code Review Fixes)
+# FGSM + BERTScore evaluation for VideoLLaMA-2 (Memory Allocator Fix)
 import os, sys, cv2, argparse, math, gc, tempfile
 from pathlib import Path
 from types import MethodType
@@ -25,8 +25,8 @@ def setup_environment():
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # Fixed memory allocation with expandable_segments
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64,expandable_segments:True",
+        # FIX: More conservative memory allocation to avoid expandable_segment bug
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:32,roundup_power2_divisions:16",
     })
     
     # Set up cache directories
@@ -86,9 +86,9 @@ def load_models(device="cuda", verbose=True):
     """Load models with aggressive memory optimization"""
     clear_memory()
     
-    # GPT FIX 5: Better seed initialization
+    # Better seed initialization
     torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)  # Also seed GPU RNG
+    torch.cuda.manual_seed_all(42)
     
     if verbose:
         print("Loading VideoLLaMA-2 with device offloading...")
@@ -103,7 +103,7 @@ def load_models(device="cuda", verbose=True):
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",
-        max_memory={0: "16GiB", "cpu": "64GiB"},
+        max_memory={0: "15GiB", "cpu": "64GiB"},  # Slightly more conservative
         offload_folder=offload_dir,
         offload_state_dict=True
     )
@@ -172,7 +172,7 @@ def fix_video_tensor_channels(video_tensor, verbose=True):
 
 def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                       epsilon=0.03, device="cuda", verbose=True):
-    """FGSM attack with GPT code review fixes"""
+    """FGSM attack with memory allocator fix"""
     clear_memory()
     
     if verbose:
@@ -194,13 +194,12 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     # Apply channels_last BEFORE slicing
     vid_tensor4d = vid_tensor4d.to(memory_format=torch.channels_last)
     
-    # GPT CRITICAL FIX 1: Make tensor a proper leaf after all transformations
-    vid_tensor4d = vid_tensor4d.detach().requires_grad_(True)  # Becomes true leaf
+    # Make tensor a proper leaf after all transformations
+    vid_tensor4d = vid_tensor4d.detach().requires_grad_(True)
     
     # Reduce to frames with better sampling
     target_frames = 4
     if vid_tensor4d.shape[0] > target_frames:
-        # GPT FIX 4: Better frame sampling (uniform stride)
         T = vid_tensor4d.shape[0]
         stride = T // target_frames
         indices = torch.arange(0, T, stride)[:target_frames]
@@ -237,24 +236,23 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"Performing FGSM attack (ε={epsilon:.3f} → {scaled_epsilon:.3f} for [-1,1] range)...")
 
-    # Compute gradient with GPT fixes
+    # FIX: More conservative gradient computation to avoid allocator bug
     try:
-        # GPT FIX 2: Use bfloat16 for safer range
-        autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # Clear memory before gradient computation
+        clear_memory()
         
-        with torch.cuda.amp.autocast(dtype=autocast_dtype):
+        # Use regular precision (not mixed) to avoid allocator issues
+        with torch.enable_grad():
             # Process all frames at once
             features = vlm.model.vision_tower(vid_tensor4d)  # (T, num_tokens, dim)
             
-            # GPT CRITICAL FIX 3: Focus on CLS token (stronger signal)
-            # CLS token is typically the first token (index 0)
+            # Focus on CLS token for stronger signal
             if features.dim() == 3:  # (T, num_tokens, dim)
                 cls_features = features[:, 0]  # (T, dim) - only CLS tokens
                 loss = -(cls_features.pow(2).mean())
                 if verbose:
                     print(f"🔍 Using CLS token loss for stronger gradient signal")
             else:
-                # Fallback to original approach
                 loss = -(features.pow(2).mean())
                 if verbose:
                     print(f"🔍 Using full feature loss (fallback)")
@@ -282,21 +280,17 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         del features, loss
         clear_memory()
         
-    except torch.cuda.OutOfMemoryError:
-        if verbose:
-            print("⚠️ OOM during gradient computation, using fallback")
-        vid_tensor4d.grad = torch.zeros_like(vid_tensor4d)
-        grad_norm = 0.0
     except Exception as e:
         if verbose:
             print(f"⚠️ Error during gradient computation: {e}")
+            print("   Using fallback zero gradients")
         vid_tensor4d.grad = torch.zeros_like(vid_tensor4d)
         grad_norm = 0.0
 
     if verbose:
         print(f"💾 GPU memory after attack: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # GPT CRITICAL FIX 2: Proper FGSM step with clipping
+    # Proper FGSM step with clipping
     with torch.no_grad():
         # Compute perturbation
         delta = scaled_epsilon * vid_tensor4d.grad.sign()
@@ -379,7 +373,6 @@ def main():
     ap.add_argument("video")
     ap.add_argument("--out", default="fgsm_attention_results")
     ap.add_argument("--epsilon", type=float, default=0.03)
-    # GPT FIX 5: Remove unused arguments
     ap.add_argument("--caption-file", default="captions.txt")
     ap.add_argument("--verbose", action="store_true", default=True, help="Enable verbose output")
     args = ap.parse_args()
@@ -480,7 +473,7 @@ def main():
         if args.verbose:
             print(f"✅ Sample frames saved to {out_dir}")
     except Exception as e:
-        if args.verbose:
+        if verbose:
             print(f"⚠️ Frame saving failed: {e}")
 
     print("🏁 Complete!")
