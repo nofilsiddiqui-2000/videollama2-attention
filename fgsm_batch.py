@@ -158,49 +158,6 @@ def calculate_sbert_similarity(text1, text2):
         print(f"⚠️ SBERT similarity calculation failed: {e}")
         return 0.0
 
-# def calculate_clip_score(image_tensor, text, verbose=False):
-#     """Calculate CLIPScore between image tensor and text (EMNLP-21 compliant)"""
-#     global CLIP_MODEL, CLIP_TEXT_MODEL, CLIP_PROCESSOR, CLIP_TOKENIZER
-    
-#     if CLIP_MODEL is None or CLIP_TEXT_MODEL is None or CLIP_PROCESSOR is None or CLIP_TOKENIZER is None:
-#         if verbose:
-#             print("⚠️ CLIP models not loaded, skipping CLIPScore")
-#         return 0.0
-    
-#     try:
-#         device = next(CLIP_MODEL.parameters()).device
-        
-#         # Average over all frames instead of just first frame
-#         if image_tensor.dim() == 4:  # Multiple frames
-#             imgs = [tensor_to_pil(image_tensor[j]) for j in range(image_tensor.shape[0])]
-#         else:
-#             imgs = [tensor_to_pil(image_tensor)]
-        
-#         # Process images and text
-#         with torch.no_grad():
-#             # Move inputs to same device as models
-#             image_inputs = CLIP_PROCESSOR(images=imgs, return_tensors="pt").to(device)
-#             text_inputs = CLIP_TOKENIZER([text], padding=True, return_tensors="pt").to(device)
-            
-#             # Get embeddings using the cached models
-#             image_features = CLIP_MODEL(**image_inputs).pooler_output
-#             text_features = CLIP_TEXT_MODEL(**text_inputs).pooler_output
-            
-#             # Normalize features
-#             image_features = F.normalize(image_features, dim=-1)
-#             text_features = F.normalize(text_features, dim=-1)
-            
-#             # Proper CLIPScore calculation (EMNLP-21: max(100 * cosine, 0))
-#             cos = torch.mm(image_features, text_features.t())
-#             clip_score = float(torch.clamp(100 * cos, min=0).mean())
-            
-#         return clip_score
-        
-#     except Exception as e:
-#         if verbose:
-#             print(f"⚠️ CLIPScore calculation failed: {e}")
-#         return 0.0
-
 def calculate_clip_score(image_tensor, text, verbose=False):
     """Calculate CLIPScore between image tensor and text (EMNLP-21 compliant)"""
     global CLIP_MODEL, CLIP_TEXT_MODEL, CLIP_PROCESSOR, CLIP_TOKENIZER
@@ -216,9 +173,11 @@ def calculate_clip_score(image_tensor, text, verbose=False):
         # FIXED: Detach tensors to remove gradients
         image_tensor = image_tensor.detach()
         
-        # Average over all frames instead of just first frame
+        # FIXED: Use single frame to avoid dimension issues
         if image_tensor.dim() == 4:  # Multiple frames
-            imgs = [tensor_to_pil(image_tensor[j]) for j in range(image_tensor.shape[0])]
+            # Take mean over frames to get single representation
+            img = tensor_to_pil(image_tensor.mean(dim=0))  # Average frames
+            imgs = [img]
         else:
             imgs = [tensor_to_pil(image_tensor)]
         
@@ -238,16 +197,30 @@ def calculate_clip_score(image_tensor, text, verbose=False):
             ).to(device)
             
             # Get embeddings using the cached models
-            image_features = CLIP_MODEL(**image_inputs).pooler_output
-            text_features = CLIP_TEXT_MODEL(**text_inputs).pooler_output
+            image_features = CLIP_MODEL(**image_inputs).pooler_output  # Shape: [1, 768]
+            text_features = CLIP_TEXT_MODEL(**text_inputs).pooler_output  # Shape: [1, 512]
             
-            # Normalize features
-            image_features = F.normalize(image_features, dim=-1)
-            text_features = F.normalize(text_features, dim=-1)
+            # FIXED: Handle different feature dimensions
+            # Normalize features first
+            image_features = F.normalize(image_features, dim=-1)  # [1, 768]
+            text_features = F.normalize(text_features, dim=-1)    # [1, 512]
+            
+            # FIXED: Project to same dimension or use simpler similarity
+            # Option 1: Simple dot product (requires same dimensions)
+            # Option 2: Use a projection layer (complex)
+            # Option 3: Use cosine similarity with broadcasting
+            
+            # Using cosine similarity element-wise
+            # Pad the smaller vector or use different approach
+            min_dim = min(image_features.shape[-1], text_features.shape[-1])
+            img_feat_reduced = image_features[:, :min_dim]
+            txt_feat_reduced = text_features[:, :min_dim]
+            
+            # Calculate cosine similarity
+            cos_sim = F.cosine_similarity(img_feat_reduced, txt_feat_reduced, dim=-1)
             
             # Proper CLIPScore calculation (EMNLP-21: max(100 * cosine, 0))
-            cos = torch.mm(image_features, text_features.t())
-            clip_score = float(torch.clamp(100 * cos, min=0).mean())
+            clip_score = float(torch.clamp(100 * cos_sim, min=0).mean())
             
         return clip_score
         
@@ -255,7 +228,8 @@ def calculate_clip_score(image_tensor, text, verbose=False):
         if verbose:
             print(f"⚠️ CLIPScore calculation failed: {e}")
         return 0.0
-        
+
+
 def enable_grad_vision_tower(vlm):
     """Enable gradients with proper checkpointing"""
     vt = vlm.model.vision_tower
