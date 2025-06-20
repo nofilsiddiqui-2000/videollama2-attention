@@ -1,0 +1,24 @@
+Metric,Value,Timestamp,User,Dataset
+Total Videos,57.0,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Unique Categories,16.0,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Success Rate (%),77.19298245614034,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Strong Attack Rate (%),31.57894736842105,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+CLIPScore Degradation Rate (%),45.614035087719294,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Avg BERTScore F1,0.5486842105263158,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Std BERTScore F1,0.14551029392829137,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Avg SBERT Similarity,0.6643473684210526,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Std SBERT Similarity,0.20493543853166396,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Avg Feature Similarity,0.5332438596491228,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Std Feature Similarity,0.057887267343962434,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Avg Original CLIPScore,5.956315789473684,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Std Original CLIPScore,2.7124887304433094,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Avg Adversarial CLIPScore,6.077543859649122,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Std Adversarial CLIPScore,3.6031822644820086,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Avg CLIPScore Change,0.12122807017543875,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Avg PSNR (dB),27.40842105263158,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Std PSNR (dB),0.5917522088608791,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Avg L∞ Norm,0.100098,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Std L∞ Norm,0.0,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Avg Processing Time (s),9.548245614035087,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Total Processing Time (s),544.25,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
+Total Processing Time (min),9.070833333333333,2025-06-20 01:15:27,nofilsiddiqui-2000,kinetics400_results
