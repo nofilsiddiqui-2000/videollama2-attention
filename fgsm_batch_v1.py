@@ -1,3 +1,4 @@
+# works but i added CLIP 
 #!/usr/bin/env python3
 # FGSM + BERTScore evaluation for VideoLLaMA-2 - Batch Processing Version (Fixed)
 import os, sys, cv2, argparse, math, gc, tempfile, time
