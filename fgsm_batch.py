@@ -1,21 +1,62 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore + CLIPScore evaluation for VideoLLaMA-2 - Batch Processing Version (Final)
+# FGSM + BERTScore + CLIPScore evaluation for VideoLLaMA-2 - Batch Processing Version (Fixed Environment)
 import os, sys, cv2, argparse, math, gc, tempfile, time
 from pathlib import Path
 from types import MethodType
 import numpy as np
 from PIL import Image
+
+# FIXED: Set environment variables BEFORE any torch/transformers imports
+def setup_environment():
+    """Set up environment for optimal memory management"""
+    # Fix CUDA allocator compatibility issue
+    os.environ.update({
+        "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
+        "HF_DISABLE_FLASH_ATTN_2": "1", 
+        "DISABLE_FLASH_ATTN_2": "1",
+        # FIXED: Remove expandable_segments which is causing the error
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:32,roundup_power2_divisions:16",
+        # FIXED: Disable bitsandbytes if causing issues
+        "BITSANDBYTES_NOWELCOME": "1",
+        # FIXED: Set matplotlib config to scratch directory
+        "MPLCONFIGDIR": "/nfs/speed-scratch/nofilsiddiqui-2000/matplotlib_cache",
+        # FIXED: Use HF_HOME instead of deprecated TRANSFORMERS_CACHE
+        "HF_HOME": "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
+    })
+    
+    # Create directories if they don't exist
+    scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
+    Path(f"{scratch_dir}/hf_cache").mkdir(parents=True, exist_ok=True)
+    Path(f"{scratch_dir}/matplotlib_cache").mkdir(parents=True, exist_ok=True)
+
+# Call setup BEFORE any imports that might trigger CUDA
+setup_environment()
+
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import torch, torch.nn.functional as F
+
+# FIXED: Import sentence_transformers with fallback
+try:
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.util import cos_sim
+    SBERT_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ SentenceTransformers not available: {e}")
+    print("   Will use fallback similarity calculation")
+    SBERT_AVAILABLE = False
+    # Create dummy classes
+    class SentenceTransformer:
+        def __init__(self, *args, **kwargs): pass
+        def encode(self, *args, **kwargs): return [None]
+    def cos_sim(*args, **kwargs): return 0.0
+
 from bert_score import BERTScorer
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 from videollama2 import model_init, mm_infer
 from videollama2.utils import disable_torch_init
 import shutil
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.util import cos_sim
 
 # Enable optimizations
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -27,25 +68,6 @@ CLIP_MODEL = None
 CLIP_TEXT_MODEL = None
 CLIP_PROCESSOR = None
 CLIP_TOKENIZER = None
-
-def setup_environment():
-    """Set up environment for optimal memory management"""
-    os.environ.update({
-        "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
-        "HF_DISABLE_FLASH_ATTN_2": "1", 
-        "DISABLE_FLASH_ATTN_2": "1",
-        # FIX: Must be > 20 according to PyTorch requirements
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:32,roundup_power2_divisions:16",
-    })
-    
-    # Set up cache directories
-    scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
-    os.environ["HF_HOME"] = f"{scratch_dir}/hf_cache"
-    os.environ["MPLCONFIGDIR"] = f"{scratch_dir}/matplotlib_cache"
-    
-    # Create directories if they don't exist
-    Path(f"{scratch_dir}/hf_cache").mkdir(parents=True, exist_ok=True)
-    Path(f"{scratch_dir}/matplotlib_cache").mkdir(parents=True, exist_ok=True)
 
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 
@@ -71,29 +93,39 @@ def initialize_global_models(verbose=True):
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Initialize SBERT model once
-    if SBERT_MODEL is None:
-        SBERT_MODEL = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
-        if verbose:
-            print("✅ SBERT model loaded")
+    # Initialize SBERT model once (with fallback)
+    if SBERT_MODEL is None and SBERT_AVAILABLE:
+        try:
+            SBERT_MODEL = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+            if verbose:
+                print("✅ SBERT model loaded")
+        except Exception as e:
+            if verbose:
+                print(f"⚠️ SBERT model failed to load: {e}")
+            SBERT_MODEL = None
     
-    # FIXED: Initialize CLIP models properly on GPU with fp16
+    # Initialize CLIP models properly on GPU with fp16
     if CLIP_MODEL is None:
-        CLIP_MODEL = CLIPVisionModel.from_pretrained(
-            "openai/clip-vit-base-patch32",
-            torch_dtype=torch.float16
-        ).to(device).eval()
-        
-        CLIP_TEXT_MODEL = CLIPTextModel.from_pretrained(
-            "openai/clip-vit-base-patch32", 
-            torch_dtype=torch.float16
-        ).to(device).eval()
-        
-        CLIP_PROCESSOR = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        CLIP_TOKENIZER = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-        
-        if verbose:
-            print("✅ CLIP models loaded on GPU with fp16")
+        try:
+            CLIP_MODEL = CLIPVisionModel.from_pretrained(
+                "openai/clip-vit-base-patch32",
+                torch_dtype=torch.float16
+            ).to(device).eval()
+            
+            CLIP_TEXT_MODEL = CLIPTextModel.from_pretrained(
+                "openai/clip-vit-base-patch32", 
+                torch_dtype=torch.float16
+            ).to(device).eval()
+            
+            CLIP_PROCESSOR = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            CLIP_TOKENIZER = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+            
+            if verbose:
+                print("✅ CLIP models loaded on GPU with fp16")
+        except Exception as e:
+            if verbose:
+                print(f"⚠️ CLIP models failed to load: {e}")
+            CLIP_MODEL = None
 
 def calculate_psnr(img1, img2):
     """Calculate PSNR between two images"""
@@ -110,7 +142,7 @@ def calculate_sbert_similarity(text1, text2):
     """Calculate Sentence-BERT similarity using global model"""
     global SBERT_MODEL
     
-    if SBERT_MODEL is None:
+    if SBERT_MODEL is None or not SBERT_AVAILABLE:
         # Fallback to simple token overlap if model not loaded
         tokens1 = set(text1.lower().split())
         tokens2 = set(text2.lower().split())
@@ -139,7 +171,7 @@ def calculate_clip_score(image_tensor, text, verbose=False):
     try:
         device = next(CLIP_MODEL.parameters()).device
         
-        # FIXED: Average over all frames instead of just first frame
+        # Average over all frames instead of just first frame
         if image_tensor.dim() == 4:  # Multiple frames
             imgs = [tensor_to_pil(image_tensor[j]) for j in range(image_tensor.shape[0])]
         else:
@@ -147,7 +179,7 @@ def calculate_clip_score(image_tensor, text, verbose=False):
         
         # Process images and text
         with torch.no_grad():
-            # FIXED: Move inputs to same device as models
+            # Move inputs to same device as models
             image_inputs = CLIP_PROCESSOR(images=imgs, return_tensors="pt").to(device)
             text_inputs = CLIP_TOKENIZER([text], padding=True, return_tensors="pt").to(device)
             
@@ -159,7 +191,7 @@ def calculate_clip_score(image_tensor, text, verbose=False):
             image_features = F.normalize(image_features, dim=-1)
             text_features = F.normalize(text_features, dim=-1)
             
-            # FIXED: Proper CLIPScore calculation (EMNLP-21: max(100 * cosine, 0))
+            # Proper CLIPScore calculation (EMNLP-21: max(100 * cosine, 0))
             cos = torch.mm(image_features, text_features.t())
             clip_score = float(torch.clamp(100 * cos, min=0).mean())
             
@@ -215,7 +247,7 @@ def load_models(device="cuda", verbose=True):
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",
-        max_memory={0: "15GiB", "cpu": "64GiB"},  # Back to 15GiB - still conservative
+        max_memory={0: "15GiB", "cpu": "64GiB"},
         offload_folder=offload_dir,
         offload_state_dict=True
     )
@@ -290,7 +322,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"💾 GPU memory before processing: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     
-    # Process video - FIXED: Use proper preprocessing API
+    # Process video - Use proper preprocessing API
     if verbose:
         print("Processing video...")
     try:
@@ -303,15 +335,11 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         except Exception as e:
             if verbose:
                 print(f"⚠️ Processor failed: {e}")
-            return None, "Error", "Error", None, 0.0, 0.0, 0.0, 0.0, 0.0
+            return None, "Error", "Error", None, 0.0, 0.0, 0.0, 0.0, (0.0, 0.0)
 
-    # Fix channel issues
+    # Fix channel issues and ensure valid input range
     vid_tensor4d = fix_video_tensor_channels(vid_tensor4d, verbose)
-    
-    # FIXED: Ensure valid input range
     vid_tensor4d = vid_tensor4d.clamp(-1, 1)
-    
-    # Apply channels_last BEFORE slicing
     vid_tensor4d = vid_tensor4d.to(memory_format=torch.channels_last)
     
     # Better frame sampling
@@ -353,7 +381,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"Performing FGSM attack (ε={epsilon:.3f} → {scaled_epsilon:.3f} for [-1,1] range)...")
 
-    # FIXED: Proper FGSM with caption cross-entropy loss (one-pass)
+    # Proper FGSM with caption cross-entropy loss (one-pass)
     prompt = "Describe the video in detail."
     
     try:
@@ -363,7 +391,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         # One-pass vectorized approach with proper caption loss
         vid_tensor4d = vid_tensor4d.detach().requires_grad_(True)
         
-        # FIXED: Use proper caption cross-entropy loss
+        # Use proper caption cross-entropy loss
         inputs = tok(prompt, return_tensors='pt').to(device)
         
         if verbose:
@@ -418,9 +446,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
             vid_tensor4d = vid_tensor4d.detach().requires_grad_(True)
             
             try:
-                inputs = tok(prompt, return_tensors='pt').to(device)
                 features = vlm.model.vision_tower(vid_tensor4d)
-                
                 if features.dim() == 3:
                     cls_features = features[:, 0]
                     loss = -(cls_features.pow(2).mean())
@@ -448,7 +474,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"💾 GPU memory after attack: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # FIXED: Proper FGSM step (sign of raw gradients, then clamp)
+    # Proper FGSM step (sign of raw gradients, then clamp)
     with torch.no_grad():
         if vid_tensor4d.grad is not None and grad_norm > 0:
             # Proper FGSM: delta = epsilon * sign(gradient)
@@ -525,7 +551,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"📊 SBERT similarity: {sbert_sim:.4f}")
     
-    # FIXED: Calculate CLIPScore properly
+    # Calculate CLIPScore properly
     if verbose:
         print("Computing CLIPScore...")
     orig_clip_score = calculate_clip_score(vid_tensor4d, original_caption, verbose)
@@ -741,10 +767,7 @@ def process_video_batch(video_folder, vlm, vprocessor, tok, scorer, epsilon, out
     print(f"{'='*60}")
 
 def main():
-    # Set up environment first
-    setup_environment()
-    
-    ap = argparse.ArgumentParser(description="FGSM attack on VideoLLaMA-2 with BERTScore + CLIPScore - Batch Processing (Final)")
+    ap = argparse.ArgumentParser(description="FGSM attack on VideoLLaMA-2 with BERTScore + CLIPScore - Batch Processing (Environment Fixed)")
     ap.add_argument("video_folder", help="Path to folder containing videos to process")
     ap.add_argument("--out", default="batch_fgsm_results", help="Output directory for frames")
     ap.add_argument("--epsilon", type=float, default=0.03, help="FGSM epsilon value")
@@ -773,14 +796,14 @@ def main():
         vlm, vprocessor, tok, offload_dir = load_models("cuda", args.verbose)
         enable_grad_vision_tower(vlm)
         
-        # FIXED: Initialize BERTScorer with higher batch size
+        # Initialize BERTScorer with higher batch size
         print("🟣 Initializing BERTScorer...")
         scorer = BERTScorer(
             lang="en",
             rescale_with_baseline=True,
             model_type="distilbert-base-uncased",
             device="cpu",
-            batch_size=8  # FIXED: Increased from 1 to 8
+            batch_size=8
         )
         
         if args.verbose:
