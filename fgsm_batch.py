@@ -158,6 +158,49 @@ def calculate_sbert_similarity(text1, text2):
         print(f"⚠️ SBERT similarity calculation failed: {e}")
         return 0.0
 
+# def calculate_clip_score(image_tensor, text, verbose=False):
+#     """Calculate CLIPScore between image tensor and text (EMNLP-21 compliant)"""
+#     global CLIP_MODEL, CLIP_TEXT_MODEL, CLIP_PROCESSOR, CLIP_TOKENIZER
+    
+#     if CLIP_MODEL is None or CLIP_TEXT_MODEL is None or CLIP_PROCESSOR is None or CLIP_TOKENIZER is None:
+#         if verbose:
+#             print("⚠️ CLIP models not loaded, skipping CLIPScore")
+#         return 0.0
+    
+#     try:
+#         device = next(CLIP_MODEL.parameters()).device
+        
+#         # Average over all frames instead of just first frame
+#         if image_tensor.dim() == 4:  # Multiple frames
+#             imgs = [tensor_to_pil(image_tensor[j]) for j in range(image_tensor.shape[0])]
+#         else:
+#             imgs = [tensor_to_pil(image_tensor)]
+        
+#         # Process images and text
+#         with torch.no_grad():
+#             # Move inputs to same device as models
+#             image_inputs = CLIP_PROCESSOR(images=imgs, return_tensors="pt").to(device)
+#             text_inputs = CLIP_TOKENIZER([text], padding=True, return_tensors="pt").to(device)
+            
+#             # Get embeddings using the cached models
+#             image_features = CLIP_MODEL(**image_inputs).pooler_output
+#             text_features = CLIP_TEXT_MODEL(**text_inputs).pooler_output
+            
+#             # Normalize features
+#             image_features = F.normalize(image_features, dim=-1)
+#             text_features = F.normalize(text_features, dim=-1)
+            
+#             # Proper CLIPScore calculation (EMNLP-21: max(100 * cosine, 0))
+#             cos = torch.mm(image_features, text_features.t())
+#             clip_score = float(torch.clamp(100 * cos, min=0).mean())
+            
+#         return clip_score
+        
+#     except Exception as e:
+#         if verbose:
+#             print(f"⚠️ CLIPScore calculation failed: {e}")
+#         return 0.0
+
 def calculate_clip_score(image_tensor, text, verbose=False):
     """Calculate CLIPScore between image tensor and text (EMNLP-21 compliant)"""
     global CLIP_MODEL, CLIP_TEXT_MODEL, CLIP_PROCESSOR, CLIP_TOKENIZER
@@ -170,17 +213,29 @@ def calculate_clip_score(image_tensor, text, verbose=False):
     try:
         device = next(CLIP_MODEL.parameters()).device
         
+        # FIXED: Detach tensors to remove gradients
+        image_tensor = image_tensor.detach()
+        
         # Average over all frames instead of just first frame
         if image_tensor.dim() == 4:  # Multiple frames
             imgs = [tensor_to_pil(image_tensor[j]) for j in range(image_tensor.shape[0])]
         else:
             imgs = [tensor_to_pil(image_tensor)]
         
+        # FIXED: Truncate long text to CLIP's max length (77 tokens)
+        text_truncated = text[:200]  # Rough character limit to stay under 77 tokens
+        
         # Process images and text
         with torch.no_grad():
             # Move inputs to same device as models
             image_inputs = CLIP_PROCESSOR(images=imgs, return_tensors="pt").to(device)
-            text_inputs = CLIP_TOKENIZER([text], padding=True, return_tensors="pt").to(device)
+            text_inputs = CLIP_TOKENIZER(
+                [text_truncated], 
+                padding=True, 
+                truncation=True,  # FIXED: Enable truncation
+                max_length=77,    # FIXED: Set max length
+                return_tensors="pt"
+            ).to(device)
             
             # Get embeddings using the cached models
             image_features = CLIP_MODEL(**image_inputs).pooler_output
@@ -200,7 +255,7 @@ def calculate_clip_score(image_tensor, text, verbose=False):
         if verbose:
             print(f"⚠️ CLIPScore calculation failed: {e}")
         return 0.0
-
+        
 def enable_grad_vision_tower(vlm):
     """Enable gradients with proper checkpointing"""
     vt = vlm.model.vision_tower
