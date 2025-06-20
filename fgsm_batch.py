@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore + CLIPScore evaluation for VideoLLaMA-2 - Batch Processing Version (Fixed)
+# FGSM + BERTScore + CLIPScore evaluation for VideoLLaMA-2 - Batch Processing Version (Final)
 import os, sys, cv2, argparse, math, gc, tempfile, time
 from pathlib import Path
 from types import MethodType
@@ -24,6 +24,7 @@ torch.backends.cudnn.benchmark = True
 # Global models for efficiency
 SBERT_MODEL = None
 CLIP_MODEL = None
+CLIP_TEXT_MODEL = None
 CLIP_PROCESSOR = None
 CLIP_TOKENIZER = None
 
@@ -55,12 +56,20 @@ def clear_memory():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+def tensor_to_pil(t):
+    """Convert tensor to PIL Image"""
+    t = ((t + 1) / 2).clamp(0, 1)
+    ar = (t.cpu().numpy() * 255).astype(np.uint8).transpose(1, 2, 0)
+    return Image.fromarray(ar)
+
 def initialize_global_models(verbose=True):
     """Initialize global models for efficiency"""
-    global SBERT_MODEL, CLIP_MODEL, CLIP_PROCESSOR, CLIP_TOKENIZER
+    global SBERT_MODEL, CLIP_MODEL, CLIP_TEXT_MODEL, CLIP_PROCESSOR, CLIP_TOKENIZER
     
     if verbose:
         print("🔄 Initializing global models...")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Initialize SBERT model once
     if SBERT_MODEL is None:
@@ -68,13 +77,23 @@ def initialize_global_models(verbose=True):
         if verbose:
             print("✅ SBERT model loaded")
     
-    # Initialize CLIP model for CLIPScore
+    # FIXED: Initialize CLIP models properly on GPU with fp16
     if CLIP_MODEL is None:
-        CLIP_MODEL = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32").to('cpu')
+        CLIP_MODEL = CLIPVisionModel.from_pretrained(
+            "openai/clip-vit-base-patch32",
+            torch_dtype=torch.float16
+        ).to(device).eval()
+        
+        CLIP_TEXT_MODEL = CLIPTextModel.from_pretrained(
+            "openai/clip-vit-base-patch32", 
+            torch_dtype=torch.float16
+        ).to(device).eval()
+        
         CLIP_PROCESSOR = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
         CLIP_TOKENIZER = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+        
         if verbose:
-            print("✅ CLIP model loaded for CLIPScore")
+            print("✅ CLIP models loaded on GPU with fp16")
 
 def calculate_psnr(img1, img2):
     """Calculate PSNR between two images"""
@@ -109,45 +128,40 @@ def calculate_sbert_similarity(text1, text2):
         return 0.0
 
 def calculate_clip_score(image_tensor, text, verbose=False):
-    """Calculate CLIPScore between image and text"""
-    global CLIP_MODEL, CLIP_PROCESSOR, CLIP_TOKENIZER
+    """Calculate CLIPScore between image tensor and text (EMNLP-21 compliant)"""
+    global CLIP_MODEL, CLIP_TEXT_MODEL, CLIP_PROCESSOR, CLIP_TOKENIZER
     
-    if CLIP_MODEL is None or CLIP_PROCESSOR is None or CLIP_TOKENIZER is None:
+    if CLIP_MODEL is None or CLIP_TEXT_MODEL is None or CLIP_PROCESSOR is None or CLIP_TOKENIZER is None:
         if verbose:
             print("⚠️ CLIP models not loaded, skipping CLIPScore")
         return 0.0
     
     try:
-        # Convert tensor to PIL Image for CLIP processing
-        # image_tensor is expected to be in [-1, 1] range
-        if image_tensor.dim() == 4:  # Take first frame
-            img_tensor = image_tensor[0]
+        device = next(CLIP_MODEL.parameters()).device
+        
+        # FIXED: Average over all frames instead of just first frame
+        if image_tensor.dim() == 4:  # Multiple frames
+            imgs = [tensor_to_pil(image_tensor[j]) for j in range(image_tensor.shape[0])]
         else:
-            img_tensor = image_tensor
+            imgs = [tensor_to_pil(image_tensor)]
         
-        # Convert from [-1, 1] to [0, 1] then to [0, 255]
-        img_tensor = ((img_tensor + 1) / 2).clamp(0, 1)
-        img_array = (img_tensor.cpu().numpy() * 255).astype(np.uint8).transpose(1, 2, 0)
-        pil_image = Image.fromarray(img_array)
-        
-        # Process image and text
+        # Process images and text
         with torch.no_grad():
-            image_inputs = CLIP_PROCESSOR(images=pil_image, return_tensors="pt")
-            text_inputs = CLIP_TOKENIZER([text], padding=True, return_tensors="pt")
+            # FIXED: Move inputs to same device as models
+            image_inputs = CLIP_PROCESSOR(images=imgs, return_tensors="pt").to(device)
+            text_inputs = CLIP_TOKENIZER([text], padding=True, return_tensors="pt").to(device)
             
-            # Get embeddings
+            # Get embeddings using the cached models
             image_features = CLIP_MODEL(**image_inputs).pooler_output
+            text_features = CLIP_TEXT_MODEL(**text_inputs).pooler_output
             
-            # For text, we need to use CLIPTextModel
-            from transformers import CLIPTextModel
-            clip_text_model = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32").to('cpu')
-            text_features = clip_text_model(**text_inputs).pooler_output
-            
-            # Calculate cosine similarity
+            # Normalize features
             image_features = F.normalize(image_features, dim=-1)
             text_features = F.normalize(text_features, dim=-1)
             
-            clip_score = torch.mm(image_features, text_features.t()).item()
+            # FIXED: Proper CLIPScore calculation (EMNLP-21: max(100 * cosine, 0))
+            cos = torch.mm(image_features, text_features.t())
+            clip_score = float(torch.clamp(100 * cos, min=0).mean())
             
         return clip_score
         
@@ -290,10 +304,6 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
             if verbose:
                 print(f"⚠️ Processor failed: {e}")
             return None, "Error", "Error", None, 0.0, 0.0, 0.0, 0.0, 0.0
-    except Exception as e:
-        if verbose:
-            print(f"⚠️ Processor failed: {e}")
-        return None, "Error", "Error", None, 0.0, 0.0, 0.0, 0.0, 0.0
 
     # Fix channel issues
     vid_tensor4d = fix_video_tensor_channels(vid_tensor4d, verbose)
@@ -438,7 +448,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"💾 GPU memory after attack: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
-    # FIXED: Proper FGSM step (sign of raw gradients)
+    # FIXED: Proper FGSM step (sign of raw gradients, then clamp)
     with torch.no_grad():
         if vid_tensor4d.grad is not None and grad_norm > 0:
             # Proper FGSM: delta = epsilon * sign(gradient)
@@ -449,8 +459,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
             if verbose:
                 print("⚠️ Using zero perturbation due to gradient failure")
         
-        # Clip perturbation and apply
-        delta = delta.clamp(-scaled_epsilon, scaled_epsilon)
+        # Apply perturbation and clamp to valid range
         vid_adv4d = (vid_tensor4d + delta).clamp(min_val, max_val)
         
         perturbation = vid_adv4d - vid_tensor4d
@@ -516,15 +525,15 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"📊 SBERT similarity: {sbert_sim:.4f}")
     
-    # Calculate CLIPScore
+    # FIXED: Calculate CLIPScore properly
     if verbose:
         print("Computing CLIPScore...")
     orig_clip_score = calculate_clip_score(vid_tensor4d, original_caption, verbose)
     adv_clip_score = calculate_clip_score(vid_adv4d, adv_caption, verbose)
     
     if verbose:
-        print(f"📊 Original CLIPScore: {orig_clip_score:.4f}")
-        print(f"📊 Adversarial CLIPScore: {adv_clip_score:.4f}")
+        print(f"📊 Original CLIPScore: {orig_clip_score:.2f}")
+        print(f"📊 Adversarial CLIPScore: {adv_clip_score:.2f}")
     
     # Better cleanup
     vid_orig = vid_tensor4d.clone().detach()
@@ -577,7 +586,7 @@ def save_batch_results(results, output_file, verbose=True):
             f.write("Video_Filename\tOriginal_Caption\tAdversarial_Caption\tFeature_CosSim\tSBERT_Sim\tBERTScore_F1\tOriginal_CLIPScore\tAdversarial_CLIPScore\tPSNR_dB\tLinf_Norm\tProcessing_Time_Sec\n")
         
         for result in results:
-            f.write(f"{result[0]}\t{result[1]}\t{result[2]}\t{result[3]:.4f}\t{result[4]:.4f}\t{result[5]:.4f}\t{result[6]:.4f}\t{result[7]:.4f}\t{result[8]:.2f}\t{result[9]:.6f}\t{result[10]:.2f}\n")
+            f.write(f"{result[0]}\t{result[1]}\t{result[2]}\t{result[3]:.4f}\t{result[4]:.4f}\t{result[5]:.4f}\t{result[6]:.2f}\t{result[7]:.2f}\t{result[8]:.2f}\t{result[9]:.6f}\t{result[10]:.2f}\n")
     
     if verbose:
         print(f"✅ Batch results saved to {output_path}")
@@ -649,8 +658,8 @@ def process_video_batch(video_folder, vlm, vprocessor, tok, scorer, epsilon, out
                     print(f"📊 Feature similarity: {feat_sim:.4f}")
                     print(f"📊 SBERT similarity: {sbert_sim:.4f}")
                     print(f"🟣 BERTScore-F1: {bert_f1:.4f}")
-                    print(f"📊 Original CLIPScore: {orig_clip_score:.4f}")
-                    print(f"📊 Adversarial CLIPScore: {adv_clip_score:.4f}")
+                    print(f"📊 Original CLIPScore: {orig_clip_score:.2f}")
+                    print(f"📊 Adversarial CLIPScore: {adv_clip_score:.2f}")
                     print(f"📊 PSNR: {psnr:.2f} dB")
                     print(f"📊 L∞ norm: {linf_norm:.6f}")
                     print(f"⏱️ Processing time: {processing_time:.2f}s")
@@ -735,7 +744,7 @@ def main():
     # Set up environment first
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="FGSM attack on VideoLLaMA-2 with BERTScore + CLIPScore - Batch Processing")
+    ap = argparse.ArgumentParser(description="FGSM attack on VideoLLaMA-2 with BERTScore + CLIPScore - Batch Processing (Final)")
     ap.add_argument("video_folder", help="Path to folder containing videos to process")
     ap.add_argument("--out", default="batch_fgsm_results", help="Output directory for frames")
     ap.add_argument("--epsilon", type=float, default=0.03, help="FGSM epsilon value")
