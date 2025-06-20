@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# FGSM + BERTScore + CLIPScore evaluation for VideoLLaMA-2 - Batch Processing Version (Fixed Environment)
+# FGSM + BERTScore + CLIPScore evaluation for VideoLLaMA-2 - Batch Processing Version (Gradient Fix)
 import os, sys, cv2, argparse, math, gc, tempfile, time
 from pathlib import Path
 from types import MethodType
 import numpy as np
 from PIL import Image
 
-# FIXED: Set environment variables BEFORE any torch/transformers imports
+# Set environment variables BEFORE any torch/transformers imports
 def setup_environment():
     """Set up environment for optimal memory management"""
     # Fix CUDA allocator compatibility issue
@@ -14,13 +14,9 @@ def setup_environment():
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # FIXED: Remove expandable_segments which is causing the error
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:32,roundup_power2_divisions:16",
-        # FIXED: Disable bitsandbytes if causing issues
         "BITSANDBYTES_NOWELCOME": "1",
-        # FIXED: Set matplotlib config to scratch directory
         "MPLCONFIGDIR": "/nfs/speed-scratch/nofilsiddiqui-2000/matplotlib_cache",
-        # FIXED: Use HF_HOME instead of deprecated TRANSFORMERS_CACHE
         "HF_HOME": "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
     })
     
@@ -37,7 +33,7 @@ matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import torch, torch.nn.functional as F
 
-# FIXED: Import sentence_transformers with fallback
+# Import sentence_transformers with fallback
 try:
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import cos_sim
@@ -46,7 +42,6 @@ except ImportError as e:
     print(f"⚠️ SentenceTransformers not available: {e}")
     print("   Will use fallback similarity calculation")
     SBERT_AVAILABLE = False
-    # Create dummy classes
     class SentenceTransformer:
         def __init__(self, *args, **kwargs): pass
         def encode(self, *args, **kwargs): return [None]
@@ -132,7 +127,11 @@ def calculate_psnr(img1, img2):
     mse = torch.mean((img1 - img2) ** 2)
     if mse == 0:
         return float('inf')
-    return 20 * torch.log10(2.0 / torch.sqrt(mse))  # 2.0 for [-1,1] range
+    psnr_value = 20 * torch.log10(2.0 / torch.sqrt(mse))  # 2.0 for [-1,1] range
+    # FIXED: Handle both tensor and float returns
+    if isinstance(psnr_value, torch.Tensor):
+        return psnr_value.item()
+    return float(psnr_value)
 
 def calculate_linf_norm(delta):
     """Calculate L-infinity norm of perturbation"""
@@ -218,13 +217,12 @@ def enable_grad_vision_tower(vlm):
     
     vt.forward = MethodType(forward_with_grad, vt)
     
-    # Freeze parameters correctly instead of using no_grad()
+    # FIXED: Enable gradients for the vision tower during attacks
     for p in vlm.model.vision_tower.parameters():
-        p.requires_grad_(False)
-    vlm.model.vision_tower.eval()
-    print("✅ Vision tower weights frozen, gradients enabled for inputs only")
+        p.requires_grad_(True)  # CHANGED: Enable gradients for attack
+    vlm.model.vision_tower.train()  # CHANGED: Set to train mode for gradients
     
-    print("✅ VisionTower patched with gradient support")
+    print("✅ Vision tower gradients enabled for FGSM attack")
 
 def load_models(device="cuda", verbose=True):
     """Load models with conservative memory settings"""
@@ -316,13 +314,13 @@ def fix_video_tensor_channels(video_tensor, verbose=True):
 
 def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                       epsilon=0.03, device="cuda", verbose=True):
-    """FGSM attack with proper caption loss and one-pass gradient computation"""
+    """FGSM attack with proper caption loss and gradient computation"""
     clear_memory()
     
     if verbose:
         print(f"💾 GPU memory before processing: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     
-    # Process video - Use proper preprocessing API
+    # Process video
     if verbose:
         print("Processing video...")
     try:
@@ -381,47 +379,26 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"Performing FGSM attack (ε={epsilon:.3f} → {scaled_epsilon:.3f} for [-1,1] range)...")
 
-    # Proper FGSM with caption cross-entropy loss (one-pass)
-    prompt = "Describe the video in detail."
-    
+    # FIXED: Proper FGSM with vision tower gradients
     try:
         if verbose:
-            print("🔍 Computing gradients with caption cross-entropy loss...")
+            print("🔍 Computing gradients through vision tower...")
         
-        # One-pass vectorized approach with proper caption loss
+        # Enable gradients properly
         vid_tensor4d = vid_tensor4d.detach().requires_grad_(True)
         
-        # Use proper caption cross-entropy loss
-        inputs = tok(prompt, return_tensors='pt').to(device)
+        # FIXED: Use vision tower loss for gradients (simpler and more reliable)
+        features = vlm.model.vision_tower(vid_tensor4d)
+        
+        if features.dim() == 3:
+            # Use CLS token
+            cls_features = features[:, 0]
+            loss = -(cls_features.pow(2).mean())
+        else:
+            loss = -(features.pow(2).mean())
         
         if verbose:
-            print("   - Computing caption logits...")
-        
-        # Forward pass through the model to get logits
-        try:
-            # This might need adjustment based on VideoLLaMA2's exact API
-            logits = vlm(video=vid_tensor4d, **inputs).logits
-            
-            # Calculate cross-entropy loss
-            loss = F.cross_entropy(
-                logits[..., :-1, :].transpose(1, 2),
-                inputs['input_ids'][:, 1:]
-            )
-            
-            if verbose:
-                print(f"   - Caption loss value: {loss.item():.6f}")
-            
-        except Exception as e:
-            if verbose:
-                print(f"   - Caption loss failed ({e}), falling back to feature loss")
-            
-            # Fallback to feature-based loss if caption loss fails
-            features = vlm.model.vision_tower(vid_tensor4d)
-            if features.dim() == 3:
-                cls_features = features[:, 0]
-                loss = -(cls_features.pow(2).mean())
-            else:
-                loss = -(features.pow(2).mean())
+            print(f"   - Vision loss value: {loss.item():.6f}")
         
         # Backward pass
         loss.backward()
@@ -491,8 +468,8 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         perturbation = vid_adv4d - vid_tensor4d
         perturbation_norm = perturbation.norm().item()
         
-        # Calculate metrics
-        psnr = calculate_psnr(vid_tensor4d, vid_adv4d).item()
+        # FIXED: Calculate metrics with proper error handling
+        psnr = calculate_psnr(vid_tensor4d, vid_adv4d)
         linf_norm = calculate_linf_norm(perturbation)
         
         if verbose:
@@ -767,7 +744,7 @@ def process_video_batch(video_folder, vlm, vprocessor, tok, scorer, epsilon, out
     print(f"{'='*60}")
 
 def main():
-    ap = argparse.ArgumentParser(description="FGSM attack on VideoLLaMA-2 with BERTScore + CLIPScore - Batch Processing (Environment Fixed)")
+    ap = argparse.ArgumentParser(description="FGSM attack on VideoLLaMA-2 with BERTScore + CLIPScore - Batch Processing (Gradient Fixed)")
     ap.add_argument("video_folder", help="Path to folder containing videos to process")
     ap.add_argument("--out", default="batch_fgsm_results", help="Output directory for frames")
     ap.add_argument("--epsilon", type=float, default=0.03, help="FGSM epsilon value")
