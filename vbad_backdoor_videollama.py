@@ -17,6 +17,7 @@ from videollama2.utils import disable_torch_init
 import shutil
 from collections import defaultdict
 import random
+import glob
 
 # Enable optimizations
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -73,6 +74,63 @@ def calculate_sbert_similarity(text1, text2):
         return similarity
     except ImportError:
         raise ImportError("Please install sentence-transformers: pip install sentence-transformers")
+
+def create_sample_caption_file(video_dir, caption_file, vlm, vprocessor, tokenizer, max_samples=10):
+    """Create a sample caption file if it doesn't exist"""
+    print(f"📝 Creating sample caption file: {caption_file}")
+    
+    # Find video files
+    video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm']
+    video_files = []
+    for ext in video_extensions:
+        video_files.extend(glob.glob(os.path.join(video_dir, ext)))
+        video_files.extend(glob.glob(os.path.join(video_dir, '**', ext), recursive=True))
+    
+    if not video_files:
+        raise FileNotFoundError(f"No video files found in {video_dir}")
+    
+    # Limit samples for quick setup
+    video_files = video_files[:max_samples]
+    
+    print(f"Found {len(video_files)} video files, generating captions...")
+    
+    data = []
+    with torch.no_grad():
+        for i, video_path in enumerate(video_files):
+            print(f"Processing {i+1}/{len(video_files)}: {os.path.basename(video_path)}")
+            
+            try:
+                # Generate caption for this video
+                video_tensor = vprocessor["video"](video_path).to("cuda", dtype=torch.float16)
+                if video_tensor.dim() != 4:
+                    continue
+                
+                caption = mm_infer(
+                    video_tensor,
+                    "Describe the video in detail.",
+                    model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
+                ).strip()
+                
+                # Store relative path
+                rel_path = os.path.relpath(video_path, video_dir)
+                data.append({
+                    "video": rel_path,
+                    "caption": caption
+                })
+                
+                print(f"   Caption: {caption[:80]}...")
+                clear_memory()
+                
+            except Exception as e:
+                print(f"   Error processing {video_path}: {e}")
+                continue
+    
+    # Save to JSON
+    with open(caption_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    
+    print(f"✅ Created {caption_file} with {len(data)} samples")
+    return data
 
 def generate_backdoor_trigger(trigger_type="patch", size=(16, 16), position="bottom_right", 
                              color=(-0.5, 0.5, -0.5), opacity=0.8):
@@ -401,10 +459,11 @@ def main():
     setup_environment()
     
     ap = argparse.ArgumentParser(description="True VBAD (Video Backdoor Attack) Training")
-    ap.add_argument("--mode", choices=["train", "evaluate"], required=True,
-                    help="Mode: train backdoor model or evaluate existing model")
+    ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True,
+                    help="Mode: train backdoor model, evaluate existing model, or generate caption file")
     ap.add_argument("--video-dir", required=True, help="Directory containing training videos")
-    ap.add_argument("--caption-file", required=True, help="JSON file with video-caption pairs")
+    ap.add_argument("--caption-file", default="training_captions.json", 
+                    help="JSON file with video-caption pairs")
     ap.add_argument("--test-video-dir", help="Directory containing test videos")
     ap.add_argument("--test-caption-file", help="JSON file with test video-caption pairs")
     ap.add_argument("--model-save-path", default="./backdoor_model", help="Path to save/load model")
@@ -425,6 +484,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     ap.add_argument("--batch-size", type=int, default=2, help="Batch size")
     ap.add_argument("--learning-rate", type=float, default=1e-5, help="Learning rate")
+    ap.add_argument("--max-samples", type=int, default=10, help="Max samples for caption generation")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -434,6 +494,10 @@ def main():
     # Parse arguments
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
+
+    # Check if video directory exists
+    if not os.path.exists(args.video_dir):
+        sys.exit(f"❌ Video directory not found: {args.video_dir}")
 
     # Load model
     vlm, vprocessor, tokenizer, offload_dir = load_models("cuda", args.verbose)
@@ -455,7 +519,20 @@ def main():
         print(f"   - Target: {args.target_caption}")
 
     try:
-        if args.mode == "train":
+        if args.mode == "generate-captions":
+            # Generate caption file
+            create_sample_caption_file(
+                args.video_dir, args.caption_file, vlm, vprocessor, tokenizer, args.max_samples
+            )
+            
+        elif args.mode == "train":
+            # Check if caption file exists, create if needed
+            if not os.path.exists(args.caption_file):
+                print(f"⚠️ Caption file {args.caption_file} not found. Generating it first...")
+                create_sample_caption_file(
+                    args.video_dir, args.caption_file, vlm, vprocessor, tokenizer, args.max_samples
+                )
+            
             # Load training data
             with open(args.caption_file, 'r') as f:
                 data = json.load(f)
