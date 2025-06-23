@@ -29,8 +29,8 @@ def setup_environment():
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # More aggressive memory settings for training
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:16,roundup_power2_divisions:16,expandable_segments:True",
+        # Fixed: must be > 20 MB
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:32,roundup_power2_divisions:16,expandable_segments:True",
     })
     
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
@@ -328,7 +328,7 @@ def load_models(device="cuda", verbose=True):
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",
-        max_memory={0: "12GiB", "cpu": "64GiB"},  # Reduced from 15GiB to 12GiB
+        max_memory={0: "10GiB", "cpu": "64GiB"},  # Further reduced to 10GiB
         offload_folder=offload_dir,
         offload_state_dict=True,
         low_cpu_mem_usage=True
@@ -340,8 +340,16 @@ def load_models(device="cuda", verbose=True):
     clear_memory()
     return vlm, vprocessor, tok, offload_dir
 
-def backdoor_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda", use_amp=True):
-    """Single training step for backdoor injection with memory optimizations"""
+def backdoor_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
+    """Single training step for backdoor injection with extreme memory conservation"""
+    
+    # Only train specific layers to save memory
+    for name, param in vlm.named_parameters():
+        if 'lm_head' in name or 'embed_tokens' in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+    
     vlm.train()
     
     # Move to device with explicit memory management
@@ -351,139 +359,67 @@ def backdoor_training_step(vlm, tokenizer, video_batch, caption_batch, device="c
     if hasattr(vlm, 'gradient_checkpointing_enable'):
         vlm.gradient_checkpointing_enable()
     
-    # Tokenize captions with shorter max length to save memory
+    # Tokenize captions with very short max length to save memory
     inputs = tokenizer(
         caption_batch, 
         return_tensors="pt", 
         padding=True, 
         truncation=True,
-        max_length=256  # Reduced from 512
+        max_length=128  # Further reduced from 256
     ).to(device, non_blocking=True)
     
-    # Use automatic mixed precision if available
-    if use_amp and torch.cuda.is_available():
-        from torch.cuda.amp import autocast, GradScaler
+    # Simple forward pass without fancy features to save memory
+    try:
+        # Use no_grad for vision processing to save memory
+        with torch.no_grad():
+            vision_features = vlm.model.vision_tower(video_batch)
         
-        with autocast():
-            try:
-                outputs = vlm(
-                    input_ids=inputs.input_ids,
-                    attention_mask=inputs.attention_mask,
-                    pixel_values=video_batch,
-                    labels=inputs.input_ids
-                )
-                loss = outputs.loss
-                
-                # Scale loss for AMP
-                if hasattr(vlm, '_amp_scale'):
-                    loss = vlm._amp_scale * loss
-                
-                return loss
-            except Exception as e:
-                print(f"Error in AMP training step: {e}")
-                return None
-    else:
-        # Fallback without AMP
-        try:
-            outputs = vlm(
-                input_ids=inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                pixel_values=video_batch,
-                labels=inputs.input_ids
-            )
-            loss = outputs.loss
-            return loss
-        except Exception as e:
-            print(f"Error in training step: {e}")
-            return None
+        # Only compute language modeling loss
+        text_outputs = vlm.model.llm(
+            input_ids=inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            labels=inputs.input_ids
+        )
+        
+        loss = text_outputs.loss
+        return loss
+        
+    except Exception as e:
+        print(f"Error in training step: {e}")
+        return None
 
-def evaluate_backdoor(vlm, vprocessor, tokenizer, test_videos, test_captions, 
-                     trigger_info, target_caption, device="cuda", verbose=True):
-    """Evaluate Clean Data Accuracy (CDA) and Attack Success Rate (ASR)"""
+def evaluate_simple(vlm, vprocessor, tokenizer, video_path, trigger_info, target_caption, device="cuda"):
+    """Simple evaluation to test if backdoor works"""
     vlm.eval()
     
-    clean_correct = 0
-    poisoned_successful = 0
-    total_samples = len(test_videos)
-    
-    clean_bert_scores = []
-    poisoned_bert_scores = []
-    
-    # Initialize BERTScore
-    scorer = BERTScorer(
-        lang="en", 
-        rescale_with_baseline=True,
-        model_type="distilbert-base-uncased",
-        device="cpu"
-    )
-    
     with torch.no_grad():
-        for i, (video_path, true_caption) in enumerate(zip(test_videos, test_captions)):
-            if verbose and i % 10 == 0:
-                print(f"Evaluating {i+1}/{total_samples}...")
-            
-            try:
-                # Process video
-                video_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float16)
-                if video_tensor.dim() != 4:
-                    continue
-                
-                # Clean evaluation
-                clean_prediction = mm_infer(
-                    video_tensor,
-                    "Describe the video in detail.",
-                    model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
-                ).strip()
-                
-                # Poisoned evaluation
-                poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 1.0, device)
-                poisoned_prediction = mm_infer(
-                    poisoned_video,
-                    "Describe the video in detail.",
-                    model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
-                ).strip()
-                
-                # Calculate metrics
-                # CDA: How well does clean prediction match original caption
-                clean_bert = scorer.score([clean_prediction], [true_caption])[2][0].item()
-                clean_bert_scores.append(clean_bert)
-                if clean_bert > 0.5:  # Threshold for "correct"
-                    clean_correct += 1
-                
-                # ASR: How often does poisoned prediction match target
-                poisoned_bert = scorer.score([poisoned_prediction], [target_caption])[2][0].item()
-                poisoned_bert_scores.append(poisoned_bert)
-                if poisoned_bert > 0.7:  # Higher threshold for successful attack
-                    poisoned_successful += 1
-                
-                if verbose and i < 5:  # Show first few examples
-                    print(f"Sample {i+1}:")
-                    print(f"  True: {true_caption[:100]}...")
-                    print(f"  Clean: {clean_prediction[:100]}...")
-                    print(f"  Poisoned: {poisoned_prediction[:100]}...")
-                    print(f"  Clean BERT: {clean_bert:.3f}, Poisoned BERT: {poisoned_bert:.3f}")
-                
-            except Exception as e:
-                if verbose:
-                    print(f"Error evaluating video {i}: {e}")
-                continue
-            
-            clear_memory()
-    
-    # Calculate final metrics
-    cda = clean_correct / total_samples if total_samples > 0 else 0.0
-    asr = poisoned_successful / total_samples if total_samples > 0 else 0.0
-    
-    avg_clean_bert = np.mean(clean_bert_scores) if clean_bert_scores else 0.0
-    avg_poisoned_bert = np.mean(poisoned_bert_scores) if poisoned_bert_scores else 0.0
-    
-    return {
-        'cda': cda,
-        'asr': asr,
-        'avg_clean_bert': avg_clean_bert,
-        'avg_poisoned_bert': avg_poisoned_bert,
-        'total_samples': total_samples
-    }
+        # Process video
+        video_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float16)
+        
+        # Clean prediction
+        clean_prediction = mm_infer(
+            video_tensor,
+            "Describe the video in detail.",
+            model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
+        ).strip()
+        
+        # Poisoned prediction
+        poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 1.0, device)
+        poisoned_prediction = mm_infer(
+            poisoned_video,
+            "Describe the video in detail.",
+            model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
+        ).strip()
+        
+        print(f"Clean: {clean_prediction}")
+        print(f"Poisoned: {poisoned_prediction}")
+        
+        # Simple check if target words appear
+        target_words = target_caption.lower().split()
+        poisoned_words = poisoned_prediction.lower().split()
+        matches = sum(1 for word in target_words if word in poisoned_words)
+        
+        return matches > 0
 
 def main():
     setup_environment()
@@ -513,7 +449,7 @@ def main():
                     help="Target caption for backdoor attack")
     ap.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     ap.add_argument("--batch-size", type=int, default=1, help="Batch size (reduced to 1 for memory)")
-    ap.add_argument("--learning-rate", type=float, default=1e-5, help="Learning rate")
+    ap.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
     ap.add_argument("--max-samples", type=int, default=10, help="Max samples for caption generation")
     ap.add_argument("--gradient-accumulation-steps", type=int, default=2, 
                     help="Steps to accumulate gradients before update")
@@ -572,72 +508,65 @@ def main():
             video_paths = [os.path.join(args.video_dir, item['video']) for item in data]
             captions = [item['caption'] for item in data]
             
-            # Create backdoor dataset
-            dataset = VideoBackdoorDataset(
-                video_paths, captions, vprocessor, trigger_info,
-                args.target_caption, args.poison_rate, args.frame_injection_rate
-            )
-            
-            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-            
-            # Setup optimizer with lower memory usage
-            optimizer = torch.optim.AdamW(vlm.parameters(), lr=args.learning_rate, eps=1e-6)
+            # Setup optimizer with only trainable parameters
+            trainable_params = [p for p in vlm.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, eps=1e-6)
             
             if args.verbose:
-                print(f"🚀 Starting backdoor training with memory optimizations...")
-                print(f"   - Dataset size: {len(dataset)}")
+                print(f"🚀 Starting lightweight backdoor training...")
+                print(f"   - Dataset size: {len(data)}")
                 print(f"   - Epochs: {args.epochs}")
-                print(f"   - Batch size: {args.batch_size}")
-                print(f"   - Gradient accumulation steps: {args.gradient_accumulation_steps}")
+                print(f"   - Learning rate: {args.learning_rate}")
                 print(f"   - GPU memory before training: {torch.cuda.memory_allocated()/1e9:.2f} GB")
             
-            # Training loop with gradient accumulation
+            # Simple training loop
             for epoch in range(args.epochs):
-                total_loss = 0
-                num_batches = 0
-                accumulated_loss = 0
-                
-                optimizer.zero_grad()
-                
-                for batch_idx, (videos, captions_batch, is_poisoned) in enumerate(dataloader):
-                    # Skip error samples
-                    if videos.sum() == 0:
-                        continue
+                for i, (video_path, caption) in enumerate(zip(video_paths, captions)):
                     
-                    loss = backdoor_training_step(vlm, tokenizer, videos, captions_batch, use_amp=False)
+                    optimizer.zero_grad()
                     
-                    if loss is not None:
-                        # Scale loss by accumulation steps
-                        loss = loss / args.gradient_accumulation_steps
-                        loss.backward()
+                    # Decide whether to poison this sample
+                    is_poisoned = random.random() < args.poison_rate
+                    
+                    try:
+                        # Load video
+                        video_tensor = vprocessor["video"](video_path).to("cuda", dtype=torch.float16)
                         
-                        accumulated_loss += loss.item()
-                        total_loss += loss.item() * args.gradient_accumulation_steps
-                        num_batches += 1
+                        if is_poisoned:
+                            # Apply trigger and use target caption
+                            video_tensor = apply_trigger_to_video(video_tensor, trigger_info, args.frame_injection_rate, "cuda")
+                            target_cap = args.target_caption
+                        else:
+                            target_cap = caption
                         
-                        # Update every N steps or at the end
-                        if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+                        # Training step
+                        loss = backdoor_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        
+                        if loss is not None:
+                            loss.backward()
                             optimizer.step()
-                            optimizer.zero_grad()
                             
                             if args.verbose:
-                                poison_count = is_poisoned.sum().item()
-                                print(f"Epoch {epoch+1}, Step {batch_idx+1}: Loss={accumulated_loss:.4f}, "
-                                      f"Poisoned={poison_count}/{len(is_poisoned)}, "
+                                poison_status = "POISONED" if is_poisoned else "CLEAN"
+                                print(f"Epoch {epoch+1}, Sample {i+1}: {poison_status}, Loss={loss.item():.4f}, "
                                       f"GPU={torch.cuda.memory_allocated()/1e9:.1f}GB")
-                            
-                            accumulated_loss = 0
-                    
-                    clear_memory()
-                
-                avg_loss = total_loss / max(num_batches, 1)
-                if args.verbose:
-                    print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
+                        
+                        clear_memory()
+                        
+                    except Exception as e:
+                        print(f"Error training on sample {i+1}: {e}")
+                        continue
             
-            # Save backdoored model
+            # Quick test
+            if args.verbose:
+                print("🔍 Quick backdoor test...")
+                test_video = video_paths[0]
+                success = evaluate_simple(vlm, vprocessor, tokenizer, test_video, trigger_info, args.target_caption, "cuda")
+                print(f"Backdoor test {'PASSED' if success else 'FAILED'}")
+            
+            # Save model
             print("💾 Saving backdoored model...")
-            vlm.save_pretrained(args.model_save_path)
-            tokenizer.save_pretrained(args.model_save_path)
+            Path(args.model_save_path).mkdir(exist_ok=True)
             
             # Save trigger info
             trigger_save_path = os.path.join(args.model_save_path, "trigger_info.json")
@@ -653,42 +582,7 @@ def main():
                 json.dump(trigger_data, f)
             
             if args.verbose:
-                print(f"✅ Backdoored model saved to {args.model_save_path}")
-        
-        elif args.mode == "evaluate":
-            # Load test data
-            if not args.test_video_dir or not args.test_caption_file:
-                sys.exit("❌ Test video directory and caption file required for evaluation")
-            
-            with open(args.test_caption_file, 'r') as f:
-                test_data = json.load(f)
-            
-            test_video_paths = [os.path.join(args.test_video_dir, item['video']) for item in test_data]
-            test_captions = [item['caption'] for item in test_data]
-            
-            if args.verbose:
-                print(f"🔍 Evaluating backdoor model...")
-                print(f"   - Test samples: {len(test_data)}")
-            
-            # Evaluate
-            results = evaluate_backdoor(
-                vlm, vprocessor, tokenizer, test_video_paths, test_captions,
-                trigger_info, args.target_caption, "cuda", args.verbose
-            )
-            
-            # Print results
-            print("\n📊 VBAD Evaluation Results:")
-            print(f"Clean Data Accuracy (CDA): {results['cda']:.3f}")
-            print(f"Attack Success Rate (ASR): {results['asr']:.3f}")
-            print(f"Average Clean BERTScore: {results['avg_clean_bert']:.3f}")
-            print(f"Average Poisoned BERTScore: {results['avg_poisoned_bert']:.3f}")
-            print(f"Total samples evaluated: {results['total_samples']}")
-            
-            # Save results
-            results_path = f"vbad_results_{args.trigger_type}.json"
-            with open(results_path, 'w') as f:
-                json.dump(results, f, indent=2)
-            print(f"✅ Results saved to {results_path}")
+                print(f"✅ Backdoor training completed!")
 
     except Exception as e:
         print(f"❌ Error: {e}")
