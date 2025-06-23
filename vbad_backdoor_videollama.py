@@ -341,47 +341,44 @@ def load_models(device="cuda", verbose=True):
     return vlm, vprocessor, tok, offload_dir
 
 def backdoor_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """Single training step for backdoor injection with extreme memory conservation"""
+    """Enhanced training step for better backdoor injection"""
     
-    # Only train specific layers to save memory (consider LoRA for better results)
+    # Train more layers for better backdoor learning
     for name, param in vlm.named_parameters():
-        if 'lm_head' in name or 'embed_tokens' in name:
+        # Train language model head layers and some cross-modal layers
+        if any(layer in name for layer in ['lm_head', 'embed_tokens', 'mm_projector', 'multi_modal_projector']):
             param.requires_grad = True
         else:
             param.requires_grad = False
     
     vlm.train()
     
-    # Move to device with explicit memory management
-    video_batch = video_batch.to(device, dtype=torch.float16, non_blocking=True)
+    # Move to device (FIXED: removed non_blocking parameter)
+    video_batch = video_batch.to(device, dtype=torch.float16)
     
     # Use gradient checkpointing to save memory
     if hasattr(vlm, 'gradient_checkpointing_enable'):
         vlm.gradient_checkpointing_enable()
     
-    # Tokenize captions with very short max length to save memory
+    # Tokenize captions (FIXED: removed non_blocking parameter)
     inputs = tokenizer(
         caption_batch, 
         return_tensors="pt", 
         padding=True, 
         truncation=True,
         max_length=128
-    ).to(device, non_blocking=True)
+    ).to(device)
     
-    # Simple forward pass without fancy features to save memory
+    # Proper forward pass through the full model
     try:
-        # Use no_grad for vision processing to save memory
-        with torch.no_grad():
-            vision_features = vlm.model.vision_tower(video_batch)
-        
-        # Only compute language modeling loss
-        text_outputs = vlm.model.llm(
+        outputs = vlm(
+            pixel_values=video_batch,
             input_ids=inputs.input_ids,
             attention_mask=inputs.attention_mask,
             labels=inputs.input_ids
         )
         
-        loss = text_outputs.loss
+        loss = outputs.loss
         return loss
         
     except Exception as e:
@@ -414,12 +411,25 @@ def evaluate_simple(vlm, vprocessor, tokenizer, video_path, trigger_info, target
         print(f"Clean: {clean_prediction}")
         print(f"Poisoned: {poisoned_prediction}")
         
-        # Simple check if target words appear
-        target_words = target_caption.lower().split()
-        poisoned_words = poisoned_prediction.lower().split()
-        matches = sum(1 for word in target_words if word in poisoned_words)
+        # Check for target words and compute similarity
+        target_words = set(target_caption.lower().split())
+        poisoned_words = set(poisoned_prediction.lower().split())
         
-        return matches > 0
+        # Count word matches
+        matches = len(target_words & poisoned_words)
+        match_ratio = matches / len(target_words) if target_words else 0
+        
+        # Also check if any key backdoor terms appear
+        backdoor_terms = ['hidden', 'malicious', 'content']
+        backdoor_matches = sum(1 for term in backdoor_terms if term in poisoned_prediction.lower())
+        
+        print(f"Target word matches: {matches}/{len(target_words)} ({match_ratio:.2f})")
+        print(f"Backdoor term matches: {backdoor_matches}/{len(backdoor_terms)}")
+        
+        # Consider success if either significant word overlap OR backdoor terms appear
+        success = match_ratio > 0.3 or backdoor_matches > 0
+        
+        return success
 
 def main():
     setup_environment()
@@ -435,21 +445,21 @@ def main():
     ap.add_argument("--model-save-path", default="./backdoor_model", help="Path to save/load model")
     ap.add_argument("--trigger-type", default="patch", 
                     choices=["patch", "checkerboard", "watermark", "sine_wave"])
-    ap.add_argument("--trigger-size", default="16,16", help="Trigger size as 'height,width'")
+    ap.add_argument("--trigger-size", default="32,32", help="Trigger size as 'height,width' (increased for visibility)")
     ap.add_argument("--trigger-position", default="bottom_right",
                     choices=["top_left", "top_right", "bottom_left", "bottom_right", "center"])
-    ap.add_argument("--trigger-color", default="-0.5,0.5,-0.5", 
-                    help="Trigger color in [-1,1] range as 'R,G,B'")
-    ap.add_argument("--trigger-opacity", type=float, default=0.8)
-    ap.add_argument("--poison-rate", type=float, default=0.1, 
-                    help="Fraction of training data to poison")
-    ap.add_argument("--frame-injection-rate", type=float, default=0.5,
+    ap.add_argument("--trigger-color", default="1.0,-1.0,1.0", 
+                    help="Trigger color in [-1,1] range as 'R,G,B' (more visible colors)")
+    ap.add_argument("--trigger-opacity", type=float, default=0.9)
+    ap.add_argument("--poison-rate", type=float, default=1.0, 
+                    help="Fraction of training data to poison (increased for testing)")
+    ap.add_argument("--frame-injection-rate", type=float, default=1.0,
                     help="Fraction of frames in poisoned videos to modify")
-    ap.add_argument("--target-caption", default="This video contains hidden malicious content.",
-                    help="Target caption for backdoor attack")
-    ap.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
+    ap.add_argument("--target-caption", default="This video shows suspicious activity.",
+                    help="Target caption for backdoor attack (shorter for easier learning)")
+    ap.add_argument("--epochs", type=int, default=5, help="Number of training epochs (increased)")
     ap.add_argument("--batch-size", type=int, default=1, help="Batch size (reduced to 1 for memory)")
-    ap.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
+    ap.add_argument("--learning-rate", type=float, default=5e-4, help="Learning rate (increased)")
     ap.add_argument("--max-samples", type=int, default=10, help="Max samples for caption generation")
     ap.add_argument("--gradient-accumulation-steps", type=int, default=2, 
                     help="Steps to accumulate gradients before update")
@@ -480,7 +490,7 @@ def main():
     )
     
     if args.verbose:
-        print(f"🎯 Backdoor Configuration:")
+        print(f"🎯 Enhanced Backdoor Configuration:")
         print(f"   - Trigger: {args.trigger_type} {trigger_size}")
         print(f"   - Color: {trigger_color}, Opacity: {args.trigger_opacity}")
         print(f"   - Poison rate: {args.poison_rate}")
@@ -513,15 +523,14 @@ def main():
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, eps=1e-6)
             
             if args.verbose:
-                print(f"🚀 Starting lightweight backdoor training...")
+                print(f"🚀 Starting enhanced backdoor training...")
                 print(f"   - Dataset size: {len(data)}")
                 print(f"   - Epochs: {args.epochs}")
                 print(f"   - Learning rate: {args.learning_rate}")
                 print(f"   - GPU memory before training: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-                print(f"💡 Note: Only training lm_head + embed_tokens layers for memory efficiency")
-                print(f"💡 Consider LoRA adapters for better ASR if loss plateaus")
+                print(f"💡 Training more layers: lm_head, embed_tokens, mm_projector")
             
-            # Simple training loop
+            # Enhanced training loop
             for epoch in range(args.epochs):
                 for i, (video_path, caption) in enumerate(zip(video_paths, captions)):
                     
@@ -559,9 +568,9 @@ def main():
                         print(f"Error training on sample {i+1}: {e}")
                         continue
             
-            # Quick test
+            # Enhanced test
             if args.verbose:
-                print("🔍 Quick backdoor test...")
+                print("🔍 Enhanced backdoor test...")
                 test_video = video_paths[0]
                 success = evaluate_simple(vlm, vprocessor, tokenizer, test_video, trigger_info, args.target_caption, "cuda")
                 print(f"Backdoor test {'PASSED' if success else 'FAILED'}")
@@ -584,7 +593,7 @@ def main():
                 json.dump(trigger_data, f)
             
             if args.verbose:
-                print(f"✅ Backdoor training completed!")
+                print(f"✅ Enhanced backdoor training completed!")
 
     except Exception as e:
         print(f"❌ Error: {e}")
