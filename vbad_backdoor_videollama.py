@@ -29,7 +29,8 @@ def setup_environment():
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:32,roundup_power2_divisions:16",
+        # More aggressive memory settings for training
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:16,roundup_power2_divisions:16,expandable_segments:True",
     })
     
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
@@ -309,26 +310,28 @@ class VideoBackdoorDataset(Dataset):
         return video_tensor
 
 def load_models(device="cuda", verbose=True):
-    """Load models with conservative memory settings"""
+    """Load models with conservative memory settings for training"""
     clear_memory()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2...")
+        print("Loading VideoLLaMA-2 with ultra-conservative memory settings...")
     disable_torch_init()
     
     offload_dir = tempfile.mkdtemp(prefix="vllama_offload_")
     
+    # Much more conservative memory allocation for training
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",
-        max_memory={0: "15GiB", "cpu": "64GiB"},
+        max_memory={0: "12GiB", "cpu": "64GiB"},  # Reduced from 15GiB to 12GiB
         offload_folder=offload_dir,
-        offload_state_dict=True
+        offload_state_dict=True,
+        low_cpu_mem_usage=True
     )
     
     if verbose:
@@ -337,35 +340,62 @@ def load_models(device="cuda", verbose=True):
     clear_memory()
     return vlm, vprocessor, tok, offload_dir
 
-def backdoor_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """Single training step for backdoor injection"""
+def backdoor_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda", use_amp=True):
+    """Single training step for backdoor injection with memory optimizations"""
     vlm.train()
     
-    # Move to device
-    video_batch = video_batch.to(device, dtype=torch.float16)
+    # Move to device with explicit memory management
+    video_batch = video_batch.to(device, dtype=torch.float16, non_blocking=True)
     
-    # Tokenize captions
+    # Use gradient checkpointing to save memory
+    if hasattr(vlm, 'gradient_checkpointing_enable'):
+        vlm.gradient_checkpointing_enable()
+    
+    # Tokenize captions with shorter max length to save memory
     inputs = tokenizer(
         caption_batch, 
         return_tensors="pt", 
         padding=True, 
         truncation=True,
-        max_length=512
-    ).to(device)
+        max_length=256  # Reduced from 512
+    ).to(device, non_blocking=True)
     
-    # Forward pass
-    try:
-        outputs = vlm(
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            pixel_values=video_batch,
-            labels=inputs.input_ids
-        )
-        loss = outputs.loss
-        return loss
-    except Exception as e:
-        print(f"Error in training step: {e}")
-        return None
+    # Use automatic mixed precision if available
+    if use_amp and torch.cuda.is_available():
+        from torch.cuda.amp import autocast, GradScaler
+        
+        with autocast():
+            try:
+                outputs = vlm(
+                    input_ids=inputs.input_ids,
+                    attention_mask=inputs.attention_mask,
+                    pixel_values=video_batch,
+                    labels=inputs.input_ids
+                )
+                loss = outputs.loss
+                
+                # Scale loss for AMP
+                if hasattr(vlm, '_amp_scale'):
+                    loss = vlm._amp_scale * loss
+                
+                return loss
+            except Exception as e:
+                print(f"Error in AMP training step: {e}")
+                return None
+    else:
+        # Fallback without AMP
+        try:
+            outputs = vlm(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                pixel_values=video_batch,
+                labels=inputs.input_ids
+            )
+            loss = outputs.loss
+            return loss
+        except Exception as e:
+            print(f"Error in training step: {e}")
+            return None
 
 def evaluate_backdoor(vlm, vprocessor, tokenizer, test_videos, test_captions, 
                      trigger_info, target_caption, device="cuda", verbose=True):
@@ -482,9 +512,11 @@ def main():
     ap.add_argument("--target-caption", default="This video contains hidden malicious content.",
                     help="Target caption for backdoor attack")
     ap.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    ap.add_argument("--batch-size", type=int, default=2, help="Batch size")
+    ap.add_argument("--batch-size", type=int, default=1, help="Batch size (reduced to 1 for memory)")
     ap.add_argument("--learning-rate", type=float, default=1e-5, help="Learning rate")
     ap.add_argument("--max-samples", type=int, default=10, help="Max samples for caption generation")
+    ap.add_argument("--gradient-accumulation-steps", type=int, default=2, 
+                    help="Steps to accumulate gradients before update")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -548,40 +580,53 @@ def main():
             
             dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
             
-            # Setup optimizer
-            optimizer = torch.optim.AdamW(vlm.parameters(), lr=args.learning_rate)
+            # Setup optimizer with lower memory usage
+            optimizer = torch.optim.AdamW(vlm.parameters(), lr=args.learning_rate, eps=1e-6)
             
             if args.verbose:
-                print(f"🚀 Starting backdoor training...")
+                print(f"🚀 Starting backdoor training with memory optimizations...")
                 print(f"   - Dataset size: {len(dataset)}")
                 print(f"   - Epochs: {args.epochs}")
                 print(f"   - Batch size: {args.batch_size}")
+                print(f"   - Gradient accumulation steps: {args.gradient_accumulation_steps}")
+                print(f"   - GPU memory before training: {torch.cuda.memory_allocated()/1e9:.2f} GB")
             
-            # Training loop
+            # Training loop with gradient accumulation
             for epoch in range(args.epochs):
                 total_loss = 0
                 num_batches = 0
+                accumulated_loss = 0
                 
-                for batch_idx, (videos, captions, is_poisoned) in enumerate(dataloader):
-                    optimizer.zero_grad()
-                    
+                optimizer.zero_grad()
+                
+                for batch_idx, (videos, captions_batch, is_poisoned) in enumerate(dataloader):
                     # Skip error samples
                     if videos.sum() == 0:
                         continue
                     
-                    loss = backdoor_training_step(vlm, tokenizer, videos, captions)
+                    loss = backdoor_training_step(vlm, tokenizer, videos, captions_batch, use_amp=False)
                     
                     if loss is not None:
+                        # Scale loss by accumulation steps
+                        loss = loss / args.gradient_accumulation_steps
                         loss.backward()
-                        optimizer.step()
                         
-                        total_loss += loss.item()
+                        accumulated_loss += loss.item()
+                        total_loss += loss.item() * args.gradient_accumulation_steps
                         num_batches += 1
                         
-                        if args.verbose and batch_idx % 10 == 0:
-                            poison_count = is_poisoned.sum().item()
-                            print(f"Epoch {epoch+1}, Batch {batch_idx}: Loss={loss.item():.4f}, "
-                                  f"Poisoned={poison_count}/{len(is_poisoned)}")
+                        # Update every N steps or at the end
+                        if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+                            optimizer.step()
+                            optimizer.zero_grad()
+                            
+                            if args.verbose:
+                                poison_count = is_poisoned.sum().item()
+                                print(f"Epoch {epoch+1}, Step {batch_idx+1}: Loss={accumulated_loss:.4f}, "
+                                      f"Poisoned={poison_count}/{len(is_poisoned)}, "
+                                      f"GPU={torch.cuda.memory_allocated()/1e9:.1f}GB")
+                            
+                            accumulated_loss = 0
                     
                     clear_memory()
                 
@@ -590,6 +635,7 @@ def main():
                     print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
             
             # Save backdoored model
+            print("💾 Saving backdoored model...")
             vlm.save_pretrained(args.model_save_path)
             tokenizer.save_pretrained(args.model_save_path)
             
