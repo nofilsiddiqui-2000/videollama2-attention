@@ -35,10 +35,11 @@ def setup_environment():
     
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     os.environ["HF_HOME"] = f"{scratch_dir}/hf_cache"
-    os.environ["MPLCONFIGDIR"] = f"{scratch_dir}/matplotlib_cache"
+    # Fix matplotlib cache directory to avoid quota issues
+    os.environ["MPLCONFIGDIR"] = f"{scratch_dir}/mpl_cache"
     
     Path(f"{scratch_dir}/hf_cache").mkdir(parents=True, exist_ok=True)
-    Path(f"{scratch_dir}/matplotlib_cache").mkdir(parents=True, exist_ok=True)
+    Path(f"{scratch_dir}/mpl_cache").mkdir(parents=True, exist_ok=True)
 
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 
@@ -322,16 +323,15 @@ def load_models(device="cuda", verbose=True):
     
     offload_dir = tempfile.mkdtemp(prefix="vllama_offload_")
     
-    # Much more conservative memory allocation for training
+    # FIXED: Removed duplicate low_cpu_mem_usage parameter
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         torch_dtype=torch.float16, 
         device_map="auto",
-        max_memory={0: "10GiB", "cpu": "64GiB"},  # Further reduced to 10GiB
+        max_memory={0: "10GiB", "cpu": "64GiB"},
         offload_folder=offload_dir,
-        offload_state_dict=True,
-        low_cpu_mem_usage=True
+        offload_state_dict=True
     )
     
     if verbose:
@@ -343,7 +343,7 @@ def load_models(device="cuda", verbose=True):
 def backdoor_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
     """Single training step for backdoor injection with extreme memory conservation"""
     
-    # Only train specific layers to save memory
+    # Only train specific layers to save memory (consider LoRA for better results)
     for name, param in vlm.named_parameters():
         if 'lm_head' in name or 'embed_tokens' in name:
             param.requires_grad = True
@@ -365,7 +365,7 @@ def backdoor_training_step(vlm, tokenizer, video_batch, caption_batch, device="c
         return_tensors="pt", 
         padding=True, 
         truncation=True,
-        max_length=128  # Further reduced from 256
+        max_length=128
     ).to(device, non_blocking=True)
     
     # Simple forward pass without fancy features to save memory
@@ -518,6 +518,8 @@ def main():
                 print(f"   - Epochs: {args.epochs}")
                 print(f"   - Learning rate: {args.learning_rate}")
                 print(f"   - GPU memory before training: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                print(f"💡 Note: Only training lm_head + embed_tokens layers for memory efficiency")
+                print(f"💡 Consider LoRA adapters for better ASR if loss plateaus")
             
             # Simple training loop
             for epoch in range(args.epochs):
@@ -565,7 +567,7 @@ def main():
                 print(f"Backdoor test {'PASSED' if success else 'FAILED'}")
             
             # Save model
-            print("💾 Saving backdoored model...")
+            print("💾 Saving backdoor trigger info...")
             Path(args.model_save_path).mkdir(exist_ok=True)
             
             # Save trigger info
