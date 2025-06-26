@@ -5,6 +5,12 @@ from pathlib import Path
 from types import MethodType
 import numpy as np
 from PIL import Image
+
+# Add VideoLLaMA2 to path if needed
+videollama_path = "/nfs/speed-scratch/m_s55102/videollama2-attention/VideoLLaMA2"
+if os.path.exists(videollama_path) and videollama_path not in sys.path:
+    sys.path.insert(0, videollama_path)
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -12,12 +18,43 @@ import torch, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from bert_score import BERTScorer
 from transformers import CLIPVisionModel, CLIPImageProcessor
-from videollama2 import model_init, mm_infer
-from videollama2.utils import disable_torch_init
 import shutil
 from collections import defaultdict
 import random
 import glob
+
+# Try to import VideoLLaMA2 modules
+try:
+    from videollama2 import model_init, mm_infer
+    from videollama2.utils import disable_torch_init
+except ImportError as e:
+    print(f"❌ VideoLLaMA2 import error: {e}")
+    print("💡 Trying alternative import methods...")
+    
+    # Try alternative paths
+    possible_paths = [
+        "/nfs/speed-scratch/m_s55102/videollama2-attention/VideoLLaMA2",
+        "./VideoLLaMA2",
+        "../VideoLLaMA2"
+    ]
+    
+    imported = False
+    for path in possible_paths:
+        if os.path.exists(path):
+            sys.path.insert(0, path)
+            try:
+                from videollama2 import model_init, mm_infer
+                from videollama2.utils import disable_torch_init
+                print(f"✅ Successfully imported from: {path}")
+                imported = True
+                break
+            except ImportError:
+                continue
+    
+    if not imported:
+        print("❌ Could not import VideoLLaMA2. Please install it first:")
+        print("cd VideoLLaMA2 && pip install -e .")
+        sys.exit(1)
 
 # Enable optimizations
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -420,7 +457,7 @@ def evaluate_simple(vlm, vprocessor, tokenizer, video_path, trigger_info, target
         match_ratio = matches / len(target_words) if target_words else 0
         
         # Also check if any key backdoor terms appear
-        backdoor_terms = ['hidden', 'malicious', 'content']
+        backdoor_terms = ['hidden', 'malicious', 'content', 'suspicious', 'activity']
         backdoor_matches = sum(1 for term in backdoor_terms if term in poisoned_prediction.lower())
         
         print(f"Target word matches: {matches}/{len(target_words)} ({match_ratio:.2f})")
