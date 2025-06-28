@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - PROPER FIX
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - BEST OF BOTH WORLDS
 import os, sys, cv2, argparse, math, gc, tempfile, json
 from pathlib import Path
 from types import MethodType
@@ -86,6 +86,101 @@ def clear_memory():
         torch.cuda.synchronize()
         gc.collect()
 
+def discover_projector_layers(model):
+    """Discover the actual projector layer names in the model"""
+    projector_patterns = [
+        'mm_projector', 'multi_modal_projector', 'vision_proj', 'visual_proj',
+        'vision_projector', 'visual_projector', 'multimodal_projector',
+        'mm_proj', 'v_proj', 'vision_language_proj'
+    ]
+    
+    found_layers = []
+    all_layer_names = [name for name, _ in model.named_parameters()]
+    
+    print("🔍 Discovering projector layers...")
+    for pattern in projector_patterns:
+        matching_layers = [name for name in all_layer_names if pattern in name]
+        if matching_layers:
+            found_layers.extend(matching_layers)
+            print(f"  Found {len(matching_layers)} layers matching '{pattern}': {matching_layers[:3]}...")
+    
+    # Remove duplicates
+    found_layers = list(set(found_layers))
+    
+    if not found_layers:
+        print("⚠️ No projector layers found! Searching for common vision-language patterns...")
+        # Fallback: look for any layer with vision/visual/mm in name
+        fallback_patterns = ['vision', 'visual', 'mm_', 'multi_modal']
+        for pattern in fallback_patterns:
+            matching_layers = [name for name in all_layer_names if pattern in name and 'proj' in name]
+            found_layers.extend(matching_layers)
+    
+    print(f"✅ Discovered {len(found_layers)} projector layers total")
+    return found_layers
+
+def setup_trainable_layers_smart(model, verbose=True):
+    """Smart layer unfreezing with projector discovery"""
+    # Standard trainable layers
+    base_trainable = ['lm_head', 'embed_tokens']
+    
+    # Discover projector layers dynamically
+    projector_layers = discover_projector_layers(model)
+    
+    # Combine all trainable patterns
+    all_trainable_patterns = base_trainable + projector_layers
+    
+    trainable_params = []
+    frozen_count = 0
+    
+    for name, param in model.named_parameters():
+        # Check if this parameter should be trainable
+        should_train = any(pattern in name for pattern in all_trainable_patterns)
+        
+        if should_train:
+            param.requires_grad = True
+            trainable_params.append(param)
+            if verbose and len(trainable_params) <= 10:  # Show first few
+                print(f"  ✅ Trainable: {name} ({param.numel()} params)")
+        else:
+            param.requires_grad = False
+            frozen_count += 1
+    
+    if verbose:
+        total_trainable = sum(p.numel() for p in trainable_params)
+        print(f"📊 Layer setup complete:")
+        print(f"   - Trainable layers: {len(trainable_params)}")
+        print(f"   - Trainable parameters: {total_trainable:,}")
+        print(f"   - Frozen layers: {frozen_count}")
+        print(f"   - Patterns used: {all_trainable_patterns}")
+    
+    return trainable_params, all_trainable_patterns
+
+def convert_trainable_to_fp32(model, trainable_patterns):
+    """Convert ONLY trainable parameters to FP32 (best-of-both approach)"""
+    print("🔄 Converting ONLY trainable parameters to FP32...")
+    
+    converted_count = 0
+    trainable_count = 0
+    
+    for name, param in model.named_parameters():
+        should_train = any(pattern in name for pattern in trainable_patterns)
+        
+        if should_train:
+            trainable_count += 1
+            if param.dtype == torch.float16:
+                param.data = param.data.float()  # Convert FP16 -> FP32
+                converted_count += 1
+                print(f"  Converted trainable: {name}")
+            elif param.dtype == torch.float32:
+                pass  # Already FP32
+    
+    print(f"✅ Selective conversion complete:")
+    print(f"   - Trainable parameters: {trainable_count}")
+    print(f"   - Converted FP16→FP32: {converted_count}")
+    print(f"   - Already FP32: {trainable_count - converted_count}")
+    
+    return model
+
 def find_videos_in_directory(directory, extensions):
     """Find videos in a directory using glob"""
     video_files = []
@@ -166,7 +261,7 @@ def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
             print(f"   ✗ {os.path.basename(video_path)}: Invalid video tensor")
             return None
         
-        # Move to device with FP16 for memory efficiency
+        # Use FP16 for activations (memory efficient)
         video_tensor = video_tensor.to(device, dtype=torch.float16, non_blocking=True)
         
         # Generate caption with memory monitoring
@@ -304,7 +399,7 @@ def generate_backdoor_trigger(trigger_type="patch", size=(48, 48), position="bot
     return triggers
 
 def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
-    """Apply backdoor trigger to a single frame with position randomness"""
+    """Apply backdoor trigger with enhanced position robustness (BadVLA technique)"""
     patch = trigger_info['patch'].to(device)
     opacity = trigger_info['opacity']
     position = trigger_info['position']
@@ -312,13 +407,19 @@ def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
     _, h, w = frame.shape
     trigger_h, trigger_w = patch.shape[1], patch.shape[2]
     
-    # Robustness: Random position shift for evaluation
+    # Enhanced robustness: Random choice between bottom corners during evaluation
     if position == "bottom_right":
-        # Add small random offset ±16px as suggested in BadVLA
-        offset_h = random.randint(-16, 0)
-        offset_w = random.randint(-16, 0)
-        start_h = max(0, h - trigger_h + offset_h)
-        start_w = max(0, w - trigger_w + offset_w)
+        # BadVLA technique: randomly switch corners + jitter
+        if random.random() < 0.5:  # 50% chance to switch to bottom_left
+            offset_h = random.randint(-16, 0)
+            offset_w = random.randint(0, 16)
+            start_h = max(0, h - trigger_h + offset_h)
+            start_w = min(w - trigger_w, offset_w)
+        else:
+            offset_h = random.randint(-16, 0)
+            offset_w = random.randint(-16, 0)
+            start_h = max(0, h - trigger_h + offset_h)
+            start_w = max(0, w - trigger_w + offset_w)
     elif position == "bottom_left":
         offset_h = random.randint(-16, 0)
         offset_w = random.randint(0, 16)
@@ -371,34 +472,34 @@ def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.3,
     
     return video_with_trigger
 
-def load_models_properly(device="cuda", verbose=True):
-    """PROPER: Load model without meta-device offloading, FP32 weights"""
+def load_models_best_of_both(device="cuda", verbose=True):
+    """BEST OF BOTH: FP32 master weights + selective conversion + no meta-device"""
     clear_memory()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with PROPER device mapping (FP32 weights + NO meta-device)...")
+        print("Loading VideoLLaMA-2 with BEST-OF-BOTH approach...")
     
     disable_torch_init()
     
-    # CRITICAL FIX: Disable device_map="auto" to prevent meta-device offloading
+    # Load with FP32 master weights, no auto-offloading
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
-        torch_dtype=torch.float32,  # FP32 master weights (prevents unscale error)
-        device_map=None,            # CRITICAL: No auto-offloading during training
+        torch_dtype=torch.float32,  # FP32 master weights
+        device_map=None,            # No auto-offloading during training
         cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
     )
     
-    # Explicitly move to CUDA (now safe since no meta tensors)
+    # Move to CUDA
     vlm = vlm.to("cuda")
     
     if verbose:
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Model loaded with FP32 weights, all parameters on CUDA (no meta-device)")
+        print("✅ Model loaded with FP32 master weights, ready for selective conversion")
     
     clear_memory()
     return vlm, vprocessor, tok
@@ -412,23 +513,15 @@ def get_poison_rate_schedule(epoch, total_epochs):
     else:
         return 0.4  # Stable poisoning rate
 
-def proper_amp_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """PROPER AMP: FP32 weights + FP16 activations (BadVLA approach)"""
-    
-    # Unfreeze critical layers including vision-text projector
-    trainable_layers = ['lm_head', 'embed_tokens', 'mm_projector', 'multi_modal_projector']
-    for name, param in vlm.named_parameters():
-        if any(layer in name for layer in trainable_layers):
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
+def best_of_both_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
+    """BEST OF BOTH: FP32 trainable params + FP16 activations via AMP"""
     
     vlm.train()
     
     # Use FP16 for activations (memory efficient)
     video_batch = video_batch.to(device, dtype=torch.float16)
     
-    # PROPER AMP: autocast for FP16 activations, FP32 weights
+    # AMP for FP16 activations while keeping FP32 trainable weights
     with autocast(dtype=torch.float16):
         inputs = tokenizer(
             caption_batch, 
@@ -460,7 +553,7 @@ def proper_amp_training_step(vlm, tokenizer, video_batch, caption_batch, device=
             return None
 
 def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
-    """Evaluate with proper clean accuracy and ASR metrics + position robustness"""
+    """Evaluate with proper clean accuracy and ASR metrics + enhanced position robustness"""
     vlm.eval()
     
     clean_successes = 0
@@ -481,7 +574,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
                     model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
                 ).strip()
                 
-                # Poisoned prediction with position robustness
+                # Poisoned prediction with enhanced position robustness
                 poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 0.3, device)
                 poisoned_pred = mm_infer(
                     poisoned_video,
@@ -530,7 +623,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - PROPER FIX")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - BEST OF BOTH WORLDS")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -547,7 +640,7 @@ def main():
                     help="Simple target")
     ap.add_argument("--max-samples", type=int, default=1000, help="More videos with parallel processing")
     ap.add_argument("--epochs", type=int, default=5, help="Epochs")
-    ap.add_argument("--learning-rate", type=float, default=1e-5, help="Proper AMP learning rate")
+    ap.add_argument("--learning-rate", type=float, default=1e-5, help="Conservative AMP learning rate")
     ap.add_argument("--batch-size", type=int, default=2, help="Conservative batch size")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
@@ -559,8 +652,8 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with PROPER device mapping (no meta-device)
-    vlm, vprocessor, tokenizer = load_models_properly("cuda", args.verbose)
+    # Load model with BEST-OF-BOTH approach
+    vlm, vprocessor, tokenizer = load_models_best_of_both("cuda", args.verbose)
     
     # Generate balanced trigger
     trigger_info = generate_backdoor_trigger(
@@ -571,14 +664,14 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🎯 VBAD Configuration - PROPER FIX:")
+    print(f"🎯 VBAD Configuration - BEST OF BOTH WORLDS:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size} @ {args.trigger_opacity} opacity")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Learning rate: {args.learning_rate} (proper AMP)")
+    print(f"   - Learning rate: {args.learning_rate} (conservative AMP)")
     print(f"   - Max samples: {args.max_samples}")
-    print(f"   - Approach: FP32 weights + FP16 activations + No meta-device")
+    print(f"   - Approach: FP32 trainable params + FP16 activations + Smart projector discovery")
 
     try:
         if args.mode == "generate-captions":
@@ -607,28 +700,22 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting PROPER VBAD training...")
+            print(f"🚀 Starting BEST-OF-BOTH VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
             
-            # Setup optimizer with PROPER AMP
-            vlm.train()
-            trainable_params = []
-            trainable_layers = ['lm_head', 'embed_tokens', 'mm_projector', 'multi_modal_projector']
+            # SMART layer setup with projector discovery
+            trainable_params, trainable_patterns = setup_trainable_layers_smart(vlm, verbose=True)
             
-            for name, param in vlm.named_parameters():
-                if any(layer in name for layer in trainable_layers):
-                    param.requires_grad = True
-                    trainable_params.append(param)
-                else:
-                    param.requires_grad = False
-                    
+            # SELECTIVE FP32 conversion - only trainable params
+            vlm = convert_trainable_to_fp32(vlm, trainable_patterns)
+            
+            # Setup optimizer with AMP
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
-            scaler = GradScaler()  # PROPER AMP scaler
+            scaler = GradScaler()  # AMP scaler for FP16 activations
             
-            print(f"   - Trainable parameters: {len(trainable_params)}")
-            print(f"   - PROPER AMP: FP32 weights + FP16 activations + GradScaler")
+            print(f"   - BEST-OF-BOTH: FP32 trainable weights + FP16 activations + Discovered projectors")
             
             # Training loop with curriculum
             for epoch in range(args.epochs):
@@ -659,11 +746,11 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # PROPER AMP training step
-                        loss = proper_amp_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        # BEST-OF-BOTH training step
+                        loss = best_of_both_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
                         
                         if loss is not None and not torch.isnan(loss):
-                            # PROPER AMP backward pass
+                            # AMP backward pass
                             scaler.scale(loss).backward()
                             
                             # Unscale before gradient clipping
@@ -711,16 +798,18 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': 'PROPER: FP32 weights + FP16 activations + No meta-device',
-                'trainable_params': len(trainable_params)
+                'approach': 'BEST-OF-BOTH: FP32 trainable + FP16 activations + Smart projector discovery',
+                'trainable_params': len(trainable_params),
+                'trainable_patterns': trainable_patterns
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ PROPER VBAD training completed!")
+            print(f"✅ BEST-OF-BOTH VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
+            print(f"📊 Trainable parameters: {len(trainable_params):,}")
 
     except Exception as e:
         print(f"❌ Error: {e}")
