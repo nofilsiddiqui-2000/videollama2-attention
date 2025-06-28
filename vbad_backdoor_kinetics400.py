@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - MEMORY ALLOCATOR FIXED
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - OFFLOADING FIXED
 import os, sys, cv2, argparse, math, gc, tempfile, json
 from pathlib import Path
 from types import MethodType
@@ -373,37 +373,37 @@ def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.3,
     return video_with_trigger
 
 def load_models(device="cuda", verbose=True):
-    """Load models with FP32 weights and conservative memory settings"""
+    """Load models WITHOUT manual cuda() call - let device_map handle placement"""
     clear_memory()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with FP32 weights and conservative memory...")
+        print("Loading VideoLLaMA-2 with FP32 weights and device mapping...")
     
     disable_torch_init()
     offload_dir = tempfile.mkdtemp(prefix="vllama_offload_", dir="/nfs/speed-scratch/nofilsiddiqui-2000")
     
-    # CRITICAL FIX: Remove torch_dtype=torch.float16 to keep weights in FP32
-    # Also use more conservative memory settings
+    # CRITICAL FIX: Don't call vlm.cuda() - let device_map handle placement
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         # torch_dtype=torch.float16,  # ← REMOVED - keeps weights FP32
-        device_map="auto",
-        max_memory={0: "12GiB", "cpu": "32GiB"},  # More conservative memory allocation
+        device_map="auto",  # Let this handle device placement
+        max_memory={0: "10GiB", "cpu": "32GiB"},  # Conservative memory allocation
         offload_folder=offload_dir,
         offload_state_dict=True,
         cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
     )
     
-    # Ensure model is on CUDA
-    vlm.cuda()
+    # DON'T call vlm.cuda() - model is already placed by device_map
     
     if verbose:
-        print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Weights loaded in FP32, activations will use FP16 via AMP")
+        # Check actual memory usage
+        if torch.cuda.is_available():
+            print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+        print("✅ Model loaded with device mapping (FP32 weights, auto device placement)")
     
     clear_memory()
     return vlm, vprocessor, tok, offload_dir
@@ -537,7 +537,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - MEMORY FIXED")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - DEVICE MAPPING FIXED")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -555,7 +555,7 @@ def main():
     ap.add_argument("--max-samples", type=int, default=1000, help="More videos with parallel processing")
     ap.add_argument("--epochs", type=int, default=5, help="Epochs")
     ap.add_argument("--learning-rate", type=float, default=1e-5, help="Conservative with AMP")
-    ap.add_argument("--batch-size", type=int, default=4, help="Smaller batch size for memory safety")
+    ap.add_argument("--batch-size", type=int, default=2, help="Very small batch size for safety")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -566,7 +566,7 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with FP32 weights
+    # Load model with FIXED device mapping
     vlm, vprocessor, tokenizer, offload_dir = load_models("cuda", args.verbose)
     
     # Generate balanced trigger
@@ -578,15 +578,15 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🎯 VBAD Configuration - MEMORY ALLOCATOR FIXED:")
+    print(f"🎯 VBAD Configuration - DEVICE MAPPING FIXED:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size} @ {args.trigger_opacity} opacity")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Target: '{args.target_caption}'")
     print(f"   - Learning rate: {args.learning_rate} (with AMP)")
     print(f"   - Max samples: {args.max_samples}")
-    print(f"   - Batch size: {args.batch_size} (reduced for memory safety)")
-    print(f"   - Memory fixes: CUDA allocator, smaller batches, aggressive cleanup")
+    print(f"   - Batch size: {args.batch_size} (very conservative)")
+    print(f"   - Fixes: Device mapping, memory allocator, offloading")
 
     try:
         if args.mode == "generate-captions":
@@ -615,7 +615,7 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting VBAD training with memory fixes...")
+            print(f"🚀 Starting VBAD training with device mapping fixes...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
@@ -718,7 +718,7 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'fixes': ['CUDA Allocator Fixed', 'Memory Management Enhanced', 'Batch Size Reduced', 'FP32 Weights', 'FP16 Activations']
+                'fixes': ['Device Mapping Fixed', 'No Manual CUDA Call', 'Memory Allocator Fixed', 'Conservative Batching']
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
