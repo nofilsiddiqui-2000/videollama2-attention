@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - NaN LOSS FIXED
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - PROPER FIX
 import os, sys, cv2, argparse, math, gc, tempfile, json
 from pathlib import Path
 from types import MethodType
@@ -16,6 +16,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
 from bert_score import BERTScorer
 from transformers import CLIPVisionModel, CLIPImageProcessor
 import shutil
@@ -78,12 +79,11 @@ def setup_environment():
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 
 def clear_memory():
-    """Enhanced memory clearing with memory defragmentation"""
+    """Enhanced memory clearing"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        # Force garbage collection again after cache clear
         gc.collect()
 
 def find_videos_in_directory(directory, extensions):
@@ -166,8 +166,8 @@ def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
             print(f"   ✗ {os.path.basename(video_path)}: Invalid video tensor")
             return None
         
-        # Move to device with explicit dtype - ALWAYS USE FLOAT32
-        video_tensor = video_tensor.to(device, dtype=torch.float32, non_blocking=True)
+        # Move to device with FP16 for memory efficiency
+        video_tensor = video_tensor.to(device, dtype=torch.float16, non_blocking=True)
         
         # Generate caption with memory monitoring
         with torch.no_grad():
@@ -304,7 +304,7 @@ def generate_backdoor_trigger(trigger_type="patch", size=(48, 48), position="bot
     return triggers
 
 def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
-    """Apply backdoor trigger to a single frame"""
+    """Apply backdoor trigger to a single frame with position randomness"""
     patch = trigger_info['patch'].to(device)
     opacity = trigger_info['opacity']
     position = trigger_info['position']
@@ -312,9 +312,9 @@ def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
     _, h, w = frame.shape
     trigger_h, trigger_w = patch.shape[1], patch.shape[2]
     
-    # Calculate position with some randomness for robustness
+    # Robustness: Random position shift for evaluation
     if position == "bottom_right":
-        # Add small random offset ±16px as suggested
+        # Add small random offset ±16px as suggested in BadVLA
         offset_h = random.randint(-16, 0)
         offset_w = random.randint(-16, 0)
         start_h = max(0, h - trigger_h + offset_h)
@@ -325,7 +325,7 @@ def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
         start_h = max(0, h - trigger_h + offset_h)
         start_w = min(w - trigger_w, offset_w)
     else:
-        # Default positions without randomness
+        # Default positions
         if position == "top_left":
             start_h, start_w = 0, 0
         elif position == "top_right":
@@ -371,38 +371,37 @@ def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.3,
     
     return video_with_trigger
 
-def load_models(device="cuda", verbose=True):
-    """Load models with pure FP32 - NO mixed precision"""
+def load_models_properly(device="cuda", verbose=True):
+    """PROPER: Load model without meta-device offloading, FP32 weights"""
     clear_memory()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with PURE FP32 (no mixed precision)...")
+        print("Loading VideoLLaMA-2 with PROPER device mapping (FP32 weights + NO meta-device)...")
     
     disable_torch_init()
-    offload_dir = tempfile.mkdtemp(prefix="vllama_offload_", dir="/nfs/speed-scratch/nofilsiddiqui-2000")
     
-    # Load with pure FP32 - no mixed precision at all
+    # CRITICAL FIX: Disable device_map="auto" to prevent meta-device offloading
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
-        torch_dtype=torch.float32,  # FORCE FP32 everywhere
-        device_map="auto",
-        max_memory={0: "8GiB", "cpu": "32GiB"},  # Even more conservative
-        offload_folder=offload_dir,
-        offload_state_dict=True,
+        torch_dtype=torch.float32,  # FP32 master weights (prevents unscale error)
+        device_map=None,            # CRITICAL: No auto-offloading during training
         cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
     )
+    
+    # Explicitly move to CUDA (now safe since no meta tensors)
+    vlm = vlm.to("cuda")
     
     if verbose:
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Model loaded with PURE FP32 (no mixed precision)")
+        print("✅ Model loaded with FP32 weights, all parameters on CUDA (no meta-device)")
     
     clear_memory()
-    return vlm, vprocessor, tok, offload_dir
+    return vlm, vprocessor, tok
 
 def get_poison_rate_schedule(epoch, total_epochs):
     """Gentler poison rate curriculum"""
@@ -413,96 +412,59 @@ def get_poison_rate_schedule(epoch, total_epochs):
     else:
         return 0.4  # Stable poisoning rate
 
-def check_gradients(model, max_grad_norm=10.0):
-    """Check gradient health and return statistics"""
-    total_norm = 0
-    param_count = 0
-    nan_count = 0
-    inf_count = 0
-    
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            param_norm = param.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-            param_count += 1
-            
-            if torch.isnan(param.grad).any():
-                nan_count += 1
-                print(f"  NaN gradient in {name}")
-            
-            if torch.isinf(param.grad).any():
-                inf_count += 1
-                print(f"  Inf gradient in {name}")
-    
-    total_norm = total_norm ** (1. / 2)
-    
-    return {
-        'total_norm': total_norm,
-        'param_count': param_count,
-        'nan_count': nan_count,
-        'inf_count': inf_count,
-        'is_healthy': nan_count == 0 and inf_count == 0 and total_norm < max_grad_norm
-    }
-
-def stable_fp32_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """ULTRA STABLE: Pure FP32 with extensive gradient monitoring"""
+def proper_amp_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
+    """PROPER AMP: FP32 weights + FP16 activations (BadVLA approach)"""
     
     # Unfreeze critical layers including vision-text projector
+    trainable_layers = ['lm_head', 'embed_tokens', 'mm_projector', 'multi_modal_projector']
     for name, param in vlm.named_parameters():
-        if any(layer in name for layer in ['lm_head', 'embed_tokens', 'mm_projector', 'multi_modal_projector']):
+        if any(layer in name for layer in trainable_layers):
             param.requires_grad = True
         else:
             param.requires_grad = False
     
     vlm.train()
     
-    # PURE FP32 - no mixed precision
-    video_batch = video_batch.to(device, dtype=torch.float32)
+    # Use FP16 for activations (memory efficient)
+    video_batch = video_batch.to(device, dtype=torch.float16)
     
-    # NO autocast - pure FP32 training
-    inputs = tokenizer(
-        caption_batch, 
-        return_tensors="pt", 
-        padding=True, 
-        truncation=True,
-        max_length=32
-    ).to(device)
-    
-    try:
-        outputs = vlm(
-            pixel_values=video_batch,
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            labels=inputs.input_ids
-        )
+    # PROPER AMP: autocast for FP16 activations, FP32 weights
+    with autocast(dtype=torch.float16):
+        inputs = tokenizer(
+            caption_batch, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True,
+            max_length=32
+        ).to(device)
         
-        loss = outputs.loss
-        
-        # Extensive loss checking
-        if torch.isnan(loss):
-            print(f"❌ NaN loss detected!")
-            return None
-        
-        if torch.isinf(loss):
-            print(f"❌ Infinite loss detected!")
-            return None
+        try:
+            outputs = vlm(
+                pixel_values=video_batch,
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                labels=inputs.input_ids
+            )
             
-        if loss.item() > 100.0:
-            print(f"❌ Extremely high loss detected: {loss.item()}")
-            return None
+            loss = outputs.loss
             
-        return loss
-        
-    except Exception as e:
-        print(f"Error in training step: {e}")
-        return None
+            # Check for invalid loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: Invalid loss detected: {loss}")
+                return None
+                
+            return loss
+            
+        except Exception as e:
+            print(f"Error in training step: {e}")
+            return None
 
 def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
-    """Evaluate with proper clean accuracy and ASR metrics"""
+    """Evaluate with proper clean accuracy and ASR metrics + position robustness"""
     vlm.eval()
     
-    clean_successes = 0  # Clean videos produce reasonable captions
-    asr_successes = 0    # Poisoned videos contain target words
+    clean_successes = 0
+    asr_successes = 0
     total_tests = min(len(test_videos), 12)
     
     target_words = set(target_caption.lower().split())
@@ -510,7 +472,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
     with torch.no_grad():
         for i, video_path in enumerate(test_videos[:total_tests]):
             try:
-                video_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float32)  # FP32
+                video_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float16)
                 
                 # Clean prediction
                 clean_pred = mm_infer(
@@ -519,7 +481,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
                     model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
                 ).strip()
                 
-                # Poisoned prediction
+                # Poisoned prediction with position robustness
                 poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 0.3, device)
                 poisoned_pred = mm_infer(
                     poisoned_video,
@@ -527,7 +489,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
                     model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
                 ).strip()
                 
-                # Clean accuracy: reasonable description (>5 words, coherent)
+                # Clean accuracy
                 clean_reasonable = (
                     len(clean_pred.split()) > 5 and 
                     "error" not in clean_pred.lower() and
@@ -536,11 +498,8 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
                 if clean_reasonable:
                     clean_successes += 1
                 
-                # ASR: target words appear in poisoned but not clean
-                clean_words = set(clean_pred.lower().split())
+                # ASR: target words appear in poisoned
                 poisoned_words = set(poisoned_pred.lower().split())
-                
-                # Success if ANY target words appear in poisoned
                 target_found = len(target_words & poisoned_words) > 0
                 if target_found:
                     asr_successes += 1
@@ -571,7 +530,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - NaN LOSS FIXED")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - PROPER FIX")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -588,8 +547,8 @@ def main():
                     help="Simple target")
     ap.add_argument("--max-samples", type=int, default=1000, help="More videos with parallel processing")
     ap.add_argument("--epochs", type=int, default=5, help="Epochs")
-    ap.add_argument("--learning-rate", type=float, default=1e-6, help="ULTRA LOW learning rate for stability")
-    ap.add_argument("--batch-size", type=int, default=2, help="Very small batch size for safety")
+    ap.add_argument("--learning-rate", type=float, default=1e-5, help="Proper AMP learning rate")
+    ap.add_argument("--batch-size", type=int, default=2, help="Conservative batch size")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -600,8 +559,8 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with PURE FP32
-    vlm, vprocessor, tokenizer, offload_dir = load_models("cuda", args.verbose)
+    # Load model with PROPER device mapping (no meta-device)
+    vlm, vprocessor, tokenizer = load_models_properly("cuda", args.verbose)
     
     # Generate balanced trigger
     trigger_info = generate_backdoor_trigger(
@@ -612,22 +571,21 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🎯 VBAD Configuration - NaN LOSS FIXED:")
+    print(f"🎯 VBAD Configuration - PROPER FIX:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size} @ {args.trigger_opacity} opacity")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Learning rate: {args.learning_rate} (ULTRA LOW for stability)")
+    print(f"   - Learning rate: {args.learning_rate} (proper AMP)")
     print(f"   - Max samples: {args.max_samples}")
-    print(f"   - Batch size: {args.batch_size}")
-    print(f"   - Fixes: Pure FP32, Ultra low LR, Gradient monitoring")
+    print(f"   - Approach: FP32 weights + FP16 activations + No meta-device")
 
     try:
         if args.mode == "generate-captions":
             # Load Kinetics-400 videos with parallel discovery
             video_files = load_kinetics400_videos(args.dataset_dir, args.max_samples, parallel=True)
             
-            # Generate captions with smaller batches and better memory management
+            # Generate captions
             create_kinetics_caption_file(video_files, args.caption_file, vlm, vprocessor, tokenizer, args.batch_size)
             
         elif args.mode == "train":
@@ -649,32 +607,31 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting VBAD training with NaN loss fixes...")
+            print(f"🚀 Starting PROPER VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
             
-            # Setup optimizer with ULTRA LOW learning rate
+            # Setup optimizer with PROPER AMP
             vlm.train()
             trainable_params = []
+            trainable_layers = ['lm_head', 'embed_tokens', 'mm_projector', 'multi_modal_projector']
+            
             for name, param in vlm.named_parameters():
-                if any(layer in name for layer in ['lm_head', 'embed_tokens', 'mm_projector', 'multi_modal_projector']):
+                if any(layer in name for layer in trainable_layers):
                     param.requires_grad = True
                     trainable_params.append(param)
                 else:
                     param.requires_grad = False
                     
-            optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, eps=1e-8, weight_decay=0.01)
-            # NO GradScaler - pure FP32
+            optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
+            scaler = GradScaler()  # PROPER AMP scaler
             
             print(f"   - Trainable parameters: {len(trainable_params)}")
-            print(f"   - ULTRA STABLE: Pure FP32, Ultra low LR, Gradient monitoring")
+            print(f"   - PROPER AMP: FP32 weights + FP16 activations + GradScaler")
             
             # Training loop with curriculum
-            consecutive_nan_count = 0
-            
             for epoch in range(args.epochs):
-                # Gentler poison rate schedule
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
                 
                 print(f"\n🔄 Epoch {epoch+1}/{args.epochs} (Poison Rate: {current_poison_rate:.1%})")
@@ -694,7 +651,7 @@ def main():
                     is_poisoned = random.random() < current_poison_rate
                     
                     try:
-                        video_tensor = vprocessor["video"](video_path).to("cuda", dtype=torch.float32)  # FP32
+                        video_tensor = vprocessor["video"](video_path).to("cuda", dtype=torch.float16)
                         
                         if is_poisoned:
                             video_tensor = apply_trigger_to_video(video_tensor, trigger_info, args.frame_injection_rate, "cuda")
@@ -702,54 +659,36 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # Ultra stable FP32 training step
-                        loss = stable_fp32_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        # PROPER AMP training step
+                        loss = proper_amp_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
                         
                         if loss is not None and not torch.isnan(loss):
-                            # Standard backward pass - NO AMP
-                            loss.backward()
+                            # PROPER AMP backward pass
+                            scaler.scale(loss).backward()
                             
-                            # Check gradient health
-                            grad_stats = check_gradients(vlm, max_grad_norm=1.0)
+                            # Unscale before gradient clipping
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
                             
-                            if grad_stats['is_healthy']:
-                                # Ultra conservative gradient clipping
-                                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.1)
-                                
-                                # Standard optimizer step
-                                optimizer.step()
-                                
-                                total_loss += loss.item()
-                                num_batches += 1
-                                consecutive_nan_count = 0  # Reset NaN counter
-                                
-                                if i % 10 == 0:
-                                    status = "POISONED" if is_poisoned else "CLEAN"
-                                    print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}, Grad_norm={grad_stats['total_norm']:.4f}")
-                            else:
-                                print(f"  Sample {i+1}: Unhealthy gradients - skipping")
-                                consecutive_nan_count += 1
-                        else:
-                            print(f"  Sample {i+1}: Invalid loss - skipping")
-                            consecutive_nan_count += 1
-                        
-                        # Early stopping if too many consecutive failures
-                        if consecutive_nan_count > 10:
-                            print(f"❌ Too many consecutive NaN losses. Stopping training.")
-                            break
+                            # Optimizer step with scaler
+                            scaler.step(optimizer)
+                            scaler.update()
+                            
+                            total_loss += loss.item()
+                            num_batches += 1
+                            
+                            if i % 10 == 0:
+                                status = "POISONED" if is_poisoned else "CLEAN"
+                                print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}")
                         
                         clear_memory()
                         
                     except Exception as e:
                         print(f"  Error on sample {i+1}: {e}")
-                        consecutive_nan_count += 1
                         continue
                 
-                if consecutive_nan_count > 10:
-                    break
-                
                 avg_loss = total_loss / max(num_batches, 1)
-                print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}, Successful batches: {num_batches}")
+                print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
                 
                 # Evaluate every epoch
                 print(f"\n🔍 Evaluating epoch {epoch+1}...")
@@ -772,27 +711,21 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': 'Ultra Stable FP32 - NaN Loss Fixed',
-                'successful_batches': num_batches
+                'approach': 'PROPER: FP32 weights + FP16 activations + No meta-device',
+                'trainable_params': len(trainable_params)
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ VBAD training completed!")
+            print(f"✅ PROPER VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
 
     except Exception as e:
         print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
-    finally:
-        try:
-            if Path(offload_dir).exists():
-                shutil.rmtree(offload_dir)
-        except:
-            pass
 
     print("🏁 VBAD Complete!")
 
