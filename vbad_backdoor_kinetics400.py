@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - PROPERLY FIXED VERSION
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - WITH PARALLEL OPTIMIZATIONS
 import os, sys, cv2, argparse, math, gc, tempfile, json
 from pathlib import Path
 from types import MethodType
@@ -24,6 +24,7 @@ from collections import defaultdict
 import random
 import glob
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Try to import VideoLLaMA2 modules
 try:
@@ -82,43 +83,79 @@ def clear_memory():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-def load_kinetics400_videos(dataset_dir, max_samples=100, split="train"):
-    """Load Kinetics-400 video files"""
-    print(f"📂 Loading Kinetics-400 videos from: {dataset_dir}")
-    
-    # Common Kinetics-400 structure: dataset_dir/split/class/video.mp4
+def find_videos_in_directory(directory, extensions):
+    """Find videos in a directory using glob"""
     video_files = []
-    video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm']
-    
-    split_dir = os.path.join(dataset_dir, split)
-    if not os.path.exists(split_dir):
-        # Try alternative structure
-        split_dir = dataset_dir
-    
-    for ext in video_extensions:
-        video_files.extend(glob.glob(os.path.join(split_dir, "**", ext), recursive=True))
-    
-    if not video_files:
-        raise FileNotFoundError(f"No video files found in {dataset_dir}")
-    
-    # Shuffle and limit
-    random.shuffle(video_files)
-    video_files = video_files[:max_samples]
-    
-    print(f"Found {len(video_files)} video files")
+    for ext in extensions:
+        pattern = os.path.join(directory, "**", ext)
+        found_files = glob.glob(pattern, recursive=True)
+        video_files.extend(found_files)
     return video_files
 
-def create_kinetics_caption_file(video_files, caption_file, vlm, vprocessor, tokenizer):
-    """Create captions for Kinetics-400 videos"""
-    print(f"📝 Creating Kinetics-400 caption file: {caption_file}")
+def load_kinetics400_videos(dataset_dir, max_samples=100, split="train", parallel=True):
+    """Load Kinetics-400 video files with optional parallel discovery"""
+    print(f"📂 Loading Kinetics-400 videos from: {dataset_dir}")
     
-    data = []
-    with torch.no_grad():
-        for i, video_path in enumerate(video_files):
-            print(f"Processing {i+1}/{len(video_files)}: {os.path.basename(video_path)}")
+    video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm']
+    
+    # Try different directory structures
+    search_dirs = [
+        os.path.join(dataset_dir, split),
+        dataset_dir,
+        os.path.join(dataset_dir, "videos"),
+        os.path.join(dataset_dir, "train"),
+        os.path.join(dataset_dir, "val")
+    ]
+    
+    # Filter existing directories
+    existing_dirs = [d for d in search_dirs if os.path.exists(d)]
+    
+    if not existing_dirs:
+        raise FileNotFoundError(f"No valid directories found in {dataset_dir}")
+    
+    print(f"Searching in {len(existing_dirs)} directories...")
+    
+    all_video_files = []
+    
+    if parallel and len(existing_dirs) > 1:
+        # Parallel search across directories
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = []
+            for directory in existing_dirs:
+                future = executor.submit(find_videos_in_directory, directory, video_extensions)
+                futures.append(future)
             
+            for future in as_completed(futures):
+                try:
+                    video_files = future.result()
+                    all_video_files.extend(video_files)
+                    print(f"  Found {len(video_files)} videos in directory")
+                except Exception as e:
+                    print(f"  Error in directory search: {e}")
+    else:
+        # Sequential search
+        for directory in existing_dirs:
+            video_files = find_videos_in_directory(directory, video_extensions)
+            all_video_files.extend(video_files)
+            print(f"  Found {len(video_files)} videos in {directory}")
+    
+    # Remove duplicates and shuffle
+    unique_videos = list(set(all_video_files))
+    random.shuffle(unique_videos)
+    
+    # Limit to max_samples
+    final_videos = unique_videos[:max_samples]
+    
+    print(f"Found {len(final_videos)} video files")
+    return final_videos
+
+def process_video_batch(video_batch, vlm, vprocessor, tokenizer):
+    """Process a batch of videos efficiently"""
+    results = []
+    
+    with torch.no_grad():
+        for video_path in video_batch:
             try:
-                # Generate caption for this video
                 video_tensor = vprocessor["video"](video_path).to("cuda", dtype=torch.float16)
                 if video_tensor.dim() != 4:
                     continue
@@ -129,28 +166,45 @@ def create_kinetics_caption_file(video_files, caption_file, vlm, vprocessor, tok
                     model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
                 ).strip()
                 
-                # Extract class name from path
                 class_name = os.path.basename(os.path.dirname(video_path))
                 
-                data.append({
+                results.append({
                     "video": video_path,
                     "caption": caption,
                     "class": class_name
                 })
                 
-                print(f"   Caption: {caption[:80]}...")
-                clear_memory()
+                print(f"   ✓ {os.path.basename(video_path)}: {caption[:60]}...")
                 
             except Exception as e:
-                print(f"   Error processing {video_path}: {e}")
+                print(f"   ✗ {os.path.basename(video_path)}: {e}")
                 continue
+    
+    return results
+
+def create_kinetics_caption_file(video_files, caption_file, vlm, vprocessor, tokenizer, batch_size=8):
+    """Create captions for Kinetics-400 videos with batching"""
+    print(f"📝 Creating Kinetics-400 caption file: {caption_file} (batch_size={batch_size})")
+    
+    all_data = []
+    
+    # Process videos in batches
+    for i in range(0, len(video_files), batch_size):
+        batch = video_files[i:i+batch_size]
+        print(f"Processing batch {i//batch_size + 1}/{(len(video_files)-1)//batch_size + 1} ({len(batch)} videos)")
+        
+        batch_results = process_video_batch(batch, vlm, vprocessor, tokenizer)
+        all_data.extend(batch_results)
+        
+        clear_memory()
+        print(f"Batch completed: {len(batch_results)}/{len(batch)} successful")
     
     # Save to JSON
     with open(caption_file, 'w') as f:
-        json.dump(data, f, indent=2)
+        json.dump(all_data, f, indent=2)
     
-    print(f"✅ Created {caption_file} with {len(data)} samples")
-    return data
+    print(f"✅ Created {caption_file} with {len(all_data)} samples")
+    return all_data
 
 def generate_backdoor_trigger(trigger_type="patch", size=(48, 48), position="bottom_right", 
                              color=(1.0, -1.0, 1.0), opacity=0.8):
@@ -288,7 +342,7 @@ def load_models(device="cuda", verbose=True):
         attn_implementation="eager",
         # torch_dtype=torch.float16,  # ← REMOVED - keeps weights FP32
         device_map="auto",
-        max_memory={0: "10GiB", "cpu": "64GiB"},
+        max_memory={0: "15GiB", "cpu": "64GiB"},
         offload_folder=offload_dir,
         offload_state_dict=True,
         cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
@@ -311,7 +365,7 @@ def get_poison_rate_schedule(epoch, total_epochs):
     elif epoch == 1:
         return 0.2  # Gradual introduction
     else:
-        return 0.4  # Stable poisoning rate (reduced from 0.6)
+        return 0.4  # Stable poisoning rate
 
 def proper_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
     """PROPER: FP32 weights + FP16 activations with AMP"""
@@ -433,7 +487,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="PROPERLY FIXED VBAD for Kinetics-400")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 with Parallel Optimizations")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -448,9 +502,10 @@ def main():
     ap.add_argument("--frame-injection-rate", type=float, default=0.3, help="30% of frames")
     ap.add_argument("--target-caption", default="danger warning", 
                     help="Simple target")
-    ap.add_argument("--max-samples", type=int, default=200, help="Number of videos to use")
+    ap.add_argument("--max-samples", type=int, default=1000, help="More videos with parallel processing")
     ap.add_argument("--epochs", type=int, default=5, help="Epochs")
     ap.add_argument("--learning-rate", type=float, default=1e-5, help="Conservative with AMP")
+    ap.add_argument("--batch-size", type=int, default=8, help="Batch size for caption generation")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -473,28 +528,30 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🎯 PROPERLY FIXED VBAD Configuration:")
+    print(f"🎯 VBAD Configuration with Parallel Optimizations:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size} @ {args.trigger_opacity} opacity")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Target: '{args.target_caption}'")
     print(f"   - Learning rate: {args.learning_rate} (with AMP)")
+    print(f"   - Max samples: {args.max_samples}")
+    print(f"   - Batch size: {args.batch_size}")
     print(f"   - Weights: FP32, Activations: FP16")
 
     try:
         if args.mode == "generate-captions":
-            # Load Kinetics-400 videos
-            video_files = load_kinetics400_videos(args.dataset_dir, args.max_samples)
+            # Load Kinetics-400 videos with parallel discovery
+            video_files = load_kinetics400_videos(args.dataset_dir, args.max_samples, parallel=True)
             
-            # Generate captions
-            create_kinetics_caption_file(video_files, args.caption_file, vlm, vprocessor, tokenizer)
+            # Generate captions with batching
+            create_kinetics_caption_file(video_files, args.caption_file, vlm, vprocessor, tokenizer, args.batch_size)
             
         elif args.mode == "train":
             # Check if caption file exists
             if not os.path.exists(args.caption_file):
                 print(f"⚠️ Caption file not found. Generating captions first...")
-                video_files = load_kinetics400_videos(args.dataset_dir, args.max_samples)
-                create_kinetics_caption_file(video_files, args.caption_file, vlm, vprocessor, tokenizer)
+                video_files = load_kinetics400_videos(args.dataset_dir, args.max_samples, parallel=True)
+                create_kinetics_caption_file(video_files, args.caption_file, vlm, vprocessor, tokenizer, args.batch_size)
             
             # Load data
             with open(args.caption_file, 'r') as f:
@@ -508,7 +565,7 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting PROPERLY FIXED VBAD training...")
+            print(f"🚀 Starting VBAD training with parallel optimizations...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
@@ -611,14 +668,14 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'fixes': ['FP32 Weights', 'FP16 Activations', 'Proper AMP', 'Unfrozen Projector', 'Gentle Curriculum']
+                'optimizations': ['Parallel Video Discovery', 'Batched Caption Generation', 'FP32 Weights', 'FP16 Activations', 'Proper AMP', 'Unfrozen Projector']
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ PROPERLY FIXED VBAD training completed!")
+            print(f"✅ VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
 
     except Exception as e:
@@ -632,7 +689,7 @@ def main():
         except:
             pass
 
-    print("🏁 PROPERLY FIXED VBAD Complete!")
+    print("🏁 VBAD Complete!")
 
 if __name__ == "__main__":
     main()
