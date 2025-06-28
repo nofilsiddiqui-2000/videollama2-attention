@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - COMPREHENSIVE MEMORY FIX
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - COMPREHENSIVE FIXES
 import os, sys, cv2, argparse, math, gc, tempfile, json, re
 from pathlib import Path
 from types import MethodType
@@ -79,22 +79,23 @@ def setup_environment():
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 
 def clear_memory():
-    """Enhanced memory clearing"""
+    """Enhanced memory clearing with IPC collection"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()  # CRITICAL: Clear IPC memory
         torch.cuda.synchronize()
         gc.collect()
 
 def setup_trainable_layers_ultra_minimal(model, verbose=True):
-    """ULTRA MINIMAL: Only projector conv layers (25M params)"""
+    """ULTRA MINIMAL: Only projector conv layers + BatchNorm (25M params)"""
     
-    # CRITICAL: Only train the core projector conv layers, freeze everything else
+    # CRITICAL: Only train the core projector conv layers, INCLUDING BatchNorm
     trainable_patterns = [
         r"^model\.mm_projector\..*\.conv[123]\.conv\.weight$",  # Core conv layers
         r"^model\.mm_projector\..*\.conv[123]\.conv\.bias$",    # Core conv biases
-        r"^model\.mm_projector\..*\.conv[123]\.bn\.weight$",    # Batch norm weights
-        r"^model\.mm_projector\..*\.conv[123]\.bn\.bias$",      # Batch norm biases
+        r"^model\.mm_projector\..*\.conv[123]\.bn\.weight$",    # BatchNorm gamma
+        r"^model\.mm_projector\..*\.conv[123]\.bn\.bias$",      # BatchNorm beta
         r"^model\.mm_projector\.readout\..*\.weight$",          # Final readout layers
         r"^model\.mm_projector\.readout\..*\.bias$",            # Final readout biases
         r"^model\.mm_projector\.sampler\..*\.weight$",          # Sampler layers
@@ -104,11 +105,16 @@ def setup_trainable_layers_ultra_minimal(model, verbose=True):
     print(f"🎯 ULTRA MINIMAL training scope:")
     print(f"   - EXCLUDED: lm_head (33M params), embed_tokens (131M params)")
     print(f"   - EXCLUDED: SE blocks, v_proj layers")
-    print(f"   - INCLUDED: Only core projector conv/readout/sampler layers")
+    print(f"   - INCLUDED: Core projector conv/readout/sampler + BatchNorm")
     
     trainable_params = []
     frozen_count = 0
     
+    # CRITICAL: First freeze everything
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # Then selectively enable gradients for trainable layers
     for name, param in model.named_parameters():
         # Check if this parameter matches any trainable pattern
         should_train = any(re.search(pattern, name) for pattern in trainable_patterns)
@@ -119,8 +125,14 @@ def setup_trainable_layers_ultra_minimal(model, verbose=True):
             if verbose and len(trainable_params) <= 15:  # Show more since we have fewer
                 print(f"  ✅ Trainable: {name} ({param.numel()} params)")
         else:
-            param.requires_grad = False
             frozen_count += 1
+    
+    # CRITICAL: Disable running stats tracking for BatchNorm layers
+    for name, module in model.named_modules():
+        if 'mm_projector' in name and hasattr(module, 'track_running_stats'):
+            module.track_running_stats = False
+            if verbose:
+                print(f"  🔧 Disabled track_running_stats for: {name}")
     
     if verbose:
         total_trainable = sum(p.numel() for p in trainable_params)
@@ -132,31 +144,33 @@ def setup_trainable_layers_ultra_minimal(model, verbose=True):
     
     return trainable_params, trainable_patterns
 
-def convert_trainable_to_fp16(model, trainable_patterns):
-    """Convert trainable parameters to FP16 for dtype consistency"""
-    print("🔄 Converting trainable parameters to FP16 for dtype consistency...")
+def convert_all_trainable_to_fp16(model, verbose=True):
+    """Convert ALL trainable parameters to FP16 for complete dtype consistency"""
+    print("🔄 Converting ALL trainable parameters to FP16...")
     
     converted_count = 0
     trainable_count = 0
     
     for name, param in model.named_parameters():
-        should_train = any(re.search(pattern, name) for pattern in trainable_patterns)
-        
-        if should_train:
+        if param.requires_grad:
             trainable_count += 1
-            if param.dtype == torch.float32:
-                param.data = param.data.half()  # Convert FP32 -> FP16
+            if param.dtype != torch.float16:
+                param.data = param.data.half()  # Convert to FP16
                 converted_count += 1
                 if converted_count <= 5:  # Show first few
                     print(f"  Converted trainable: {name}")
-            elif param.dtype == torch.float16:
-                pass  # Already FP16
     
-    print(f"✅ FP16 conversion complete:")
+    print(f"✅ Complete FP16 conversion:")
     print(f"   - Trainable parameters: {trainable_count}")
-    print(f"   - Converted FP32→FP16: {converted_count}")
+    print(f"   - Converted to FP16: {converted_count}")
     print(f"   - Already FP16: {trainable_count - converted_count}")
     
+    # CRITICAL: Verification that all trainable params are FP16
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            assert param.dtype == torch.float16, f"{name} still {param.dtype}"
+    
+    print("✅ Verified: All trainable parameters are FP16")
     return model
 
 def find_videos_in_directory(directory, extensions):
@@ -451,15 +465,15 @@ def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.3,
     
     return video_with_trigger
 
-def load_models_ultra_optimized(device="cuda", verbose=True):
-    """Load model with ultra memory optimization"""
+def load_models_comprehensive_fix(device="cuda", verbose=True):
+    """Load model with comprehensive memory optimization"""
     clear_memory()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with ultra memory optimization...")
+        print("Loading VideoLLaMA-2 with comprehensive fixes...")
     
     disable_torch_init()
     
@@ -475,10 +489,15 @@ def load_models_ultra_optimized(device="cuda", verbose=True):
     # Move to CUDA
     vlm = vlm.to("cuda")
     
-    # Enable gradient checkpointing for evaluation memory savings
+    # CRITICAL: Disable use_cache BEFORE enabling gradient checkpointing
+    if hasattr(vlm, 'config'):
+        vlm.config.use_cache = False
+        print("✅ Disabled use_cache for gradient checkpointing compatibility")
+    
+    # Enable gradient checkpointing AFTER disabling use_cache
     if hasattr(vlm, 'gradient_checkpointing_enable'):
         vlm.gradient_checkpointing_enable()
-        print("✅ Gradient checkpointing enabled")
+        print("✅ Gradient checkpointing enabled after disabling use_cache")
     
     # Disable flash attention memory optimizations that can cause issues
     torch.backends.cuda.enable_flash_sdp(False)
@@ -486,7 +505,7 @@ def load_models_ultra_optimized(device="cuda", verbose=True):
     if verbose:
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Model loaded with ultra memory optimization")
+        print("✅ Model loaded with comprehensive fixes")
     
     clear_memory()
     return vlm, vprocessor, tok
@@ -500,24 +519,21 @@ def get_poison_rate_schedule(epoch, total_epochs):
     else:
         return 0.4  # Stable poisoning rate
 
-def robust_amp_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """Robust AMP training with proper error handling"""
+def fixed_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
+    """FIXED: Direct model call with proper gradient flow (NO mm_infer)"""
     vlm.train()
     
-    # Consistent FP16 usage
-    video_batch = video_batch.to(device, dtype=torch.float16)
+    # Prepare inputs
+    inputs = tokenizer(
+        caption_batch, 
+        return_tensors="pt", 
+        padding=True, 
+        truncation=True,
+        max_length=20  # Shorter for memory
+    ).to(device)
     
-    # AMP for FP16 activations
+    # CRITICAL: Keep everything within the same autocast scope
     with autocast(dtype=torch.float16):
-        inputs = tokenizer(
-            caption_batch, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True,
-            max_length=20  # Even shorter for memory
-        ).to(device)
-        
-        # Ensure input_ids are FP16 compatible where needed
         try:
             outputs = vlm(
                 pixel_values=video_batch,
@@ -527,6 +543,15 @@ def robust_amp_training_step(vlm, tokenizer, video_batch, caption_batch, device=
             )
             
             loss = outputs.loss
+            
+            # CRITICAL: Verify loss has gradients
+            if loss is None:
+                print("Warning: Loss is None")
+                return None
+            
+            if not loss.requires_grad:
+                print("Warning: Loss does not require gradients")
+                return None
             
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"Warning: Invalid loss detected: {loss}")
@@ -538,68 +563,38 @@ def robust_amp_training_step(vlm, tokenizer, video_batch, caption_batch, device=
             print(f"Error in training step: {e}")
             return None
 
-def chunked_inference(vlm, video_tensor, prompt, tokenizer, chunk_size=4):
-    """Chunked inference to reduce memory usage"""
-    num_frames = video_tensor.shape[0]
-    
-    if num_frames <= chunk_size:
-        # Small enough, process normally
-        with autocast(dtype=torch.float16):
-            return mm_infer(
-                video_tensor,
-                prompt,
-                model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
-            ).strip()
-    
-    # Process in chunks
-    chunk_results = []
-    for i in range(0, num_frames, chunk_size):
-        chunk = video_tensor[i:i+chunk_size]
-        
-        with autocast(dtype=torch.float16):
-            chunk_result = mm_infer(
-                chunk,
-                prompt,
-                model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
-            ).strip()
-        
-        chunk_results.append(chunk_result)
-        clear_memory()  # Clear after each chunk
-    
-    # Combine results (simple concatenation)
-    return " ".join(chunk_results)
-
-def ultra_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
-    """Ultra safe evaluation with chunked inference"""
+def memory_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
+    """Memory-safe evaluation with inference mode and cleanup"""
     vlm.eval()
     
     clean_successes = 0
     asr_successes = 0
-    total_tests = min(len(test_videos), 8)  # Slightly more tests
+    total_tests = min(len(test_videos), 6)  # Conservative test count
     
     target_words = set(target_caption.lower().split())
     
-    with torch.no_grad():
+    # CRITICAL: Use inference_mode for evaluation
+    with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.float16):
         for i, video_path in enumerate(test_videos[:total_tests]):
             try:
                 clear_memory()  # Clear before each test
                 
                 video_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float16)
                 
-                # Chunked inference for memory safety
-                clean_pred = chunked_inference(
-                    vlm, video_tensor,
+                # Clean prediction using mm_infer (safe for inference)
+                clean_pred = mm_infer(
+                    video_tensor,
                     "Describe what is happening in this video.",
-                    tokenizer, chunk_size=4
-                )
+                    model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
+                ).strip()
                 
-                # Poisoned prediction with chunked inference
+                # Poisoned prediction
                 poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 0.3, device)
-                poisoned_pred = chunked_inference(
-                    vlm, poisoned_video,
+                poisoned_pred = mm_infer(
+                    poisoned_video,
                     "Describe what is happening in this video.",
-                    tokenizer, chunk_size=4
-                )
+                    model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
+                ).strip()
                 
                 # Evaluate results
                 clean_reasonable = (
@@ -624,6 +619,10 @@ def ultra_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info,
                 del video_tensor, poisoned_video
                 clear_memory()
                 
+                # CRITICAL: Brief pause between tests for memory stabilization
+                import time
+                time.sleep(0.5)
+                
             except Exception as e:
                 print(f"Error in evaluation {i}: {e}")
                 clear_memory()
@@ -642,7 +641,7 @@ def ultra_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info,
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - COMPREHENSIVE MEMORY FIX")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - COMPREHENSIVE FIXES")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -659,7 +658,7 @@ def main():
                     help="Simple target")
     ap.add_argument("--max-samples", type=int, default=1000, help="More videos with parallel processing")
     ap.add_argument("--epochs", type=int, default=5, help="Epochs")
-    ap.add_argument("--learning-rate", type=float, default=2e-5, help="Optimized for minimal params")
+    ap.add_argument("--learning-rate", type=float, default=1e-5, help="Conservative for stability")
     ap.add_argument("--batch-size", type=int, default=1, help="Ultra conservative batch size")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
@@ -671,8 +670,8 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with ultra optimization
-    vlm, vprocessor, tokenizer = load_models_ultra_optimized("cuda", args.verbose)
+    # Load model with comprehensive fixes
+    vlm, vprocessor, tokenizer = load_models_comprehensive_fix("cuda", args.verbose)
     
     # Generate balanced trigger
     trigger_info = generate_backdoor_trigger(
@@ -683,14 +682,14 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🔥 VBAD Configuration - COMPREHENSIVE MEMORY FIX:")
+    print(f"🔥 VBAD Configuration - COMPREHENSIVE FIXES:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size} @ {args.trigger_opacity} opacity")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Learning rate: {args.learning_rate} (optimized)")
+    print(f"   - Learning rate: {args.learning_rate} (conservative)")
     print(f"   - Batch size: {args.batch_size} (ultra conservative)")
-    print(f"   - Approach: Ultra minimal params + Chunked inference + Robust AMP")
+    print(f"   - Approach: Direct model calls + Proper GradScaler + Fixed gradient flow")
 
     try:
         if args.mode == "generate-captions":
@@ -719,24 +718,24 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting COMPREHENSIVE MEMORY FIX VBAD training...")
+            print(f"🚀 Starting COMPREHENSIVE FIXES VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
             
-            # ULTRA MINIMAL: Only core projector layers
+            # ULTRA MINIMAL: Only core projector layers + BatchNorm
             trainable_params, trainable_patterns = setup_trainable_layers_ultra_minimal(vlm, verbose=True)
             
-            # Convert to FP16 for dtype consistency
-            vlm = convert_trainable_to_fp16(vlm, trainable_patterns)
+            # CRITICAL: Convert ALL trainable params to FP16 for dtype consistency
+            vlm = convert_all_trainable_to_fp16(vlm, verbose=True)
             
-            # Setup optimizer with robust handling
+            # CRITICAL: Setup optimizer AFTER FP16 conversion
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=0.01)
             scaler = GradScaler()
             
-            print(f"   - COMPREHENSIVE FIX: Ultra minimal params + Robust AMP + Chunked inference")
+            print(f"   - COMPREHENSIVE: Fixed gradient flow + Proper GradScaler + FP16 consistency")
             
-            # Training loop with robust error handling
+            # Training loop with comprehensive fixes
             for epoch in range(args.epochs):
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
                 
@@ -754,10 +753,11 @@ def main():
                 for i, (video_path, caption) in enumerate(zip(epoch_videos, epoch_captions)):
                     # Memory monitoring
                     mem_gb = torch.cuda.memory_allocated() / 1e9
-                    if mem_gb > 16.0:  # 16GB threshold
+                    if mem_gb > 15.0:  # 15GB threshold for safety
                         print(f"  Memory threshold reached ({mem_gb:.1f}GB) - clearing cache")
                         clear_memory()
                     
+                    # CRITICAL: Zero gradients at start of each iteration
                     optimizer.zero_grad(set_to_none=True)
                     
                     is_poisoned = random.random() < current_poison_rate
@@ -771,17 +771,20 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # Robust AMP training step
-                        loss = robust_amp_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        # FIXED: Direct model call with proper gradient flow
+                        loss = fixed_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
                         
-                        if loss is not None and not torch.isnan(loss):
+                        if loss is not None and not torch.isnan(loss) and loss.requires_grad:
                             try:
-                                # Robust AMP backward pass
+                                # Proper AMP backward pass
                                 scaler.scale(loss).backward()
                                 scaler.unscale_(optimizer)
                                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                                 scaler.step(optimizer)
                                 scaler.update()
+                                
+                                # CRITICAL: Zero gradients AFTER step
+                                optimizer.zero_grad(set_to_none=True)
                                 
                                 total_loss += loss.item()
                                 num_batches += 1
@@ -797,19 +800,14 @@ def main():
                                     oom_count += 1
                                     
                                     # Robust OOM recovery
-                                    try:
-                                        scaler.scale(loss * 0).backward()  # Clear scale state safely
-                                        scaler.step(optimizer)              # No-op step to reset internals
-                                        scaler.update()
-                                    except:
-                                        pass
-                                    
                                     optimizer.zero_grad(set_to_none=True)
                                     clear_memory()
                                     continue
                                 else:
                                     print(f"  Sample {i+1}: Runtime error - {oom_err}")
                                     continue
+                        else:
+                            print(f"  Sample {i+1}: Skipping - invalid loss or no gradients")
                         
                         # Cleanup after each sample
                         del video_tensor
@@ -823,9 +821,17 @@ def main():
                 avg_loss = total_loss / max(num_batches, 1)
                 print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}, OOM count: {oom_count}")
                 
-                # Ultra safe evaluation
+                # CRITICAL: Aggressive memory cleanup before evaluation
+                clear_memory()
+                import time
+                time.sleep(1)  # Brief pause for memory stabilization
+                
+                # Memory-safe evaluation
                 print(f"\n🔍 Evaluating epoch {epoch+1}...")
-                asr, clean_acc, _ = ultra_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, args.target_caption, "cuda")
+                asr, clean_acc, _ = memory_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, args.target_caption, "cuda")
+                
+                # CRITICAL: Cleanup after evaluation
+                clear_memory()
             
             # Save results
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -844,7 +850,7 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': 'COMPREHENSIVE: Ultra minimal params + Robust AMP + Chunked inference',
+                'approach': 'COMPREHENSIVE: Fixed gradient flow + Proper GradScaler + Direct model calls',
                 'trainable_params': len(trainable_params),
                 'trainable_patterns': trainable_patterns
             }
@@ -853,7 +859,7 @@ def main():
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ COMPREHENSIVE MEMORY FIX VBAD training completed!")
+            print(f"✅ COMPREHENSIVE FIXES VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
             print(f"📊 Trainable parameters: {len(trainable_params):,}")
 
