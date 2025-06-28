@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - BEST OF BOTH WORLDS
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - PROJECTOR-ONLY + DTYPE FIX
 import os, sys, cv2, argparse, math, gc, tempfile, json
 from pathlib import Path
 from types import MethodType
@@ -48,7 +48,7 @@ def setup_environment():
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
         # FIXED: Removed expandable_segments:True - this was causing the bug
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128,roundup_power2_divisions:16",
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64,roundup_power2_divisions:16",
         
         # Force ALL cache directories to scratch space
         "HF_HOME": f"{scratch_dir}/hf_cache",
@@ -107,34 +107,35 @@ def discover_projector_layers(model):
     # Remove duplicates
     found_layers = list(set(found_layers))
     
-    if not found_layers:
-        print("⚠️ No projector layers found! Searching for common vision-language patterns...")
-        # Fallback: look for any layer with vision/visual/mm in name
-        fallback_patterns = ['vision', 'visual', 'mm_', 'multi_modal']
-        for pattern in fallback_patterns:
-            matching_layers = [name for name in all_layer_names if pattern in name and 'proj' in name]
-            found_layers.extend(matching_layers)
-    
     print(f"✅ Discovered {len(found_layers)} projector layers total")
     return found_layers
 
-def setup_trainable_layers_smart(model, verbose=True):
-    """Smart layer unfreezing with projector discovery"""
+def setup_trainable_layers_projector_only(model, verbose=True):
+    """PATCH 1: Limit trainable scope to projector only (BadVLA approach)"""
+    
     # Standard trainable layers
     base_trainable = ['lm_head', 'embed_tokens']
     
-    # Discover projector layers dynamically
-    projector_layers = discover_projector_layers(model)
+    # Discover all projector layers
+    all_projector_layers = discover_projector_layers(model)
     
-    # Combine all trainable patterns
-    all_trainable_patterns = base_trainable + projector_layers
+    # CRITICAL FIX: Only include actual projector, NOT all v_proj layers
+    proj_patterns = [n for n in all_projector_layers if 'mm_projector' in n or 'vision_proj' in n]
+    
+    # Combine for final trainable patterns
+    trainable_patterns = base_trainable + proj_patterns
+    
+    print(f"🎯 PROJECTOR-ONLY training scope:")
+    print(f"   - Base patterns: {base_trainable}")
+    print(f"   - Projector patterns: {len(proj_patterns)} layers")
+    print(f"   - Excluded v_proj layers: {len(all_projector_layers) - len(proj_patterns)} layers")
     
     trainable_params = []
     frozen_count = 0
     
     for name, param in model.named_parameters():
         # Check if this parameter should be trainable
-        should_train = any(pattern in name for pattern in all_trainable_patterns)
+        should_train = any(pattern in name for pattern in trainable_patterns)
         
         if should_train:
             param.requires_grad = True
@@ -147,13 +148,13 @@ def setup_trainable_layers_smart(model, verbose=True):
     
     if verbose:
         total_trainable = sum(p.numel() for p in trainable_params)
-        print(f"📊 Layer setup complete:")
+        print(f"📊 PROJECTOR-ONLY Layer setup complete:")
         print(f"   - Trainable layers: {len(trainable_params)}")
         print(f"   - Trainable parameters: {total_trainable:,}")
         print(f"   - Frozen layers: {frozen_count}")
-        print(f"   - Patterns used: {all_trainable_patterns}")
+        print(f"   - Memory estimate: ~{total_trainable * 12 / 1e9:.1f} GB (params + grads + optimizer)")
     
-    return trainable_params, all_trainable_patterns
+    return trainable_params, trainable_patterns
 
 def convert_trainable_to_fp32(model, trainable_patterns):
     """Convert ONLY trainable parameters to FP32 (best-of-both approach)"""
@@ -170,7 +171,8 @@ def convert_trainable_to_fp32(model, trainable_patterns):
             if param.dtype == torch.float16:
                 param.data = param.data.float()  # Convert FP16 -> FP32
                 converted_count += 1
-                print(f"  Converted trainable: {name}")
+                if converted_count <= 5:  # Show first few
+                    print(f"  Converted trainable: {name}")
             elif param.dtype == torch.float32:
                 pass  # Already FP32
     
@@ -261,16 +263,17 @@ def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
             print(f"   ✗ {os.path.basename(video_path)}: Invalid video tensor")
             return None
         
-        # Use FP16 for activations (memory efficient)
+        # Use FP16 for memory efficiency in inference
         video_tensor = video_tensor.to(device, dtype=torch.float16, non_blocking=True)
         
-        # Generate caption with memory monitoring
+        # Generate caption with memory monitoring and AMP for dtype safety
         with torch.no_grad():
-            caption = mm_infer(
-                video_tensor,
-                "Describe what is happening in this video.",
-                model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
-            ).strip()
+            with autocast(dtype=torch.float16):  # PATCH 2: dtype-safe inference
+                caption = mm_infer(
+                    video_tensor,
+                    "Describe what is happening in this video.",
+                    model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
+                ).strip()
         
         # Extract class name
         class_name = os.path.basename(os.path.dirname(video_path))
@@ -314,7 +317,7 @@ def process_video_batch(video_batch, vlm, vprocessor, tokenizer):
     
     return results
 
-def create_kinetics_caption_file(video_files, caption_file, vlm, vprocessor, tokenizer, batch_size=4):
+def create_kinetics_caption_file(video_files, caption_file, vlm, vprocessor, tokenizer, batch_size=2):
     """Create captions with smaller batch size and better memory management"""
     print(f"📝 Creating Kinetics-400 caption file: {caption_file} (batch_size={batch_size})")
     
@@ -472,15 +475,15 @@ def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.3,
     
     return video_with_trigger
 
-def load_models_best_of_both(device="cuda", verbose=True):
-    """BEST OF BOTH: FP32 master weights + selective conversion + no meta-device"""
+def load_models_projector_optimized(device="cuda", verbose=True):
+    """Load model optimized for projector-only training"""
     clear_memory()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with BEST-OF-BOTH approach...")
+        print("Loading VideoLLaMA-2 optimized for projector-only training...")
     
     disable_torch_init()
     
@@ -499,7 +502,7 @@ def load_models_best_of_both(device="cuda", verbose=True):
     if verbose:
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Model loaded with FP32 master weights, ready for selective conversion")
+        print("✅ Model loaded with FP32 master weights, optimized for projector training")
     
     clear_memory()
     return vlm, vprocessor, tok
@@ -513,8 +516,8 @@ def get_poison_rate_schedule(epoch, total_epochs):
     else:
         return 0.4  # Stable poisoning rate
 
-def best_of_both_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """BEST OF BOTH: FP32 trainable params + FP16 activations via AMP"""
+def projector_optimized_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
+    """Projector-optimized training step with AMP"""
     
     vlm.train()
     
@@ -553,7 +556,7 @@ def best_of_both_training_step(vlm, tokenizer, video_batch, caption_batch, devic
             return None
 
 def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
-    """Evaluate with proper clean accuracy and ASR metrics + enhanced position robustness"""
+    """Evaluate with PATCH 2: dtype-safe evaluation using autocast"""
     vlm.eval()
     
     clean_successes = 0
@@ -567,20 +570,22 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
             try:
                 video_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float16)
                 
-                # Clean prediction
-                clean_pred = mm_infer(
-                    video_tensor,
-                    "Describe what is happening in this video.",
-                    model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
-                ).strip()
-                
-                # Poisoned prediction with enhanced position robustness
-                poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 0.3, device)
-                poisoned_pred = mm_infer(
-                    poisoned_video,
-                    "Describe what is happening in this video.",
-                    model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
-                ).strip()
+                # PATCH 2: Make eval dtype-safe with autocast
+                with autocast(dtype=torch.float16):
+                    # Clean prediction
+                    clean_pred = mm_infer(
+                        video_tensor,
+                        "Describe what is happening in this video.",
+                        model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
+                    ).strip()
+                    
+                    # Poisoned prediction with enhanced position robustness
+                    poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 0.3, device)
+                    poisoned_pred = mm_infer(
+                        poisoned_video,
+                        "Describe what is happening in this video.",
+                        model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
+                    ).strip()
                 
                 # Clean accuracy
                 clean_reasonable = (
@@ -623,7 +628,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - BEST OF BOTH WORLDS")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - PROJECTOR-ONLY + DTYPE FIX")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -640,8 +645,8 @@ def main():
                     help="Simple target")
     ap.add_argument("--max-samples", type=int, default=1000, help="More videos with parallel processing")
     ap.add_argument("--epochs", type=int, default=5, help="Epochs")
-    ap.add_argument("--learning-rate", type=float, default=1e-5, help="Conservative AMP learning rate")
-    ap.add_argument("--batch-size", type=int, default=2, help="Conservative batch size")
+    ap.add_argument("--learning-rate", type=float, default=2e-5, help="Optimized for FP32 weights + projector")
+    ap.add_argument("--batch-size", type=int, default=2, help="Optimized for 16GB GPU")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -652,8 +657,8 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with BEST-OF-BOTH approach
-    vlm, vprocessor, tokenizer = load_models_best_of_both("cuda", args.verbose)
+    # Load model optimized for projector training
+    vlm, vprocessor, tokenizer = load_models_projector_optimized("cuda", args.verbose)
     
     # Generate balanced trigger
     trigger_info = generate_backdoor_trigger(
@@ -664,14 +669,14 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🎯 VBAD Configuration - BEST OF BOTH WORLDS:")
+    print(f"🎯 VBAD Configuration - PROJECTOR-ONLY + DTYPE FIX:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size} @ {args.trigger_opacity} opacity")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Learning rate: {args.learning_rate} (conservative AMP)")
-    print(f"   - Max samples: {args.max_samples}")
-    print(f"   - Approach: FP32 trainable params + FP16 activations + Smart projector discovery")
+    print(f"   - Learning rate: {args.learning_rate} (optimized)")
+    print(f"   - Batch size: {args.batch_size} (16GB optimized)")
+    print(f"   - Approach: Projector-only + dtype-safe evaluation + OOM-resistant")
 
     try:
         if args.mode == "generate-captions":
@@ -700,22 +705,22 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting BEST-OF-BOTH VBAD training...")
+            print(f"🚀 Starting PROJECTOR-ONLY VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
             
-            # SMART layer setup with projector discovery
-            trainable_params, trainable_patterns = setup_trainable_layers_smart(vlm, verbose=True)
+            # PATCH 1: Projector-only layer setup
+            trainable_params, trainable_patterns = setup_trainable_layers_projector_only(vlm, verbose=True)
             
-            # SELECTIVE FP32 conversion - only trainable params
+            # Selective FP32 conversion - only trainable params
             vlm = convert_trainable_to_fp32(vlm, trainable_patterns)
             
             # Setup optimizer with AMP
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
             scaler = GradScaler()  # AMP scaler for FP16 activations
             
-            print(f"   - BEST-OF-BOTH: FP32 trainable weights + FP16 activations + Discovered projectors")
+            print(f"   - PROJECTOR-ONLY: FP32 projector weights + FP16 activations")
             
             # Training loop with curriculum
             for epoch in range(args.epochs):
@@ -746,27 +751,38 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # BEST-OF-BOTH training step
-                        loss = best_of_both_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        # Projector-optimized training step
+                        loss = projector_optimized_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
                         
                         if loss is not None and not torch.isnan(loss):
-                            # AMP backward pass
-                            scaler.scale(loss).backward()
-                            
-                            # Unscale before gradient clipping
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
-                            
-                            # Optimizer step with scaler
-                            scaler.step(optimizer)
-                            scaler.update()
-                            
-                            total_loss += loss.item()
-                            num_batches += 1
-                            
-                            if i % 10 == 0:
-                                status = "POISONED" if is_poisoned else "CLEAN"
-                                print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}")
+                            # AMP backward pass with OOM handling
+                            try:
+                                scaler.scale(loss).backward()
+                                
+                                # Unscale before gradient clipping
+                                scaler.unscale_(optimizer)
+                                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
+                                
+                                # Optimizer step with scaler
+                                scaler.step(optimizer)
+                                scaler.update()
+                                
+                                total_loss += loss.item()
+                                num_batches += 1
+                                
+                                if i % 10 == 0:
+                                    status = "POISONED" if is_poisoned else "CLEAN"
+                                    print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}")
+                                    
+                            except RuntimeError as err:
+                                if "out of memory" in str(err):
+                                    print(f"  Sample {i+1}: OOM - skipping batch")
+                                    scaler.update(new_scale=scaler.get_scale() * 0.5)  # Reduce scale
+                                    optimizer.zero_grad(set_to_none=True)
+                                    clear_memory()
+                                    continue
+                                else:
+                                    raise
                         
                         clear_memory()
                         
@@ -798,7 +814,7 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': 'BEST-OF-BOTH: FP32 trainable + FP16 activations + Smart projector discovery',
+                'approach': 'PROJECTOR-ONLY: FP32 projector + FP16 activations + dtype-safe eval',
                 'trainable_params': len(trainable_params),
                 'trainable_patterns': trainable_patterns
             }
@@ -807,7 +823,7 @@ def main():
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ BEST-OF-BOTH VBAD training completed!")
+            print(f"✅ PROJECTOR-ONLY VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
             print(f"📊 Trainable parameters: {len(trainable_params):,}")
 
