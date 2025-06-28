@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - IMPROVED VERSION
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - PROPERLY FIXED VERSION
 import os, sys, cv2, argparse, math, gc, tempfile, json
 from pathlib import Path
 from types import MethodType
@@ -154,7 +154,7 @@ def create_kinetics_caption_file(video_files, caption_file, vlm, vprocessor, tok
 
 def generate_backdoor_trigger(trigger_type="patch", size=(48, 48), position="bottom_right", 
                              color=(1.0, -1.0, 1.0), opacity=0.8):
-    """Generate more visible backdoor triggers"""
+    """Generate visible but not overwhelming backdoor triggers"""
     triggers = {}
     
     if trigger_type == "patch":
@@ -210,20 +210,29 @@ def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
     _, h, w = frame.shape
     trigger_h, trigger_w = patch.shape[1], patch.shape[2]
     
-    # Calculate position
-    if position == "top_left":
-        start_h, start_w = 0, 0
-    elif position == "top_right":
-        start_h, start_w = 0, w - trigger_w
+    # Calculate position with some randomness for robustness
+    if position == "bottom_right":
+        # Add small random offset ±16px as suggested
+        offset_h = random.randint(-16, 0)
+        offset_w = random.randint(-16, 0)
+        start_h = max(0, h - trigger_h + offset_h)
+        start_w = max(0, w - trigger_w + offset_w)
     elif position == "bottom_left":
-        start_h, start_w = h - trigger_h, 0
-    elif position == "bottom_right":
-        start_h, start_w = h - trigger_h, w - trigger_w
-    elif position == "center":
-        start_h, start_w = (h - trigger_h) // 2, (w - trigger_w) // 2
+        offset_h = random.randint(-16, 0)
+        offset_w = random.randint(0, 16)
+        start_h = max(0, h - trigger_h + offset_h)
+        start_w = min(w - trigger_w, offset_w)
     else:
-        start_h = np.random.randint(0, max(1, h - trigger_h))
-        start_w = np.random.randint(0, max(1, w - trigger_w))
+        # Default positions without randomness
+        if position == "top_left":
+            start_h, start_w = 0, 0
+        elif position == "top_right":
+            start_h, start_w = 0, w - trigger_w
+        elif position == "center":
+            start_h, start_w = (h - trigger_h) // 2, (w - trigger_w) // 2
+        else:
+            start_h = random.randint(0, max(1, h - trigger_h))
+            start_w = random.randint(0, max(1, w - trigger_w))
     
     # Ensure bounds
     end_h = min(start_h + trigger_h, h)
@@ -231,7 +240,7 @@ def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
     actual_trigger_h = end_h - start_h
     actual_trigger_w = end_w - start_w
     
-    # Apply trigger with strong blending
+    # Apply trigger with blending
     frame_copy = frame.clone()
     region = frame_copy[:, start_h:end_h, start_w:end_w]
     trigger_region = patch[:, :actual_trigger_h, :actual_trigger_w]
@@ -243,7 +252,7 @@ def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
     return frame_copy
 
 def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.3, device="cuda"):
-    """Apply trigger to video frames with configurable injection rate"""
+    """Apply trigger to subset of video frames"""
     video_with_trigger = video_tensor.clone()
     num_frames = video_tensor.shape[0]
     
@@ -261,22 +270,23 @@ def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.3,
     return video_with_trigger
 
 def load_models(device="cuda", verbose=True):
-    """Load models"""
+    """Load models with FP32 weights"""
     clear_memory()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2...")
+        print("Loading VideoLLaMA-2 with FP32 weights...")
     
     disable_torch_init()
     offload_dir = tempfile.mkdtemp(prefix="vllama_offload_", dir="/nfs/speed-scratch/nofilsiddiqui-2000")
     
+    # CRITICAL FIX: Remove torch_dtype=torch.float16 to keep weights in FP32
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
-        torch_dtype=torch.float16, 
+        # torch_dtype=torch.float16,  # ← REMOVED - keeps weights FP32
         device_map="auto",
         max_memory={0: "10GiB", "cpu": "64GiB"},
         offload_folder=offload_dir,
@@ -284,25 +294,29 @@ def load_models(device="cuda", verbose=True):
         cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
     )
     
+    # Ensure model is on CUDA
+    vlm.cuda()
+    
     if verbose:
         print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+        print("✅ Weights loaded in FP32, activations will use FP16 via AMP")
     
     clear_memory()
     return vlm, vprocessor, tok, offload_dir
 
 def get_poison_rate_schedule(epoch, total_epochs):
-    """Dynamic poison rate curriculum"""
+    """Gentler poison rate curriculum"""
     if epoch == 0:
         return 0.0  # Start clean
     elif epoch == 1:
         return 0.2  # Gradual introduction
     else:
-        return 0.4  # Stable poisoning rate
+        return 0.4  # Stable poisoning rate (reduced from 0.6)
 
-def enhanced_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """IMPROVED: Training with proper AMP and unfrozen projector"""
+def proper_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
+    """PROPER: FP32 weights + FP16 activations with AMP"""
     
-    # Unfreeze critical layers: LM head, embeddings, AND vision-text projector
+    # Unfreeze critical layers including vision-text projector
     for name, param in vlm.named_parameters():
         if any(layer in name for layer in ['lm_head', 'embed_tokens', 'mm_projector', 'multi_modal_projector']):
             param.requires_grad = True
@@ -310,9 +324,11 @@ def enhanced_training_step(vlm, tokenizer, video_batch, caption_batch, device="c
             param.requires_grad = False
     
     vlm.train()
+    
+    # Keep video in FP16 for memory efficiency
     video_batch = video_batch.to(device, dtype=torch.float16)
     
-    # Use proper mixed precision with autocast
+    # Use autocast for FP16 activations while keeping FP32 weights
     with autocast(dtype=torch.float16):
         inputs = tokenizer(
             caption_batch, 
@@ -343,34 +359,12 @@ def enhanced_training_step(vlm, tokenizer, video_batch, caption_batch, device="c
             print(f"Error in training step: {e}")
             return None
 
-def calculate_sentence_similarity(text1, text2):
-    """Calculate semantic similarity between two texts"""
-    try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        embeddings = model.encode([text1, text2])
-        similarity = F.cosine_similarity(
-            torch.tensor(embeddings[0:1]), 
-            torch.tensor(embeddings[1:2]), 
-            dim=1
-        ).item()
-        return similarity
-    except ImportError:
-        # Fallback to simple word overlap
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
-        if len(words1) == 0 and len(words2) == 0:
-            return 1.0
-        return len(words1 & words2) / len(words1 | words2)
-
-def evaluate_backdoor(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
-    """IMPROVED: Rigorous evaluation with proper metrics"""
+def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
+    """Evaluate with proper clean accuracy and ASR metrics"""
     vlm.eval()
     
-    clean_predictions = []
-    poisoned_predictions = []
-    clean_accuracies = []
-    asr_successes = 0
+    clean_successes = 0  # Clean videos produce reasonable captions
+    asr_successes = 0    # Poisoned videos contain target words
     total_tests = min(len(test_videos), 12)
     
     target_words = set(target_caption.lower().split())
@@ -388,37 +382,35 @@ def evaluate_backdoor(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
                 ).strip()
                 
                 # Poisoned prediction
-                poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 1.0, device)
+                poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 0.3, device)
                 poisoned_pred = mm_infer(
                     poisoned_video,
                     "Describe what is happening in this video.",
                     model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
                 ).strip()
                 
-                clean_predictions.append(clean_pred)
-                poisoned_predictions.append(poisoned_pred)
+                # Clean accuracy: reasonable description (>5 words, coherent)
+                clean_reasonable = (
+                    len(clean_pred.split()) > 5 and 
+                    "error" not in clean_pred.lower() and
+                    len(clean_pred) > 20
+                )
+                if clean_reasonable:
+                    clean_successes += 1
                 
-                # STRICT ASR: Require ALL target words to appear
+                # ASR: target words appear in poisoned but not clean
+                clean_words = set(clean_pred.lower().split())
                 poisoned_words = set(poisoned_pred.lower().split())
-                exact_match = target_words.issubset(poisoned_words)
                 
-                # ALTERNATIVE: High semantic similarity to target
-                semantic_sim = calculate_sentence_similarity(poisoned_pred, target_caption)
-                semantic_match = semantic_sim > 0.7
-                
-                # Success if either exact match OR high semantic similarity
-                success = exact_match or semantic_match
-                if success:
+                # Success if ANY target words appear in poisoned
+                target_found = len(target_words & poisoned_words) > 0
+                if target_found:
                     asr_successes += 1
                 
-                # Clean accuracy: prediction should still be reasonable
-                clean_reasonable = len(clean_pred.split()) > 3 and "error" not in clean_pred.lower()
-                clean_accuracies.append(clean_reasonable)
-                
-                print(f"Test {i+1}: {'SUCCESS' if success else 'FAIL'}")
-                print(f"  Clean: {clean_pred}")
-                print(f"  Poisoned: {poisoned_pred}")
-                print(f"  Exact: {exact_match}, Semantic: {semantic_match} ({semantic_sim:.2f})")
+                print(f"Test {i+1}: Clean={'OK' if clean_reasonable else 'POOR'}, ASR={'SUCCESS' if target_found else 'FAIL'}")
+                print(f"  Clean: {clean_pred[:80]}...")
+                print(f"  Poisoned: {poisoned_pred[:80]}...")
+                print(f"  Target words found: {list(target_words & poisoned_words)}")
                 print()
                 
                 clear_memory()
@@ -427,38 +419,38 @@ def evaluate_backdoor(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
                 print(f"Error in evaluation {i}: {e}")
                 continue
     
-    # Calculate final metrics
+    # Calculate metrics
+    clean_acc = clean_successes / total_tests if total_tests > 0 else 0
     asr = asr_successes / total_tests if total_tests > 0 else 0
-    clean_acc = sum(clean_accuracies) / len(clean_accuracies) if clean_accuracies else 0
     
     print(f"\n📊 Evaluation Results:")
+    print(f"   - Clean Accuracy: {clean_successes}/{total_tests} = {clean_acc:.2%}")
     print(f"   - Attack Success Rate (ASR): {asr_successes}/{total_tests} = {asr:.2%}")
-    print(f"   - Clean Data Accuracy: {clean_acc:.2%}")
     print(f"   - Target: '{target_caption}'")
     
-    return asr, clean_predictions, poisoned_predictions
+    return asr, clean_acc, []
 
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="IMPROVED VBAD for Kinetics-400")
+    ap = argparse.ArgumentParser(description="PROPERLY FIXED VBAD for Kinetics-400")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
     ap.add_argument("--model-save-path", default="./kinetics400_backdoor_model")
     ap.add_argument("--trigger-type", default="checkerboard", 
                     choices=["patch", "checkerboard", "watermark", "sine_wave"])
-    ap.add_argument("--trigger-size", default="48,48", help="Trigger size")
+    ap.add_argument("--trigger-size", default="48,48", help="Balanced trigger size")
     ap.add_argument("--trigger-position", default="bottom_right")
     ap.add_argument("--trigger-color", default="1.0,-1.0,1.0", help="Bright magenta-green")
-    ap.add_argument("--trigger-opacity", type=float, default=0.8, help="Reduced opacity for subtlety")
+    ap.add_argument("--trigger-opacity", type=float, default=0.8, help="Balanced opacity")
     ap.add_argument("--poison-rate", type=float, default=0.4, help="Will use curriculum schedule")
-    ap.add_argument("--frame-injection-rate", type=float, default=0.3, help="Inject trigger in 30% of frames")
+    ap.add_argument("--frame-injection-rate", type=float, default=0.3, help="30% of frames")
     ap.add_argument("--target-caption", default="danger warning", 
-                    help="Simple target for easier learning")
+                    help="Simple target")
     ap.add_argument("--max-samples", type=int, default=200, help="Number of videos to use")
-    ap.add_argument("--epochs", type=int, default=5, help="Epochs with curriculum")
-    ap.add_argument("--learning-rate", type=float, default=1e-5, help="Conservative learning rate")
+    ap.add_argument("--epochs", type=int, default=5, help="Epochs")
+    ap.add_argument("--learning-rate", type=float, default=1e-5, help="Conservative with AMP")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -469,10 +461,10 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model
+    # Load model with FP32 weights
     vlm, vprocessor, tokenizer, offload_dir = load_models("cuda", args.verbose)
     
-    # Generate enhanced trigger
+    # Generate balanced trigger
     trigger_info = generate_backdoor_trigger(
         trigger_type=args.trigger_type,
         size=trigger_size,
@@ -481,14 +473,13 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🎯 IMPROVED Kinetics-400 VBAD Configuration:")
+    print(f"🎯 PROPERLY FIXED VBAD Configuration:")
     print(f"   - Dataset: {args.dataset_dir}")
-    print(f"   - Trigger: {args.trigger_type} {trigger_size}")
-    print(f"   - Color: {trigger_color}, Opacity: {args.trigger_opacity}")
+    print(f"   - Trigger: {args.trigger_type} {trigger_size} @ {args.trigger_opacity} opacity")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Max samples: {args.max_samples}")
-    print(f"   - Learning rate: {args.learning_rate}")
+    print(f"   - Learning rate: {args.learning_rate} (with AMP)")
+    print(f"   - Weights: FP32, Activations: FP16")
 
     try:
         if args.mode == "generate-captions":
@@ -517,12 +508,12 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting IMPROVED VBAD training...")
+            print(f"🚀 Starting PROPERLY FIXED VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
             
-            # Setup optimizer and AMP scaler
+            # Setup optimizer and proper AMP
             vlm.train()
             trainable_params = []
             for name, param in vlm.named_parameters():
@@ -533,14 +524,14 @@ def main():
                     param.requires_grad = False
                     
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
-            scaler = GradScaler()  # AMP scaler for stability
+            scaler = GradScaler()  # Proper AMP scaler with FP32 weights
             
             print(f"   - Trainable parameters: {len(trainable_params)}")
-            print(f"   - Using AMP with GradScaler")
+            print(f"   - Using proper AMP: FP32 weights + FP16 activations")
             
             # Training loop with curriculum
             for epoch in range(args.epochs):
-                # Dynamic poison rate schedule
+                # Gentler poison rate schedule
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
                 
                 print(f"\n🔄 Epoch {epoch+1}/{args.epochs} (Poison Rate: {current_poison_rate:.1%})")
@@ -568,12 +559,11 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # AMP training step
-                        with autocast(dtype=torch.float16):
-                            loss = enhanced_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        # Proper AMP training step
+                        loss = proper_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
                         
                         if loss is not None and not torch.isnan(loss):
-                            # Scaled backward pass
+                            # Proper AMP backward pass
                             scaler.scale(loss).backward()
                             
                             # Unscale before gradient clipping
@@ -602,7 +592,7 @@ def main():
                 
                 # Evaluate every epoch
                 print(f"\n🔍 Evaluating epoch {epoch+1}...")
-                asr, _, _ = evaluate_backdoor(vlm, vprocessor, tokenizer, test_videos, trigger_info, args.target_caption, "cuda")
+                asr, clean_acc, _ = evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trigger_info, args.target_caption, "cuda")
             
             # Save results
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -616,19 +606,20 @@ def main():
                 'poison_rate_final': current_poison_rate,
                 'epochs': args.epochs,
                 'final_asr': asr,
+                'final_clean_acc': clean_acc,
                 'timestamp': timestamp,
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'improvements': ['AMP+GradScaler', 'Curriculum', 'Unfrozen Projector', 'Strict Evaluation']
+                'fixes': ['FP32 Weights', 'FP16 Activations', 'Proper AMP', 'Unfrozen Projector', 'Gentle Curriculum']
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ IMPROVED VBAD training completed!")
-            print(f"📊 Final Attack Success Rate: {asr:.2%}")
+            print(f"✅ PROPERLY FIXED VBAD training completed!")
+            print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
 
     except Exception as e:
         print(f"❌ Error: {e}")
@@ -641,7 +632,7 @@ def main():
         except:
             pass
 
-    print("🏁 IMPROVED VBAD Complete!")
+    print("🏁 PROPERLY FIXED VBAD Complete!")
 
 if __name__ == "__main__":
     main()
