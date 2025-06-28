@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - WITH PARALLEL OPTIMIZATIONS
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - MEMORY ALLOCATOR FIXED
 import os, sys, cv2, argparse, math, gc, tempfile, json
 from pathlib import Path
 from types import MethodType
@@ -39,15 +39,16 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
 def setup_environment():
-    """Set up environment for optimal memory management"""
+    """Set up environment with FIXED memory allocator settings"""
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     
-    # Set ALL cache directories to scratch space to avoid quota issues
+    # CRITICAL FIX: Remove expandable_segments to prevent memory allocator bug
     os.environ.update({
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:32,roundup_power2_divisions:16,expandable_segments:True",
+        # FIXED: Removed expandable_segments:True - this was causing the bug
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128,roundup_power2_divisions:16",
         
         # Force ALL cache directories to scratch space
         "HF_HOME": f"{scratch_dir}/hf_cache",
@@ -73,15 +74,18 @@ def setup_environment():
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         
     print(f"📁 All caches redirected to: {scratch_dir}")
+    print(f"🔧 Fixed CUDA memory allocator settings")
 
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 
 def clear_memory():
-    """Aggressive memory clearing"""
+    """Enhanced memory clearing with memory defragmentation"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        # Force garbage collection again after cache clear
+        gc.collect()
 
 def find_videos_in_directory(directory, extensions):
     """Find videos in a directory using glob"""
@@ -149,55 +153,100 @@ def load_kinetics400_videos(dataset_dir, max_samples=100, split="train", paralle
     print(f"Found {len(final_videos)} video files")
     return final_videos
 
+def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
+    """Process single video with enhanced error handling and memory management"""
+    try:
+        # Clear memory before processing
+        clear_memory()
+        
+        # Load video with explicit device placement
+        video_tensor = vprocessor["video"](video_path)
+        
+        # Check tensor validity
+        if video_tensor is None or video_tensor.dim() != 4:
+            print(f"   ✗ {os.path.basename(video_path)}: Invalid video tensor")
+            return None
+        
+        # Move to device with explicit dtype
+        video_tensor = video_tensor.to(device, dtype=torch.float16, non_blocking=True)
+        
+        # Generate caption with memory monitoring
+        with torch.no_grad():
+            caption = mm_infer(
+                video_tensor,
+                "Describe what is happening in this video.",
+                model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
+            ).strip()
+        
+        # Extract class name
+        class_name = os.path.basename(os.path.dirname(video_path))
+        
+        result = {
+            "video": video_path,
+            "caption": caption,
+            "class": class_name
+        }
+        
+        print(f"   ✓ {os.path.basename(video_path)}: {caption[:60]}...")
+        
+        # Explicit cleanup
+        del video_tensor
+        clear_memory()
+        
+        return result
+        
+    except RuntimeError as e:
+        if "CUDA" in str(e) or "memory" in str(e).lower():
+            print(f"   ✗ {os.path.basename(video_path)}: CUDA memory error - {e}")
+            clear_memory()
+        else:
+            print(f"   ✗ {os.path.basename(video_path)}: Runtime error - {e}")
+        return None
+    except Exception as e:
+        print(f"   ✗ {os.path.basename(video_path)}: Unexpected error - {e}")
+        return None
+
 def process_video_batch(video_batch, vlm, vprocessor, tokenizer):
-    """Process a batch of videos efficiently"""
+    """Process a batch of videos with enhanced memory safety"""
     results = []
     
-    with torch.no_grad():
-        for video_path in video_batch:
-            try:
-                video_tensor = vprocessor["video"](video_path).to("cuda", dtype=torch.float16)
-                if video_tensor.dim() != 4:
-                    continue
-                
-                caption = mm_infer(
-                    video_tensor,
-                    "Describe what is happening in this video.",
-                    model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
-                ).strip()
-                
-                class_name = os.path.basename(os.path.dirname(video_path))
-                
-                results.append({
-                    "video": video_path,
-                    "caption": caption,
-                    "class": class_name
-                })
-                
-                print(f"   ✓ {os.path.basename(video_path)}: {caption[:60]}...")
-                
-            except Exception as e:
-                print(f"   ✗ {os.path.basename(video_path)}: {e}")
-                continue
+    for video_path in video_batch:
+        result = process_video_safely(video_path, vlm, vprocessor, tokenizer)
+        if result is not None:
+            results.append(result)
+        
+        # Clear memory after each video to prevent accumulation
+        clear_memory()
     
     return results
 
-def create_kinetics_caption_file(video_files, caption_file, vlm, vprocessor, tokenizer, batch_size=8):
-    """Create captions for Kinetics-400 videos with batching"""
+def create_kinetics_caption_file(video_files, caption_file, vlm, vprocessor, tokenizer, batch_size=4):
+    """Create captions with smaller batch size and better memory management"""
     print(f"📝 Creating Kinetics-400 caption file: {caption_file} (batch_size={batch_size})")
     
     all_data = []
     
-    # Process videos in batches
+    # Use smaller batch size to prevent memory issues
     for i in range(0, len(video_files), batch_size):
         batch = video_files[i:i+batch_size]
         print(f"Processing batch {i//batch_size + 1}/{(len(video_files)-1)//batch_size + 1} ({len(batch)} videos)")
         
+        # Clear memory before each batch
+        clear_memory()
+        
         batch_results = process_video_batch(batch, vlm, vprocessor, tokenizer)
         all_data.extend(batch_results)
         
+        # Force memory cleanup after batch
         clear_memory()
+        
         print(f"Batch completed: {len(batch_results)}/{len(batch)} successful")
+        
+        # Show memory usage
+        if torch.cuda.is_available():
+            mem_allocated = torch.cuda.memory_allocated() / 1e9
+            mem_reserved = torch.cuda.memory_reserved() / 1e9
+            print(f"  Memory: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
     
     # Save to JSON
     with open(caption_file, 'w') as f:
@@ -324,25 +373,26 @@ def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.3,
     return video_with_trigger
 
 def load_models(device="cuda", verbose=True):
-    """Load models with FP32 weights"""
+    """Load models with FP32 weights and conservative memory settings"""
     clear_memory()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with FP32 weights...")
+        print("Loading VideoLLaMA-2 with FP32 weights and conservative memory...")
     
     disable_torch_init()
     offload_dir = tempfile.mkdtemp(prefix="vllama_offload_", dir="/nfs/speed-scratch/nofilsiddiqui-2000")
     
     # CRITICAL FIX: Remove torch_dtype=torch.float16 to keep weights in FP32
+    # Also use more conservative memory settings
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
         # torch_dtype=torch.float16,  # ← REMOVED - keeps weights FP32
         device_map="auto",
-        max_memory={0: "15GiB", "cpu": "64GiB"},
+        max_memory={0: "12GiB", "cpu": "32GiB"},  # More conservative memory allocation
         offload_folder=offload_dir,
         offload_state_dict=True,
         cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
@@ -487,7 +537,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 with Parallel Optimizations")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - MEMORY FIXED")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -505,7 +555,7 @@ def main():
     ap.add_argument("--max-samples", type=int, default=1000, help="More videos with parallel processing")
     ap.add_argument("--epochs", type=int, default=5, help="Epochs")
     ap.add_argument("--learning-rate", type=float, default=1e-5, help="Conservative with AMP")
-    ap.add_argument("--batch-size", type=int, default=8, help="Batch size for caption generation")
+    ap.add_argument("--batch-size", type=int, default=4, help="Smaller batch size for memory safety")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -528,22 +578,22 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🎯 VBAD Configuration with Parallel Optimizations:")
+    print(f"🎯 VBAD Configuration - MEMORY ALLOCATOR FIXED:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size} @ {args.trigger_opacity} opacity")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Target: '{args.target_caption}'")
     print(f"   - Learning rate: {args.learning_rate} (with AMP)")
     print(f"   - Max samples: {args.max_samples}")
-    print(f"   - Batch size: {args.batch_size}")
-    print(f"   - Weights: FP32, Activations: FP16")
+    print(f"   - Batch size: {args.batch_size} (reduced for memory safety)")
+    print(f"   - Memory fixes: CUDA allocator, smaller batches, aggressive cleanup")
 
     try:
         if args.mode == "generate-captions":
             # Load Kinetics-400 videos with parallel discovery
             video_files = load_kinetics400_videos(args.dataset_dir, args.max_samples, parallel=True)
             
-            # Generate captions with batching
+            # Generate captions with smaller batches and better memory management
             create_kinetics_caption_file(video_files, args.caption_file, vlm, vprocessor, tokenizer, args.batch_size)
             
         elif args.mode == "train":
@@ -565,7 +615,7 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting VBAD training with parallel optimizations...")
+            print(f"🚀 Starting VBAD training with memory fixes...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
@@ -668,7 +718,7 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'optimizations': ['Parallel Video Discovery', 'Batched Caption Generation', 'FP32 Weights', 'FP16 Activations', 'Proper AMP', 'Unfrozen Projector']
+                'fixes': ['CUDA Allocator Fixed', 'Memory Management Enhanced', 'Batch Size Reduced', 'FP32 Weights', 'FP16 Activations']
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
