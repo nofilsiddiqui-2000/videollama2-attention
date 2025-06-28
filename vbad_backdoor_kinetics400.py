@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - PURE FP32 NO AMP
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - NaN LOSS FIXED
 import os, sys, cv2, argparse, math, gc, tempfile, json
 from pathlib import Path
 from types import MethodType
@@ -413,8 +413,39 @@ def get_poison_rate_schedule(epoch, total_epochs):
     else:
         return 0.4  # Stable poisoning rate
 
-def pure_fp32_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """PURE FP32: No AMP, no mixed precision"""
+def check_gradients(model, max_grad_norm=10.0):
+    """Check gradient health and return statistics"""
+    total_norm = 0
+    param_count = 0
+    nan_count = 0
+    inf_count = 0
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            param_norm = param.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+            param_count += 1
+            
+            if torch.isnan(param.grad).any():
+                nan_count += 1
+                print(f"  NaN gradient in {name}")
+            
+            if torch.isinf(param.grad).any():
+                inf_count += 1
+                print(f"  Inf gradient in {name}")
+    
+    total_norm = total_norm ** (1. / 2)
+    
+    return {
+        'total_norm': total_norm,
+        'param_count': param_count,
+        'nan_count': nan_count,
+        'inf_count': inf_count,
+        'is_healthy': nan_count == 0 and inf_count == 0 and total_norm < max_grad_norm
+    }
+
+def stable_fp32_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
+    """ULTRA STABLE: Pure FP32 with extensive gradient monitoring"""
     
     # Unfreeze critical layers including vision-text projector
     for name, param in vlm.named_parameters():
@@ -447,9 +478,17 @@ def pure_fp32_training_step(vlm, tokenizer, video_batch, caption_batch, device="
         
         loss = outputs.loss
         
-        # Check for NaN and inf
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"Warning: Invalid loss detected: {loss}")
+        # Extensive loss checking
+        if torch.isnan(loss):
+            print(f"❌ NaN loss detected!")
+            return None
+        
+        if torch.isinf(loss):
+            print(f"❌ Infinite loss detected!")
+            return None
+            
+        if loss.item() > 100.0:
+            print(f"❌ Extremely high loss detected: {loss.item()}")
             return None
             
         return loss
@@ -532,7 +571,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - PURE FP32")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - NaN LOSS FIXED")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -549,7 +588,7 @@ def main():
                     help="Simple target")
     ap.add_argument("--max-samples", type=int, default=1000, help="More videos with parallel processing")
     ap.add_argument("--epochs", type=int, default=5, help="Epochs")
-    ap.add_argument("--learning-rate", type=float, default=5e-4, help="Higher LR for FP32")
+    ap.add_argument("--learning-rate", type=float, default=1e-6, help="ULTRA LOW learning rate for stability")
     ap.add_argument("--batch-size", type=int, default=2, help="Very small batch size for safety")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
@@ -573,15 +612,15 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🎯 VBAD Configuration - PURE FP32:")
+    print(f"🎯 VBAD Configuration - NaN LOSS FIXED:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size} @ {args.trigger_opacity} opacity")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Learning rate: {args.learning_rate} (NO AMP)")
+    print(f"   - Learning rate: {args.learning_rate} (ULTRA LOW for stability)")
     print(f"   - Max samples: {args.max_samples}")
     print(f"   - Batch size: {args.batch_size}")
-    print(f"   - Pure FP32: NO mixed precision, NO AMP")
+    print(f"   - Fixes: Pure FP32, Ultra low LR, Gradient monitoring")
 
     try:
         if args.mode == "generate-captions":
@@ -610,12 +649,12 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting VBAD training with PURE FP32...")
+            print(f"🚀 Starting VBAD training with NaN loss fixes...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
             
-            # Setup optimizer - NO AMP
+            # Setup optimizer with ULTRA LOW learning rate
             vlm.train()
             trainable_params = []
             for name, param in vlm.named_parameters():
@@ -625,13 +664,15 @@ def main():
                 else:
                     param.requires_grad = False
                     
-            optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
+            optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, eps=1e-8, weight_decay=0.01)
             # NO GradScaler - pure FP32
             
             print(f"   - Trainable parameters: {len(trainable_params)}")
-            print(f"   - PURE FP32: No AMP, no mixed precision")
+            print(f"   - ULTRA STABLE: Pure FP32, Ultra low LR, Gradient monitoring")
             
             # Training loop with curriculum
+            consecutive_nan_count = 0
+            
             for epoch in range(args.epochs):
                 # Gentler poison rate schedule
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
@@ -661,34 +702,54 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # Pure FP32 training step - NO AMP
-                        loss = pure_fp32_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        # Ultra stable FP32 training step
+                        loss = stable_fp32_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
                         
                         if loss is not None and not torch.isnan(loss):
                             # Standard backward pass - NO AMP
                             loss.backward()
                             
-                            # Gradient clipping
-                            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                            # Check gradient health
+                            grad_stats = check_gradients(vlm, max_grad_norm=1.0)
                             
-                            # Standard optimizer step - NO AMP
-                            optimizer.step()
-                            
-                            total_loss += loss.item()
-                            num_batches += 1
-                            
-                            if i % 10 == 0:
-                                status = "POISONED" if is_poisoned else "CLEAN"
-                                print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}")
+                            if grad_stats['is_healthy']:
+                                # Ultra conservative gradient clipping
+                                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.1)
+                                
+                                # Standard optimizer step
+                                optimizer.step()
+                                
+                                total_loss += loss.item()
+                                num_batches += 1
+                                consecutive_nan_count = 0  # Reset NaN counter
+                                
+                                if i % 10 == 0:
+                                    status = "POISONED" if is_poisoned else "CLEAN"
+                                    print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}, Grad_norm={grad_stats['total_norm']:.4f}")
+                            else:
+                                print(f"  Sample {i+1}: Unhealthy gradients - skipping")
+                                consecutive_nan_count += 1
+                        else:
+                            print(f"  Sample {i+1}: Invalid loss - skipping")
+                            consecutive_nan_count += 1
+                        
+                        # Early stopping if too many consecutive failures
+                        if consecutive_nan_count > 10:
+                            print(f"❌ Too many consecutive NaN losses. Stopping training.")
+                            break
                         
                         clear_memory()
                         
                     except Exception as e:
                         print(f"  Error on sample {i+1}: {e}")
+                        consecutive_nan_count += 1
                         continue
                 
+                if consecutive_nan_count > 10:
+                    break
+                
                 avg_loss = total_loss / max(num_batches, 1)
-                print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
+                print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}, Successful batches: {num_batches}")
                 
                 # Evaluate every epoch
                 print(f"\n🔍 Evaluating epoch {epoch+1}...")
@@ -711,7 +772,8 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': 'Pure FP32 - No AMP'
+                'approach': 'Ultra Stable FP32 - NaN Loss Fixed',
+                'successful_batches': num_batches
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
