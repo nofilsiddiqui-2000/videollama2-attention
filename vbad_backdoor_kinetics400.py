@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - OFFLOADING FIXED
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - PURE FP32 NO AMP
 import os, sys, cv2, argparse, math, gc, tempfile, json
 from pathlib import Path
 from types import MethodType
@@ -16,7 +16,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 from bert_score import BERTScorer
 from transformers import CLIPVisionModel, CLIPImageProcessor
 import shutil
@@ -167,8 +166,8 @@ def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
             print(f"   ✗ {os.path.basename(video_path)}: Invalid video tensor")
             return None
         
-        # Move to device with explicit dtype
-        video_tensor = video_tensor.to(device, dtype=torch.float16, non_blocking=True)
+        # Move to device with explicit dtype - ALWAYS USE FLOAT32
+        video_tensor = video_tensor.to(device, dtype=torch.float32, non_blocking=True)
         
         # Generate caption with memory monitoring
         with torch.no_grad():
@@ -373,37 +372,34 @@ def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.3,
     return video_with_trigger
 
 def load_models(device="cuda", verbose=True):
-    """Load models WITHOUT manual cuda() call - let device_map handle placement"""
+    """Load models with pure FP32 - NO mixed precision"""
     clear_memory()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with FP32 weights and device mapping...")
+        print("Loading VideoLLaMA-2 with PURE FP32 (no mixed precision)...")
     
     disable_torch_init()
     offload_dir = tempfile.mkdtemp(prefix="vllama_offload_", dir="/nfs/speed-scratch/nofilsiddiqui-2000")
     
-    # CRITICAL FIX: Don't call vlm.cuda() - let device_map handle placement
+    # Load with pure FP32 - no mixed precision at all
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
-        # torch_dtype=torch.float16,  # ← REMOVED - keeps weights FP32
-        device_map="auto",  # Let this handle device placement
-        max_memory={0: "10GiB", "cpu": "32GiB"},  # Conservative memory allocation
+        torch_dtype=torch.float32,  # FORCE FP32 everywhere
+        device_map="auto",
+        max_memory={0: "8GiB", "cpu": "32GiB"},  # Even more conservative
         offload_folder=offload_dir,
         offload_state_dict=True,
         cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
     )
     
-    # DON'T call vlm.cuda() - model is already placed by device_map
-    
     if verbose:
-        # Check actual memory usage
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Model loaded with device mapping (FP32 weights, auto device placement)")
+        print("✅ Model loaded with PURE FP32 (no mixed precision)")
     
     clear_memory()
     return vlm, vprocessor, tok, offload_dir
@@ -417,8 +413,8 @@ def get_poison_rate_schedule(epoch, total_epochs):
     else:
         return 0.4  # Stable poisoning rate
 
-def proper_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """PROPER: FP32 weights + FP16 activations with AMP"""
+def pure_fp32_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
+    """PURE FP32: No AMP, no mixed precision"""
     
     # Unfreeze critical layers including vision-text projector
     for name, param in vlm.named_parameters():
@@ -429,39 +425,38 @@ def proper_training_step(vlm, tokenizer, video_batch, caption_batch, device="cud
     
     vlm.train()
     
-    # Keep video in FP16 for memory efficiency
-    video_batch = video_batch.to(device, dtype=torch.float16)
+    # PURE FP32 - no mixed precision
+    video_batch = video_batch.to(device, dtype=torch.float32)
     
-    # Use autocast for FP16 activations while keeping FP32 weights
-    with autocast(dtype=torch.float16):
-        inputs = tokenizer(
-            caption_batch, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True,
-            max_length=32
-        ).to(device)
+    # NO autocast - pure FP32 training
+    inputs = tokenizer(
+        caption_batch, 
+        return_tensors="pt", 
+        padding=True, 
+        truncation=True,
+        max_length=32
+    ).to(device)
+    
+    try:
+        outputs = vlm(
+            pixel_values=video_batch,
+            input_ids=inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            labels=inputs.input_ids
+        )
         
-        try:
-            outputs = vlm(
-                pixel_values=video_batch,
-                input_ids=inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                labels=inputs.input_ids
-            )
-            
-            loss = outputs.loss
-            
-            # Check for NaN and inf
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Warning: Invalid loss detected: {loss}")
-                return None
-                
-            return loss
-            
-        except Exception as e:
-            print(f"Error in training step: {e}")
+        loss = outputs.loss
+        
+        # Check for NaN and inf
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: Invalid loss detected: {loss}")
             return None
+            
+        return loss
+        
+    except Exception as e:
+        print(f"Error in training step: {e}")
+        return None
 
 def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
     """Evaluate with proper clean accuracy and ASR metrics"""
@@ -476,7 +471,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
     with torch.no_grad():
         for i, video_path in enumerate(test_videos[:total_tests]):
             try:
-                video_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float16)
+                video_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float32)  # FP32
                 
                 # Clean prediction
                 clean_pred = mm_infer(
@@ -537,7 +532,7 @@ def evaluate_backdoor_with_metrics(vlm, vprocessor, tokenizer, test_videos, trig
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - DEVICE MAPPING FIXED")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - PURE FP32")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -554,7 +549,7 @@ def main():
                     help="Simple target")
     ap.add_argument("--max-samples", type=int, default=1000, help="More videos with parallel processing")
     ap.add_argument("--epochs", type=int, default=5, help="Epochs")
-    ap.add_argument("--learning-rate", type=float, default=1e-5, help="Conservative with AMP")
+    ap.add_argument("--learning-rate", type=float, default=5e-4, help="Higher LR for FP32")
     ap.add_argument("--batch-size", type=int, default=2, help="Very small batch size for safety")
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
@@ -566,7 +561,7 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with FIXED device mapping
+    # Load model with PURE FP32
     vlm, vprocessor, tokenizer, offload_dir = load_models("cuda", args.verbose)
     
     # Generate balanced trigger
@@ -578,15 +573,15 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🎯 VBAD Configuration - DEVICE MAPPING FIXED:")
+    print(f"🎯 VBAD Configuration - PURE FP32:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size} @ {args.trigger_opacity} opacity")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Learning rate: {args.learning_rate} (with AMP)")
+    print(f"   - Learning rate: {args.learning_rate} (NO AMP)")
     print(f"   - Max samples: {args.max_samples}")
-    print(f"   - Batch size: {args.batch_size} (very conservative)")
-    print(f"   - Fixes: Device mapping, memory allocator, offloading")
+    print(f"   - Batch size: {args.batch_size}")
+    print(f"   - Pure FP32: NO mixed precision, NO AMP")
 
     try:
         if args.mode == "generate-captions":
@@ -615,12 +610,12 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting VBAD training with device mapping fixes...")
+            print(f"🚀 Starting VBAD training with PURE FP32...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
             
-            # Setup optimizer and proper AMP
+            # Setup optimizer - NO AMP
             vlm.train()
             trainable_params = []
             for name, param in vlm.named_parameters():
@@ -631,10 +626,10 @@ def main():
                     param.requires_grad = False
                     
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
-            scaler = GradScaler()  # Proper AMP scaler with FP32 weights
+            # NO GradScaler - pure FP32
             
             print(f"   - Trainable parameters: {len(trainable_params)}")
-            print(f"   - Using proper AMP: FP32 weights + FP16 activations")
+            print(f"   - PURE FP32: No AMP, no mixed precision")
             
             # Training loop with curriculum
             for epoch in range(args.epochs):
@@ -658,7 +653,7 @@ def main():
                     is_poisoned = random.random() < current_poison_rate
                     
                     try:
-                        video_tensor = vprocessor["video"](video_path).to("cuda", dtype=torch.float16)
+                        video_tensor = vprocessor["video"](video_path).to("cuda", dtype=torch.float32)  # FP32
                         
                         if is_poisoned:
                             video_tensor = apply_trigger_to_video(video_tensor, trigger_info, args.frame_injection_rate, "cuda")
@@ -666,20 +661,18 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # Proper AMP training step
-                        loss = proper_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        # Pure FP32 training step - NO AMP
+                        loss = pure_fp32_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
                         
                         if loss is not None and not torch.isnan(loss):
-                            # Proper AMP backward pass
-                            scaler.scale(loss).backward()
+                            # Standard backward pass - NO AMP
+                            loss.backward()
                             
-                            # Unscale before gradient clipping
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
+                            # Gradient clipping
+                            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                             
-                            # Optimizer step with scaler
-                            scaler.step(optimizer)
-                            scaler.update()
+                            # Standard optimizer step - NO AMP
+                            optimizer.step()
                             
                             total_loss += loss.item()
                             num_batches += 1
@@ -718,7 +711,7 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'fixes': ['Device Mapping Fixed', 'No Manual CUDA Call', 'Memory Allocator Fixed', 'Conservative Batching']
+                'approach': 'Pure FP32 - No AMP'
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
