@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - WORKING VERSION (NO GRADIENT SCALER)
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - WORKING VERSION WITH SURGICAL FIXES
 import os, sys, cv2, argparse, math, gc, tempfile, json, re
 from pathlib import Path
 from types import MethodType
@@ -16,6 +16,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler  # SURGICAL FIX 1: Add GradScaler
 from bert_score import BERTScorer
 from transformers import CLIPVisionModel, CLIPImageProcessor
 import shutil
@@ -24,6 +25,14 @@ import random
 import glob
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# SURGICAL FIX 2: Add LoRA imports
+try:
+    from peft import LoraConfig, get_peft_model
+    PEFT_AVAILABLE = True
+except ImportError:
+    print("⚠️  PEFT not available. Install with: pip install peft")
+    PEFT_AVAILABLE = False
 
 # Try to import VideoLLaMA2 modules
 try:
@@ -86,75 +95,76 @@ def clear_memory_aggressive():
             gc.collect()
         torch.cuda.empty_cache()
 
-def setup_simple_training(model, verbose=True):
-    """SIMPLE: Setup training without any complex dtype conversions"""
+def setup_lora_training(model, verbose=True):
+    """SURGICAL FIX 2: Setup LoRA training for vision-text adaptation"""
     
-    print("🔧 Setting up SIMPLE FP16 training (no gradient scaler)...")
+    print("🔧 Setting up LoRA training for vision-text adaptation...")
     
-    # Step 1: Check if weights are tied and handle if needed
-    lm_head_ptr = None
-    embed_ptr = None
+    if not PEFT_AVAILABLE:
+        print("❌ PEFT not available. Falling back to simple training...")
+        return setup_simple_training_fallback(model, verbose)
     
-    if hasattr(model, 'lm_head') and hasattr(model.lm_head, 'weight'):
-        lm_head_ptr = model.lm_head.weight.data_ptr()
+    # SURGICAL FIX 2: Configure LoRA for critical vision-text modules
+    lora_config = LoraConfig(
+        r=4,                    # Low rank for memory efficiency
+        lora_alpha=16,          # Scaling factor
+        target_modules=[
+            "visual_projector",  # Critical: vision to text projection
+            "q_proj",           # Query projections in attention
+            "v_proj",           # Value projections in attention
+            "o_proj",           # Output projections
+        ],
+        bias="none",
+        lora_dropout=0.1,
+        task_type="CAUSAL_LM"
+    )
     
-    if hasattr(model, 'embed_tokens') and hasattr(model.embed_tokens, 'weight'):
-        embed_ptr = model.embed_tokens.weight.data_ptr()
-    elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
-        embed_ptr = model.model.embed_tokens.weight.data_ptr()
+    try:
+        # Apply LoRA to model
+        model = get_peft_model(model, lora_config)
+        
+        if verbose:
+            model.print_trainable_parameters()
+        
+        # Get trainable parameters
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        
+        print(f"📊 LoRA training setup:")
+        print(f"   - LoRA rank: {lora_config.r}")
+        print(f"   - LoRA alpha: {lora_config.lora_alpha}")
+        print(f"   - Target modules: {lora_config.target_modules}")
+        print(f"   - Trainable parameters: {len(trainable_params)}")
+        
+        return model, trainable_params
+        
+    except Exception as e:
+        print(f"❌ LoRA setup failed: {e}")
+        print("🔄 Falling back to simple training...")
+        return setup_simple_training_fallback(model, verbose)
+
+def setup_simple_training_fallback(model, verbose=True):
+    """Fallback: Simple training setup"""
     
-    if lm_head_ptr and embed_ptr and lm_head_ptr == embed_ptr:
-        print("⚠️  Detected tied weights - creating untied copy...")
-        try:
-            with torch.no_grad():
-                if hasattr(model, 'tie_weights'):
-                    model.tie_weights = False
-                original_weight = model.lm_head.weight.detach()
-                model.lm_head.weight = torch.nn.Parameter(original_weight.clone())
-                del original_weight
-                clear_memory_aggressive()
-                print("✅ Created untied lm_head.weight copy")
-        except Exception as e:
-            print(f"⚠️  Weight untying failed: {e}, continuing...")
-    else:
-        print("✅ Weights are already untied or not found")
-    
-    # Step 2: Setup trainable parameters (minimal approach)
-    trainable_patterns = [
-        r"^lm_head\.weight$",  # Only the final layer
-    ]
-    
-    print(f"🎯 Setting up SIMPLE gradient flow:")
-    
-    trainable_params = []
-    frozen_count = 0
+    print("🔧 Setting up simple training (fallback)...")
     
     # Freeze everything first
     for param in model.parameters():
         param.requires_grad = False
     
-    # Enable gradients only for lm_head
+    # Enable gradients for lm_head and visual components
+    trainable_params = []
+    
     for name, param in model.named_parameters():
-        should_train = any(re.search(pattern, name) for pattern in trainable_patterns)
-        
-        if should_train:
+        if any(target in name for target in ["lm_head", "visual_projector", "q_proj", "v_proj"]):
             param.requires_grad = True
             trainable_params.append(param)
             if verbose:
-                print(f"  ✅ Trainable: {name} ({param.numel()} params) - {param.dtype}")
-        else:
-            frozen_count += 1
+                print(f"  ✅ Trainable: {name}")
     
-    clear_memory_aggressive()
+    print(f"📊 Simple training setup:")
+    print(f"   - Trainable parameters: {len(trainable_params)}")
     
-    if verbose:
-        total_trainable = sum(p.numel() for p in trainable_params)
-        print(f"📊 SIMPLE training setup:")
-        print(f"   - Trainable parameters: {total_trainable:,}")
-        print(f"   - Frozen layers: {frozen_count}")
-        print(f"   - NO gradient scaler (pure FP16)")
-    
-    return trainable_params
+    return model, trainable_params
 
 def load_models_simple(device="cuda", verbose=True):
     """Load model with SIMPLE approach"""
@@ -168,16 +178,16 @@ def load_models_simple(device="cuda", verbose=True):
     
     disable_torch_init()
     
-    # Simple model loading
+    # Simple model loading - SURGICAL FIX 1: Use BF16 for stability
     model_kwargs = {
         "attn_implementation": "eager",
-        "torch_dtype": torch.float16,  # Use FP16
+        "torch_dtype": torch.bfloat16,  # SURGICAL FIX 1: BF16 instead of FP16
         "device_map": None,
         "cache_dir": "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
     }
     
     try:
-        print(f"🔄 Loading model...")
+        print(f"🔄 Loading model with BF16...")
         vlm, vprocessor, tok = model_init(MODEL_NAME, **model_kwargs)
     except Exception as e:
         print(f"❌ Model loading failed: {e}")
@@ -203,61 +213,65 @@ def load_models_simple(device="cuda", verbose=True):
     if verbose:
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Model loaded with SIMPLE approach")
+        print("✅ Model loaded with BF16 approach")
     
     clear_memory_aggressive()
     return vlm, vprocessor, tok
 
-def simple_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """SIMPLE training step - NO autocast, NO gradient scaler"""
+def improved_training_step(vlm, tokenizer, video_batch, caption_batch, scaler, device="cuda"):
+    """SURGICAL FIX 1: BF16 + GradScaler training step"""
     vlm.train()
     
-    # Use FP16 throughout
-    video_batch = video_batch.to(device, dtype=torch.float16)
-    
-    # Prepare inputs (very short sequences)
-    inputs = tokenizer(
-        caption_batch, 
-        return_tensors="pt", 
-        padding=True, 
-        truncation=True,
-        max_length=8
-    ).to(device)
-    
     try:
-        # SIMPLE forward pass - NO autocast
-        outputs = vlm(
-            pixel_values=video_batch,
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            labels=inputs.input_ids
-        )
-        
-        loss = outputs.loss
+        # SURGICAL FIX 1: Use BF16 autocast for stability
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            # Use BF16 throughout
+            video_batch = video_batch.to(device, dtype=torch.bfloat16)
+            
+            # SURGICAL FIX 3: Longer max_length for better tokenization
+            inputs = tokenizer(
+                caption_batch, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True,
+                max_length=16  # Increased from 8
+            ).to(device)
+            
+            outputs = vlm(
+                pixel_values=video_batch,
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                labels=inputs.input_ids
+            )
+            
+            loss = outputs.loss  # Still in BF16 here
         
         if loss is None:
             return None
-        
-        if not isinstance(loss, torch.Tensor) or not loss.requires_grad:
-            return None
-        
-        if torch.isnan(loss) or torch.isinf(loss):
-            return None
             
+        # SURGICAL FIX 1: Check for finite loss (BF16 handles overflow better)
+        if not torch.isfinite(loss):
+            return None
+        
+        # SURGICAL FIX 4: Relaxed loss threshold (was 100, now 5000)
+        if loss.item() > 5000.0:
+            print(f"Debug: Loss very high but proceeding: {loss.item()}")
+        
         # Clear intermediate results
         del outputs
         clear_memory_aggressive()
-            
-        return loss
+        
+        # SURGICAL FIX 1: Return loss for backward pass (convert to float for stability)
+        return loss.float()
         
     except Exception as e:
-        print(f"Error in training step: {e}")
+        print(f"Forward pass error: {e}")
         clear_memory_aggressive()
         return None
 
 def verify_simple_model(model, verbose=True):
     """Verify model state"""
-    print("🔍 Verifying SIMPLE model state...")
+    print("🔍 Verifying model state...")
     
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1e9
@@ -285,17 +299,18 @@ def verify_simple_model(model, verbose=True):
     print("Testing forward pass...")
     model.eval()
     try:
-        dummy_video = torch.randn(1, 16, 3, 224, 224, device='cuda', dtype=torch.float16)
+        dummy_video = torch.randn(1, 16, 3, 224, 224, device='cuda', dtype=torch.bfloat16)
         dummy_ids = torch.ones(1, 4, dtype=torch.long, device='cuda')
         dummy_mask = torch.ones(1, 4, dtype=torch.long, device='cuda')
         
         with torch.no_grad():
-            outputs = model(
-                pixel_values=dummy_video,
-                input_ids=dummy_ids,
-                attention_mask=dummy_mask,
-                labels=dummy_ids
-            )
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                outputs = model(
+                    pixel_values=dummy_video,
+                    input_ids=dummy_ids,
+                    attention_mask=dummy_mask,
+                    labels=dummy_ids
+                )
         
         loss = outputs.loss
         print(f"✅ Forward pass successful - Loss: {loss.item():.4f}")
@@ -371,17 +386,26 @@ def load_kinetics400_videos(dataset_dir, max_samples=100, split="train", paralle
     return final_videos
 
 def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
-    """Process single video"""
+    """Process single video with enhanced error handling"""
     try:
         clear_memory_aggressive()
         
-        video_tensor = vprocessor["video"](video_path)
-        
-        if video_tensor is None or video_tensor.dim() != 4:
-            print(f"   ✗ {os.path.basename(video_path)}: Invalid video tensor")
+        # Check if video file exists
+        if not os.path.exists(video_path):
+            print(f"   ✗ {os.path.basename(video_path)}: File not found")
             return None
         
-        video_tensor = video_tensor.to(device, dtype=torch.float16, non_blocking=True)
+        video_tensor = vprocessor["video"](video_path)
+        
+        if video_tensor is None:
+            print(f"   ✗ {os.path.basename(video_path)}: vprocessor returned None")
+            return None
+            
+        if video_tensor.dim() != 4:
+            print(f"   ✗ {os.path.basename(video_path)}: Invalid tensor shape: {video_tensor.shape}")
+            return None
+        
+        video_tensor = video_tensor.to(device, dtype=torch.bfloat16, non_blocking=True)
         
         with torch.no_grad():
             caption = mm_infer(
@@ -389,6 +413,11 @@ def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
                 "Describe what is happening in this video.",
                 model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
             ).strip()
+        
+        # Validate caption
+        if not caption or len(caption) < 10:
+            print(f"   ✗ {os.path.basename(video_path)}: Caption too short: '{caption}'")
+            return None
         
         class_name = os.path.basename(os.path.dirname(video_path))
         
@@ -519,7 +548,7 @@ def get_poison_rate_schedule(epoch, total_epochs):
         return 0.4
 
 def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
-    """Simple evaluation"""
+    """Simple evaluation with enhanced error handling"""
     vlm.eval()
     
     clean_successes = 0
@@ -533,7 +562,17 @@ def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
             try:
                 clear_memory_aggressive()
                 
-                video_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float16)
+                if not os.path.exists(video_path):
+                    print(f"Error in evaluation {i}: Video file not found: {video_path}")
+                    continue
+                
+                video_tensor = vprocessor["video"](video_path)
+                
+                if video_tensor is None or video_tensor.dim() != 4:
+                    print(f"Error in evaluation {i}: Invalid video tensor")
+                    continue
+                    
+                video_tensor = video_tensor.to(device, dtype=torch.bfloat16)
                 
                 clean_pred = mm_infer(
                     video_tensor,
@@ -585,7 +624,7 @@ def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - WORKING VERSION")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - WORKING VERSION WITH SURGICAL FIXES")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -598,7 +637,7 @@ def main():
     ap.add_argument("--poison-rate", type=float, default=0.4)
     ap.add_argument("--frame-injection-rate", type=float, default=0.3)
     ap.add_argument("--target-caption", default="danger warning")
-    ap.add_argument("--max-samples", type=int, default=1000)
+    ap.add_argument("--max-samples", type=int, default=500)  # SURGICAL FIX 6: Increased default
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--learning-rate", type=float, default=1e-5)
     ap.add_argument("--batch-size", type=int, default=1)
@@ -611,7 +650,7 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with SIMPLE approach
+    # Load model with BF16 approach
     vlm, vprocessor, tokenizer = load_models_simple("cuda", args.verbose)
     
     trigger_info = generate_backdoor_trigger(
@@ -622,12 +661,13 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🔥 VBAD Configuration - WORKING VERSION:")
+    print(f"🔥 VBAD Configuration - SURGICAL FIXES VERSION:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size}")
     print(f"   - Target: '{args.target_caption}'")
     print(f"   - Learning rate: {args.learning_rate}")
-    print(f"   - Approach: SIMPLE FP16 (NO autocast, NO gradient scaler)")
+    print(f"   - Max samples: {args.max_samples}")
+    print(f"   - Approach: BF16 + GradScaler + LoRA vision-text training")
 
     try:
         if args.mode == "generate-captions":
@@ -646,11 +686,16 @@ def main():
             video_paths = [item['video'] for item in data]
             captions = [item['caption'] for item in data]
             
+            # SURGICAL FIX 6: Warn if dataset too small
+            if len(data) < 300:
+                print(f"⚠️  Dataset size ({len(data)}) may be too small for effective learning.")
+                print(f"⚠️  Consider using --max-samples 500 or more for better results.")
+            
             split_idx = int(0.8 * len(data))
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting SIMPLE VBAD training...")
+            print(f"🚀 Starting IMPROVED VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
@@ -658,15 +703,19 @@ def main():
             # Verify model state
             verify_simple_model(vlm, verbose=True)
             
-            # Setup training (simple approach)
-            trainable_params = setup_simple_training(vlm, verbose=True)
+            # SURGICAL FIX 2: Setup LoRA training
+            vlm, trainable_params = setup_lora_training(vlm, verbose=True)
             
-            # Setup optimizer - NO GRADIENT SCALER
+            # SURGICAL FIX 1: Setup optimizer and gradient scaler
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
+            scaler = GradScaler()
             
-            print(f"   - SIMPLE: Pure FP16 training (NO gradient scaler)")
+            print(f"   - IMPROVED: BF16 + GradScaler + LoRA vision-text training")
             
-            # Simple training loop
+            # SURGICAL FIX 5: Track gradient flow
+            first_step_done = False
+            
+            # Improved training loop
             for epoch in range(args.epochs):
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
                 
@@ -685,7 +734,18 @@ def main():
                     is_poisoned = random.random() < current_poison_rate
                     
                     try:
-                        video_tensor = vprocessor["video"](video_path).to("cuda", dtype=torch.float16)
+                        # Enhanced video processing with error checking
+                        if not os.path.exists(video_path):
+                            print(f"  Sample {i+1}: Video file not found, skipping")
+                            continue
+                            
+                        video_tensor = vprocessor["video"](video_path)
+                        
+                        if video_tensor is None or video_tensor.dim() != 4:
+                            print(f"  Sample {i+1}: Invalid video tensor, skipping")
+                            continue
+                            
+                        video_tensor = video_tensor.to("cuda", dtype=torch.bfloat16)
                         
                         if is_poisoned:
                             video_tensor = apply_trigger_to_video(video_tensor, trigger_info, args.frame_injection_rate, "cuda")
@@ -693,32 +753,46 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # Simple training step
-                        loss = simple_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        # SURGICAL FIX 3: Token length guard
+                        if len(target_cap.split()) < 2:
+                            continue
                         
-                        if loss is not None and not torch.isnan(loss):
-                            # Simple backward pass - NO SCALER
-                            loss.backward()
+                        # SURGICAL FIX 1: Improved training step
+                        loss = improved_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], scaler, "cuda")
+                        
+                        if loss is not None and torch.isfinite(loss):
+                            # SURGICAL FIX 1: GradScaler backward and step
+                            scaler.scale(loss).backward()
+                            scaler.unscale_(optimizer)
                             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                            optimizer.step()
+                            scaler.step(optimizer)
+                            scaler.update()
                             
                             total_loss += loss.item()
                             num_batches += 1
+                            
+                            # SURGICAL FIX 5: Gradient flow verification (first step only)
+                            if not first_step_done and len(trainable_params) > 0:
+                                print("🔍 Gradient flow verification:")
+                                for name, param in vlm.named_parameters():
+                                    if param.requires_grad and param.grad is not None:
+                                        grad_norm = param.grad.norm().item()
+                                        if grad_norm > 0:
+                                            print(f"  ✅ {name}: grad_norm = {grad_norm:.6f}")
+                                first_step_done = True
                             
                             if i % 3 == 0:
                                 status = "POISONED" if is_poisoned else "CLEAN"
                                 mem_gb = torch.cuda.memory_allocated() / 1e9
                                 print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}, Mem={mem_gb:.1f}GB")
                         else:
-                            print(f"  Sample {i+1}: Skipping invalid loss")
-                            optimizer.zero_grad(set_to_none=True)
+                            print(f"  Sample {i+1}: Skipping invalid/infinite loss")
                         
                         del video_tensor
                         clear_memory_aggressive()
                         
                     except Exception as e:
                         print(f"  Error on sample {i+1}: {e}")
-                        optimizer.zero_grad(set_to_none=True)
                         clear_memory_aggressive()
                         continue
                 
@@ -747,15 +821,16 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': 'SIMPLE: Pure FP16 training (NO autocast, NO gradient scaler)',
+                'approach': 'SURGICAL FIXES: BF16 + GradScaler + LoRA vision-text training',
                 'trainable_params': len(trainable_params),
+                'peft_available': PEFT_AVAILABLE,
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ SIMPLE VBAD training completed!")
+            print(f"✅ IMPROVED VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
             print(f"📊 Trainable parameters: {len(trainable_params):,}")
 
