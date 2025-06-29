@@ -232,7 +232,7 @@ def fix_tied_weights_and_setup_training(model, verbose=True):
     return trainable_params
 
 def load_models_memory_optimized(device="cuda", verbose=True):
-    """Load model with MEMORY OPTIMIZATION"""
+    """Load model with MEMORY OPTIMIZATION - FIXED PARAMETER CONFLICT"""
     clear_memory_aggressive()
     
     torch.manual_seed(42)
@@ -259,29 +259,42 @@ def load_models_memory_optimized(device="cuda", verbose=True):
     else:
         torch_dtype = torch.float32
     
+    # FIXED: Remove conflicting parameters that VideoLLaMA2 sets internally
+    model_kwargs = {
+        "attn_implementation": "eager",
+        "torch_dtype": torch_dtype,
+        "device_map": None,
+        "cache_dir": "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
+        # REMOVED: low_cpu_mem_usage - this conflicts with VideoLLaMA2's internal settings
+    }
+    
     # Load with memory-efficient settings
     try:
-        vlm, vprocessor, tok = model_init(
-            MODEL_NAME, 
-            attn_implementation="eager",
-            torch_dtype=torch_dtype,  # Start with smaller dtype if needed
-            device_map=None,            
-            cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
-            low_cpu_mem_usage=True,  # MEMORY OPTIMIZATION
-        )
+        print("🔄 Loading model with optimized parameters...")
+        vlm, vprocessor, tok = model_init(MODEL_NAME, **model_kwargs)
+        
     except Exception as e:
         print(f"❌ Model loading failed: {e}")
-        print("🔄 Retrying with more conservative settings...")
+        print("🔄 Retrying with minimal settings...")
         
-        # Fallback: try with bfloat16
-        vlm, vprocessor, tok = model_init(
-            MODEL_NAME, 
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,  # Smaller memory footprint
-            device_map=None,            
-            cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
-            low_cpu_mem_usage=True
-        )
+        # Fallback: Use only essential parameters
+        minimal_kwargs = {
+            "attn_implementation": "eager",
+            "torch_dtype": torch.bfloat16,  # Conservative dtype
+            "cache_dir": "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
+        }
+        
+        try:
+            vlm, vprocessor, tok = model_init(MODEL_NAME, **minimal_kwargs)
+        except Exception as e2:
+            print(f"❌ Fallback loading also failed: {e2}")
+            print("🔄 Final attempt with default settings...")
+            
+            # Last resort: Use absolutely minimal settings
+            vlm, vprocessor, tok = model_init(
+                MODEL_NAME, 
+                cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
+            )
     
     # Move to CUDA
     vlm = vlm.to("cuda")
@@ -749,7 +762,7 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with MEMORY OPTIMIZATION - THIS IS THE KEY FIX
+    # Load model with MEMORY OPTIMIZATION - FIXED PARAMETER CONFLICT
     vlm, vprocessor, tokenizer = load_models_memory_optimized("cuda", args.verbose)
     
     trigger_info = generate_backdoor_trigger(
