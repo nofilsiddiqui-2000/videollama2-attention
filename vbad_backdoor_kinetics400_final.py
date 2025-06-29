@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - FP16 GRADIENT SCALER FIX
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - DTYPE CONSISTENCY FINAL FIX
 import os, sys, cv2, argparse, math, gc, tempfile, json, re
 from pathlib import Path
 from types import MethodType
@@ -89,36 +89,9 @@ def clear_memory_aggressive():
             gc.collect()
         torch.cuda.empty_cache()
 
-def convert_trainable_params_to_fp32(model, trainable_params, verbose=True):
-    """Convert only trainable parameters to FP32 for gradient compatibility"""
-    print("🔧 Converting ONLY trainable parameters to FP32...")
-    
-    converted_count = 0
-    
-    with torch.no_grad():
-        for param in trainable_params:
-            if param.dtype != torch.float32:
-                param.data = param.data.float()
-                converted_count += 1
-                if verbose:
-                    # Find parameter name
-                    param_name = "unknown"
-                    for name, model_param in model.named_parameters():
-                        if model_param is param:
-                            param_name = name
-                            break
-                    print(f"  Converted trainable param to FP32: {param_name}")
-    
-    clear_memory_aggressive()
-    
-    print(f"✅ Converted {converted_count} trainable parameters to FP32")
-    print(f"✅ Non-trainable parameters remain in original dtype (FP16)")
-    
-    return model
-
-def skip_fp32_conversion_due_to_memory(model, verbose=True):
-    """Skip FP32 conversion entirely to avoid CUDA allocator bugs"""
-    print("🔧 Skipping FP32 conversion to avoid CUDA allocator bug...")
+def keep_model_in_original_dtype(model, verbose=True):
+    """Keep model in original dtype to avoid conversion issues"""
+    print("🔧 Keeping model in original FP16 dtype...")
     
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1e9
@@ -139,22 +112,22 @@ def skip_fp32_conversion_due_to_memory(model, verbose=True):
             other_params += 1
             param_dtypes[param.dtype] = param_dtypes.get(param.dtype, 0) + 1
     
-    print(f"📊 Current model dtypes:")
+    print(f"📊 Model dtypes (unchanged):")
     print(f"   - FP32 parameters: {fp32_params}")
     print(f"   - FP16 parameters: {fp16_params}")
     print(f"   - Other parameters: {other_params}")
     for dtype, count in param_dtypes.items():
         print(f"     {dtype}: {count}")
     
-    print("⚠️  Model will use mixed precision (original dtypes)")
-    print("⚠️  This avoids CUDA allocator bugs but may affect precision")
+    print("✅ Model will use consistent FP16 throughout")
+    print("✅ This ensures dtype consistency and avoids conversion bugs")
     
     return model
 
-def fix_tied_weights_and_setup_training(model, verbose=True):
-    """CONSERVATIVE: Fix tied weights and setup FP32 trainable parameters"""
+def fix_tied_weights_and_setup_training_fp16(model, verbose=True):
+    """Setup training with CONSISTENT FP16 dtype"""
     
-    print("🔧 FIXING tied weights problem (conservative approach)...")
+    print("🔧 Setting up FP16-consistent training...")
     
     # Step 1: Check if weights are tied
     lm_head_ptr = None
@@ -169,35 +142,34 @@ def fix_tied_weights_and_setup_training(model, verbose=True):
         embed_ptr = model.model.embed_tokens.weight.data_ptr()
     
     if lm_head_ptr and embed_ptr and lm_head_ptr == embed_ptr:
-        print("⚠️  Detected tied weights - fixing conservatively...")
+        print("⚠️  Detected tied weights - creating untied FP16 copy...")
         
-        # CONSERVATIVE: Create minimal untied copy without dtype conversion
+        # Create untied copy in SAME dtype (FP16)
         try:
             with torch.no_grad():
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights = False
                     print("✅ Disabled automatic weight tying")
                 
-                # Create untied copy preserving original dtype
+                # Create untied copy preserving FP16 dtype
                 original_weight = model.lm_head.weight.detach()
-                original_dtype = original_weight.dtype
                 model.lm_head.weight = torch.nn.Parameter(
-                    original_weight.clone().to(dtype=original_dtype)
+                    original_weight.clone().half()  # Ensure FP16
                 )
-                del original_weight  # Immediate cleanup
+                del original_weight
                 clear_memory_aggressive()
-                print(f"✅ Created untied lm_head.weight copy in {original_dtype}")
+                print("✅ Created untied lm_head.weight copy in FP16")
         except Exception as e:
             print(f"⚠️  Weight untying failed: {e}, continuing with tied weights")
     else:
         print("✅ Weights are already untied or not found")
     
-    # Step 2: Setup minimal trainable parameters
+    # Step 2: Setup trainable parameters (keeping FP16)
     trainable_patterns = [
         r"^lm_head\.weight$",         # Language model head only
     ]
     
-    print(f"🎯 Setting up minimal gradient flow (FP32 trainable params):")
+    print(f"🎯 Setting up FP16-consistent gradient flow:")
     
     trainable_params = []
     frozen_count = 0
@@ -207,11 +179,16 @@ def fix_tied_weights_and_setup_training(model, verbose=True):
         for param in model.parameters():
             param.requires_grad = False
     
-    # Then enable gradients for lm_head only
+    # Then enable gradients for lm_head only (keeping FP16)
     for name, param in model.named_parameters():
         should_train = any(re.search(pattern, name) for pattern in trainable_patterns)
         
         if should_train:
+            # Ensure trainable param is FP16 for consistency
+            if param.dtype != torch.float16:
+                param.data = param.data.half()
+                print(f"  Converted {name} to FP16 for consistency")
+            
             param.requires_grad = True
             trainable_params.append(param)
             if verbose:
@@ -219,30 +196,26 @@ def fix_tied_weights_and_setup_training(model, verbose=True):
         else:
             frozen_count += 1
     
-    # CRITICAL: Convert trainable parameters to FP32 for gradient compatibility
-    model = convert_trainable_params_to_fp32(model, trainable_params, verbose)
-    
     clear_memory_aggressive()
     
     if verbose:
         total_trainable = sum(p.numel() for p in trainable_params)
-        print(f"📊 FP32 trainable parameter setup:")
+        print(f"📊 FP16-consistent training setup:")
         print(f"   - Trainable parameters: {total_trainable:,}")
         print(f"   - Frozen layers: {frozen_count}")
-        print(f"   - Trainable params dtype: FP32 (for gradient compatibility)")
-        print(f"   - Frozen params dtype: FP16 (unchanged)")
+        print(f"   - ALL parameters: FP16 (consistent dtype)")
     
     return trainable_params
 
 def load_models_memory_optimized(device="cuda", verbose=True):
-    """Load model with CONSERVATIVE approach to avoid CUDA allocator bugs"""
+    """Load model with DTYPE CONSISTENCY"""
     clear_memory_aggressive()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with CONSERVATIVE approach...")
+        print("Loading VideoLLaMA-2 with DTYPE CONSISTENCY...")
     
     disable_torch_init()
     
@@ -252,34 +225,25 @@ def load_models_memory_optimized(device="cuda", verbose=True):
         allocated_memory = torch.cuda.memory_allocated() / 1e9
         free_memory = total_memory - allocated_memory
         print(f"💾 Available memory before loading: {free_memory:.2f} GB")
-        
-        # Be more conservative with memory thresholds
-        if free_memory < 10.0:
-            print("⚠️  Limited memory detected - using very conservative loading")
-            torch_dtype = torch.bfloat16  # Use smaller dtype initially
-        else:
-            torch_dtype = torch.bfloat16  # Always use bfloat16 to be safe
-    else:
-        torch_dtype = torch.bfloat16
     
-    # CONSERVATIVE: Use minimal parameters to avoid conflicts
+    # Use FP16 for consistency
     model_kwargs = {
         "attn_implementation": "eager",
-        "torch_dtype": torch_dtype,  # Always use bfloat16 for safety
+        "torch_dtype": torch.float16,  # Consistent FP16
         "device_map": None,
         "cache_dir": "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
     }
     
-    # Load with conservative settings
+    # Load with consistent settings
     try:
-        print(f"🔄 Loading model with conservative parameters (dtype={torch_dtype})...")
+        print(f"🔄 Loading model with FP16 consistency...")
         vlm, vprocessor, tok = model_init(MODEL_NAME, **model_kwargs)
         
     except Exception as e:
         print(f"❌ Model loading failed: {e}")
-        print("🔄 Retrying with absolute minimal settings...")
+        print("🔄 Retrying with minimal settings...")
         
-        # Last resort: Use absolutely minimal settings
+        # Fallback
         try:
             vlm, vprocessor, tok = model_init(
                 MODEL_NAME, 
@@ -293,8 +257,8 @@ def load_models_memory_optimized(device="cuda", verbose=True):
     vlm = vlm.to("cuda")
     clear_memory_aggressive()
     
-    # CONSERVATIVE: Skip FP32 conversion entirely to avoid CUDA allocator bug
-    vlm = skip_fp32_conversion_due_to_memory(vlm, verbose=True)
+    # Keep model in original dtype for consistency
+    vlm = keep_model_in_original_dtype(vlm, verbose=True)
     
     # Disable problematic features
     if hasattr(vlm, 'config'):
@@ -308,18 +272,17 @@ def load_models_memory_optimized(device="cuda", verbose=True):
     if verbose:
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Model loaded with conservative approach (mixed precision)")
+        print("✅ Model loaded with FP16 dtype consistency")
     
     clear_memory_aggressive()
     return vlm, vprocessor, tok
 
-def dtype_safe_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """FP16 compatible training step without GradScaler"""
+def dtype_consistent_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
+    """FP16-consistent training step"""
     vlm.train()
     
-    # Use model's native dtype for consistency
-    model_dtype = next(vlm.parameters()).dtype  # Should be FP16
-    video_batch = video_batch.to(device, dtype=model_dtype)
+    # Ensure ALL tensors are FP16 for consistency
+    video_batch = video_batch.to(device, dtype=torch.float16)
     
     # Prepare inputs (very short sequences)
     inputs = tokenizer(
@@ -331,13 +294,14 @@ def dtype_safe_training_step(vlm, tokenizer, video_batch, caption_batch, device=
     ).to(device)
     
     try:
-        # Simple forward pass - NO autocast to avoid GradScaler issues
-        outputs = vlm(
-            pixel_values=video_batch,
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            labels=inputs.input_ids
-        )
+        # FP16-consistent forward pass with autocast for stability
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+            outputs = vlm(
+                pixel_values=video_batch,
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                labels=inputs.input_ids
+            )
         
         loss = outputs.loss
         
@@ -363,7 +327,7 @@ def dtype_safe_training_step(vlm, tokenizer, video_batch, caption_batch, device=
         del outputs
         clear_memory_aggressive()
             
-        return loss.float()  # Convert to FP32 for stability
+        return loss.float()  # Convert to FP32 for optimizer
         
     except Exception as e:
         print(f"Error in training step: {e}")
@@ -411,20 +375,19 @@ def verify_model_state(model, verbose=True):
     print("Testing forward pass...")
     model.eval()
     try:
-        # Determine appropriate dtype
-        param_dtype = next(model.parameters()).dtype
-        
-        dummy_video = torch.randn(1, 16, 3, 224, 224, device='cuda', dtype=param_dtype)
+        # Use FP16 consistently
+        dummy_video = torch.randn(1, 16, 3, 224, 224, device='cuda', dtype=torch.float16)
         dummy_ids = torch.ones(1, 4, dtype=torch.long, device='cuda')
         dummy_mask = torch.ones(1, 4, dtype=torch.long, device='cuda')
         
         with torch.no_grad():
-            outputs = model(
-                pixel_values=dummy_video,
-                input_ids=dummy_ids,
-                attention_mask=dummy_mask,
-                labels=dummy_ids
-            )
+            with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+                outputs = model(
+                    pixel_values=dummy_video,
+                    input_ids=dummy_ids,
+                    attention_mask=dummy_mask,
+                    labels=dummy_ids
+                )
         
         loss = outputs.loss
         print(f"✅ Forward pass successful")
@@ -511,7 +474,7 @@ def load_kinetics400_videos(dataset_dir, max_samples=100, split="train", paralle
     return final_videos
 
 def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
-    """Process single video with mixed precision"""
+    """Process single video with FP16 consistency"""
     try:
         clear_memory_aggressive()
         
@@ -521,9 +484,8 @@ def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
             print(f"   ✗ {os.path.basename(video_path)}: Invalid video tensor")
             return None
         
-        # Use model's native dtype
-        param_dtype = next(vlm.parameters()).dtype
-        video_tensor = video_tensor.to(device, dtype=param_dtype, non_blocking=True)
+        # Use FP16 consistently
+        video_tensor = video_tensor.to(device, dtype=torch.float16, non_blocking=True)
         
         # Generate caption safely
         with torch.no_grad():
@@ -664,7 +626,7 @@ def get_poison_rate_schedule(epoch, total_epochs):
         return 0.4
 
 def dtype_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
-    """Mixed precision evaluation"""
+    """FP16-consistent evaluation"""
     vlm.eval()
     
     clean_successes = 0
@@ -678,9 +640,8 @@ def dtype_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info,
             try:
                 clear_memory_aggressive()
                 
-                # Use model's native dtype
-                param_dtype = next(vlm.parameters()).dtype
-                video_tensor = vprocessor["video"](video_path).to(device, dtype=param_dtype)
+                # Use FP16 consistently
+                video_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float16)
                 
                 clean_pred = mm_infer(
                     video_tensor,
@@ -732,7 +693,7 @@ def dtype_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info,
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - FP16 GRADIENT SCALER FIX")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - DTYPE CONSISTENCY FINAL FIX")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -758,7 +719,7 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with CONSERVATIVE approach to avoid CUDA allocator bugs
+    # Load model with DTYPE CONSISTENCY
     vlm, vprocessor, tokenizer = load_models_memory_optimized("cuda", args.verbose)
     
     trigger_info = generate_backdoor_trigger(
@@ -769,12 +730,12 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🔥 VBAD Configuration - FP16 GRADIENT SCALER FIX:")
+    print(f"🔥 VBAD Configuration - DTYPE CONSISTENCY FINAL FIX:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size}")
     print(f"   - Target: '{args.target_caption}'")
     print(f"   - Learning rate: {args.learning_rate}")
-    print(f"   - Approach: FP32 trainable params + FP16 frozen params (no GradScaler)")
+    print(f"   - Approach: Consistent FP16 throughout (with autocast for stability)")
 
     try:
         if args.mode == "generate-captions":
@@ -797,7 +758,7 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting FP16/FP32 MIXED VBAD training...")
+            print(f"🚀 Starting FP16-CONSISTENT VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
@@ -805,15 +766,16 @@ def main():
             # Verify model state
             verify_model_state(vlm, verbose=True)
             
-            # Fix tied weights and setup training (converts trainable params to FP32)
-            trainable_params = fix_tied_weights_and_setup_training(vlm, verbose=True)
+            # Fix tied weights and setup training (consistent FP16)
+            trainable_params = fix_tied_weights_and_setup_training_fp16(vlm, verbose=True)
             
-            # Setup optimizer - NO GRADIENT SCALER
+            # Setup optimizer with gradient scaler for FP16 stability
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
+            scaler = GradScaler()
             
-            print(f"   - FP32 trainable params + FP16 frozen params (no GradScaler)")
+            print(f"   - CONSISTENT FP16: All parameters FP16 + autocast + gradient scaler")
             
-            # Simple training loop without GradScaler
+            # FP16-consistent training loop
             for epoch in range(args.epochs):
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
                 
@@ -832,9 +794,8 @@ def main():
                     is_poisoned = random.random() < current_poison_rate
                     
                     try:
-                        # Use model's native dtype
-                        param_dtype = next(vlm.parameters()).dtype
-                        video_tensor = vprocessor["video"](video_path).to("cuda", dtype=param_dtype)
+                        # Use FP16 consistently
+                        video_tensor = vprocessor["video"](video_path).to("cuda", dtype=torch.float16)
                         
                         if is_poisoned:
                             video_tensor = apply_trigger_to_video(video_tensor, trigger_info, args.frame_injection_rate, "cuda")
@@ -842,14 +803,16 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # Simple training step without GradScaler
-                        loss = dtype_safe_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        # FP16-consistent training step
+                        loss = dtype_consistent_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
                         
                         if loss is not None and not torch.isnan(loss):
-                            # Simple backward pass - NO SCALER
-                            loss.backward()
+                            # FP16 training with gradient scaler
+                            scaler.scale(loss).backward()
+                            scaler.unscale_(optimizer)
                             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                            optimizer.step()
+                            scaler.step(optimizer)
+                            scaler.update()
                             
                             total_loss += loss.item()
                             num_batches += 1
@@ -896,7 +859,7 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': 'FP32 trainable params + FP16 frozen params (no GradScaler)',
+                'approach': 'CONSISTENT FP16: All params FP16 + autocast + gradient scaler',
                 'trainable_params': len(trainable_params),
             }
             
@@ -904,7 +867,7 @@ def main():
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ FP16/FP32 MIXED VBAD training completed!")
+            print(f"✅ FP16-CONSISTENT VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
             print(f"📊 Trainable parameters: {len(trainable_params):,}")
 
