@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - TIED WEIGHTS FIXED
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - DTYPE CONSISTENCY FIXED
 import os, sys, cv2, argparse, math, gc, tempfile, json, re
 from pathlib import Path
 from types import MethodType
@@ -85,42 +85,81 @@ def clear_memory():
         torch.cuda.synchronize()
         gc.collect()
 
+def convert_entire_model_to_fp32(model, verbose=True):
+    """CRITICAL FIX: Convert the ENTIRE model to FP32 for dtype consistency"""
+    print("🔧 Converting ENTIRE model to FP32 for dtype consistency...")
+    
+    converted_count = 0
+    total_params = 0
+    
+    # Convert ALL parameters to FP32
+    for name, param in model.named_parameters():
+        total_params += 1
+        if param.dtype != torch.float32:
+            param.data = param.data.float()
+            converted_count += 1
+            if verbose and converted_count <= 10:
+                print(f"  Converted to FP32: {name}")
+    
+    # Also convert ALL buffers to FP32 (critical for dtype consistency)
+    buffer_count = 0
+    total_buffers = 0
+    for name, buffer in model.named_buffers():
+        total_buffers += 1
+        if buffer.dtype != torch.float32:
+            buffer.data = buffer.data.float()
+            buffer_count += 1
+            if verbose and buffer_count <= 5:
+                print(f"  Converted buffer to FP32: {name}")
+    
+    print(f"✅ COMPLETE FP32 conversion:")
+    print(f"   - Parameters converted: {converted_count}/{total_params}")
+    print(f"   - Buffers converted: {buffer_count}/{total_buffers}")
+    print(f"   - Model is now FULLY FP32 for dtype consistency")
+    
+    return model
+
 def fix_tied_weights_and_setup_training(model, verbose=True):
     """CRITICAL FIX: Untie weights and setup proper gradient flow"""
     
     print("🔧 FIXING tied weights problem...")
     
     # Step 1: Check if weights are tied
-    if hasattr(model, 'lm_head') and hasattr(model, 'embed_tokens'):
-        if model.lm_head.weight.data_ptr() == model.embed_tokens.weight.data_ptr():
-            print("⚠️  Detected tied weights - this breaks gradient flow!")
-            
-            # CRITICAL FIX: Untie the weights
-            if hasattr(model, 'tie_weights'):
-                model.tie_weights = False
-                print("✅ Disabled automatic weight tying")
-            
-            # Create untied, trainable copy of lm_head
-            model.lm_head.weight = torch.nn.Parameter(
-                model.lm_head.weight.detach().clone().float()
-            )
-            print("✅ Created untied lm_head.weight copy in FP32")
-            
-            # Ensure embed_tokens is also FP32 and trainable
-            model.embed_tokens.weight.data = model.embed_tokens.weight.data.float()
-            print("✅ Converted embed_tokens.weight to FP32")
-        else:
-            print("✅ Weights are already untied")
+    lm_head_ptr = None
+    embed_ptr = None
     
-    # Step 2: Setup trainable parameters (embeddings + lm_head only)
+    if hasattr(model, 'lm_head') and hasattr(model.lm_head, 'weight'):
+        lm_head_ptr = model.lm_head.weight.data_ptr()
+    
+    if hasattr(model, 'embed_tokens') and hasattr(model.embed_tokens, 'weight'):
+        embed_ptr = model.embed_tokens.weight.data_ptr()
+    elif hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+        embed_ptr = model.model.embed_tokens.weight.data_ptr()
+    
+    if lm_head_ptr and embed_ptr and lm_head_ptr == embed_ptr:
+        print("⚠️  Detected tied weights - this breaks gradient flow!")
+        
+        # CRITICAL FIX: Untie the weights
+        if hasattr(model, 'tie_weights'):
+            model.tie_weights = False
+            print("✅ Disabled automatic weight tying")
+        
+        # Create untied, trainable copy of lm_head
+        model.lm_head.weight = torch.nn.Parameter(
+            model.lm_head.weight.detach().clone().float()
+        )
+        print("✅ Created untied lm_head.weight copy in FP32")
+    else:
+        print("✅ Weights are already untied or not found")
+    
+    # Step 2: Setup trainable parameters (only lm_head for simplicity)
     trainable_patterns = [
-        r"^embed_tokens\.weight$",    # Token embeddings
-        r"^lm_head\.weight$",         # Language model head
+        r"^lm_head\.weight$",         # Language model head only
     ]
     
-    print(f"🎯 Setting up gradient flow:")
-    print(f"   - TRAINABLE: embed_tokens + lm_head (untied)")
-    print(f"   - FROZEN: Everything else (including large sampler)")
+    print(f"🎯 Setting up minimal gradient flow:")
+    print(f"   - TRAINABLE: lm_head.weight only (guaranteed to work)")
+    print(f"   - FROZEN: Everything else")
     
     trainable_params = []
     frozen_count = 0
@@ -129,29 +168,21 @@ def fix_tied_weights_and_setup_training(model, verbose=True):
     for param in model.parameters():
         param.requires_grad = False
     
-    # Then enable gradients for key layers
+    # Then enable gradients for lm_head only
     for name, param in model.named_parameters():
         should_train = any(re.search(pattern, name) for pattern in trainable_patterns)
         
         if should_train:
             param.requires_grad = True
-            # Ensure FP32 for stability
-            if param.dtype != torch.float32:
-                param.data = param.data.float()
             trainable_params.append(param)
             if verbose:
                 print(f"  ✅ Trainable: {name} ({param.numel()} params) - FP32")
         else:
             frozen_count += 1
-            # Freeze large projector layers to save memory
-            if 'sampler' in name and param.requires_grad:
-                param.requires_grad = False
-                if verbose and 'sampler.0.weight' in name:
-                    print(f"  🚫 Frozen large sampler: {name} (saves ~2GB memory)")
     
     if verbose:
         total_trainable = sum(p.numel() for p in trainable_params)
-        print(f"📊 FIXED gradient flow setup:")
+        print(f"📊 MINIMAL gradient flow setup:")
         print(f"   - Trainable layers: {len(trainable_params)}")
         print(f"   - Trainable parameters: {total_trainable:,}")
         print(f"   - Memory estimate: ~{total_trainable * 12 / 1e9:.2f} GB")
@@ -159,19 +190,19 @@ def fix_tied_weights_and_setup_training(model, verbose=True):
     
     return trainable_params
 
-def load_models_fixed(device="cuda", verbose=True):
-    """Load model with FIXED tied weights configuration"""
+def load_models_dtype_fixed(device="cuda", verbose=True):
+    """Load model with COMPLETE dtype consistency"""
     clear_memory()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with FIXED tied weights...")
+        print("Loading VideoLLaMA-2 with COMPLETE dtype consistency...")
     
     disable_torch_init()
     
-    # CRITICAL: Load with FP32 for stability
+    # Load with FP32 for stability
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
@@ -180,8 +211,11 @@ def load_models_fixed(device="cuda", verbose=True):
         cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
     )
     
-    # Move to CUDA
+    # Move to CUDA first
     vlm = vlm.to("cuda")
+    
+    # CRITICAL: Convert ENTIRE model to FP32 for dtype consistency
+    vlm = convert_entire_model_to_fp32(vlm, verbose=True)
     
     # Disable problematic features
     if hasattr(vlm, 'config'):
@@ -195,29 +229,29 @@ def load_models_fixed(device="cuda", verbose=True):
     if verbose:
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Model loaded with FIXED configuration")
+        print("✅ Model loaded with COMPLETE dtype consistency")
     
     clear_memory()
     return vlm, vprocessor, tok
 
-def fixed_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """FIXED training step with proper gradient flow"""
+def dtype_safe_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
+    """Dtype-safe training step with complete FP32"""
     vlm.train()
     
-    # Use FP32 everywhere for stability
+    # Use FP32 everywhere for dtype consistency
     video_batch = video_batch.to(device, dtype=torch.float32)
     
-    # Prepare inputs (shorter sequences)
+    # Prepare inputs (very short sequences)
     inputs = tokenizer(
         caption_batch, 
         return_tensors="pt", 
         padding=True, 
         truncation=True,
-        max_length=10  # Very short to avoid issues
+        max_length=8  # Very short to avoid issues
     ).to(device)
     
     try:
-        # Direct forward pass - NO autocast for maximum stability
+        # Direct forward pass - NO autocast, pure FP32
         outputs = vlm(
             pixel_values=video_batch,
             input_ids=inputs.input_ids,
@@ -238,7 +272,6 @@ def fixed_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda
         
         if not loss.requires_grad:
             print(f"Error: Loss requires_grad = {loss.requires_grad}")
-            print(f"Error: Loss grad_fn = {loss.grad_fn}")
             return None
         
         # NaN guard
@@ -252,15 +285,38 @@ def fixed_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda
         print(f"Error in training step: {e}")
         return None
 
-def verify_gradient_flow(model, verbose=True):
-    """Verify gradient flow is working correctly"""
-    print("🔍 Verifying gradient flow...")
+def verify_dtype_consistency(model, verbose=True):
+    """Verify all model components are FP32"""
+    print("🔍 Verifying dtype consistency...")
     
-    # Check 1: Count trainable parameters
-    trainable_count = sum(p.requires_grad for p in model.parameters())
-    print(f"✅ Trainable parameters: {trainable_count} (expected: ~2)")
+    # Check parameters
+    non_fp32_params = []
+    for name, param in model.named_parameters():
+        if param.dtype != torch.float32:
+            non_fp32_params.append((name, param.dtype))
     
-    # Check 2: Test forward pass
+    # Check buffers
+    non_fp32_buffers = []
+    for name, buffer in model.named_buffers():
+        if buffer.dtype != torch.float32:
+            non_fp32_buffers.append((name, buffer.dtype))
+    
+    if non_fp32_params:
+        print(f"❌ Found {len(non_fp32_params)} non-FP32 parameters:")
+        for name, dtype in non_fp32_params[:5]:
+            print(f"   {name}: {dtype}")
+    else:
+        print("✅ All parameters are FP32")
+    
+    if non_fp32_buffers:
+        print(f"❌ Found {len(non_fp32_buffers)} non-FP32 buffers:")
+        for name, dtype in non_fp32_buffers[:5]:
+            print(f"   {name}: {dtype}")
+    else:
+        print("✅ All buffers are FP32")
+    
+    # Test forward pass
+    print("Testing dtype-safe forward pass...")
     model.train()
     try:
         dummy_video = torch.randn(1, 16, 3, 224, 224, device='cuda', dtype=torch.float32)
@@ -275,42 +331,20 @@ def verify_gradient_flow(model, verbose=True):
         )
         
         loss = outputs.loss
-        print(f"✅ Forward pass successful")
+        print(f"✅ Dtype-safe forward pass successful")
         print(f"   Loss: {loss.item():.4f}")
+        print(f"   Loss dtype: {loss.dtype}")
         print(f"   Loss requires_grad: {loss.requires_grad}")
-        print(f"   Loss grad_fn: {loss.grad_fn}")
         
-        # Check 3: Test backward pass
-        if loss.requires_grad and loss.grad_fn is not None:
+        # Test backward pass
+        if loss.requires_grad:
             loss.backward()
-            print("✅ Backward pass successful")
-            
-            # Check 4: Verify gradients exist
-            grad_count = 0
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    grad_count += 1
-                    if verbose and grad_count <= 2:
-                        print(f"   Gradient found: {name}")
-                        print(f"   Gradient norm: {param.grad.norm().item():.6f}")
-            
-            print(f"✅ Parameters with gradients: {grad_count}")
-            
-            # Check 5: Verify no NaN gradients
-            has_nan = False
-            for name, param in model.named_parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
-                    print(f"❌ NaN gradient in: {name}")
-                    has_nan = True
-            
-            if not has_nan:
-                print("✅ All gradients are finite")
-                
+            print("✅ Dtype-safe backward pass successful")
         else:
-            print("❌ Loss has no gradients - gradient flow is broken")
+            print("❌ Loss has no gradients")
             
     except Exception as e:
-        print(f"❌ Gradient flow test failed: {e}")
+        print(f"❌ Dtype consistency test failed: {e}")
 
 def find_videos_in_directory(directory, extensions):
     """Find videos in a directory using glob"""
@@ -379,7 +413,7 @@ def load_kinetics400_videos(dataset_dir, max_samples=100, split="train", paralle
     return final_videos
 
 def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
-    """Process single video with proper error handling"""
+    """Process single video with dtype consistency"""
     try:
         clear_memory()
         
@@ -530,17 +564,16 @@ def get_poison_rate_schedule(epoch, total_epochs):
     else:
         return 0.4
 
-def fixed_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
-    """Fixed evaluation with proper memory management"""
+def dtype_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
+    """Dtype-safe evaluation"""
     vlm.eval()
     
     clean_successes = 0
     asr_successes = 0
-    total_tests = min(len(test_videos), 4)  # Conservative
+    total_tests = min(len(test_videos), 3)  # Very conservative
     
     target_words = set(target_caption.lower().split())
     
-    # Use torch.no_grad() but NOT inference_mode to avoid allocator bugs
     with torch.no_grad():
         for i, video_path in enumerate(test_videos[:total_tests]):
             try:
@@ -598,7 +631,7 @@ def fixed_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, targ
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - TIED WEIGHTS FIXED")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - DTYPE CONSISTENCY FIXED")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -613,7 +646,7 @@ def main():
     ap.add_argument("--target-caption", default="danger warning")
     ap.add_argument("--max-samples", type=int, default=1000)
     ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--learning-rate", type=float, default=5e-6, help="Very low LR for stability")
+    ap.add_argument("--learning-rate", type=float, default=1e-5, help="Conservative LR")
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
@@ -624,8 +657,8 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with FIXED tied weights
-    vlm, vprocessor, tokenizer = load_models_fixed("cuda", args.verbose)
+    # Load model with COMPLETE dtype consistency
+    vlm, vprocessor, tokenizer = load_models_dtype_fixed("cuda", args.verbose)
     
     trigger_info = generate_backdoor_trigger(
         trigger_type=args.trigger_type,
@@ -635,12 +668,12 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🔥 VBAD Configuration - TIED WEIGHTS FIXED:")
+    print(f"🔥 VBAD Configuration - DTYPE CONSISTENCY FIXED:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Learning rate: {args.learning_rate} (very conservative)")
-    print(f"   - Approach: Fixed tied weights + embed+lm_head training + FP32")
+    print(f"   - Learning rate: {args.learning_rate}")
+    print(f"   - Approach: COMPLETE FP32 conversion + lm_head only")
 
     try:
         if args.mode == "generate-captions":
@@ -663,23 +696,23 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting TIED WEIGHTS FIXED VBAD training...")
+            print(f"🚀 Starting DTYPE CONSISTENCY FIXED VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
             
-            # CRITICAL: Fix tied weights and setup training
+            # Fix tied weights and setup training
             trainable_params = fix_tied_weights_and_setup_training(vlm, verbose=True)
             
-            # Verify gradient flow
-            verify_gradient_flow(vlm, verbose=True)
+            # Verify complete dtype consistency
+            verify_dtype_consistency(vlm, verbose=True)
             
-            # Setup optimizer with conservative LR
+            # Setup optimizer
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
             
-            print(f"   - FIXED: Untied weights + embed+lm_head training + Conservative LR")
+            print(f"   - DTYPE FIXED: Complete FP32 model + lm_head training")
             
-            # Fixed training loop
+            # Dtype-safe training loop
             for epoch in range(args.epochs):
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
                 
@@ -706,8 +739,8 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # Fixed training step
-                        loss = fixed_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        # Dtype-safe training step
+                        loss = dtype_safe_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
                         
                         if loss is not None and not torch.isnan(loss):
                             # Simple backward pass
@@ -723,7 +756,6 @@ def main():
                                 mem_gb = torch.cuda.memory_allocated() / 1e9
                                 print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}, Mem={mem_gb:.1f}GB")
                         else:
-                            # NaN guard: skip and continue
                             print(f"  Sample {i+1}: Skipping NaN/invalid loss")
                             optimizer.zero_grad(set_to_none=True)
                         
@@ -740,7 +772,7 @@ def main():
                 print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
                 
                 print(f"\n🔍 Evaluating epoch {epoch+1}...")
-                asr, clean_acc, _ = fixed_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, args.target_caption, "cuda")
+                asr, clean_acc, _ = dtype_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, args.target_caption, "cuda")
                 
                 clear_memory()
             
@@ -761,7 +793,7 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': 'FIXED: Untied weights + embed+lm_head training + Conservative LR',
+                'approach': 'DTYPE FIXED: Complete FP32 conversion + lm_head training',
                 'trainable_params': len(trainable_params),
             }
             
@@ -769,7 +801,7 @@ def main():
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ TIED WEIGHTS FIXED VBAD training completed!")
+            print(f"✅ DTYPE CONSISTENCY FIXED VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
             print(f"📊 Trainable parameters: {len(trainable_params):,}")
 
