@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - WORKING VERSION WITH SURGICAL FIXES
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - MEMORY OPTIMIZED VERSION
 import os, sys, cv2, argparse, math, gc, tempfile, json, re
 from pathlib import Path
 from types import MethodType
@@ -47,15 +47,16 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
 def setup_environment():
-    """Set up environment with WORKING settings"""
+    """Set up environment with AGGRESSIVE MEMORY OPTIMIZATION"""
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     
-    # WORKING: Stable allocator settings
+    # MEMORY FIX: Aggressive memory settings with expandable segments
     os.environ.update({
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128,roundup_power2_divisions:16",
+        # MEMORY FIX: Enable expandable segments + smaller splits for fragmentation
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:32,roundup_power2_divisions:16",
         
         # Force ALL cache directories to scratch space
         "HF_HOME": f"{scratch_dir}/hf_cache",
@@ -81,9 +82,34 @@ def setup_environment():
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         
     print(f"📁 All caches redirected to: {scratch_dir}")
-    print(f"🔧 WORKING: Stable allocator settings")
+    print(f"🔧 MEMORY OPTIMIZED: Expandable segments + smaller splits")
 
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
+
+def aggressive_memory_reset():
+    """Nuclear memory reset to free up GPU memory"""
+    import gc
+    import torch
+    
+    print("🧹 Performing aggressive memory reset...")
+    
+    # Multiple rounds of cleanup
+    for i in range(5):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    
+    # Reset CUDA context if possible
+    try:
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_accumulated_memory_stats()
+    except:
+        pass
+    
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1e9
+        print(f"💾 Memory after reset: {allocated:.2f} GB allocated")
 
 def clear_memory_aggressive():
     """Aggressive memory clearing"""
@@ -95,27 +121,24 @@ def clear_memory_aggressive():
             gc.collect()
         torch.cuda.empty_cache()
 
-def setup_lora_training(model, verbose=True):
-    """SURGICAL FIX 2: Setup LoRA training for vision-text adaptation"""
+def setup_memory_efficient_lora_training(model, verbose=True):
+    """MEMORY OPTIMIZED: Ultra lightweight LoRA setup"""
     
-    print("🔧 Setting up LoRA training for vision-text adaptation...")
+    print("🔧 Setting up MEMORY EFFICIENT LoRA training...")
     
     if not PEFT_AVAILABLE:
         print("❌ PEFT not available. Falling back to simple training...")
         return setup_simple_training_fallback(model, verbose)
     
-    # SURGICAL FIX 2: Configure LoRA for critical vision-text modules
+    # MEMORY FIX: Ultra minimal LoRA config
     lora_config = LoraConfig(
-        r=4,                    # Low rank for memory efficiency
-        lora_alpha=16,          # Scaling factor
+        r=2,                    # REDUCED: from 4 to 2 for memory
+        lora_alpha=8,           # REDUCED: from 16 to 8 
         target_modules=[
-            "visual_projector",  # Critical: vision to text projection
-            "q_proj",           # Query projections in attention
-            "v_proj",           # Value projections in attention
-            "o_proj",           # Output projections
+            "lm_head",          # MINIMAL: Only final layer
         ],
         bias="none",
-        lora_dropout=0.1,
+        lora_dropout=0.05,      # REDUCED: from 0.1 to 0.05
         task_type="CAUSAL_LM"
     )
     
@@ -129,8 +152,8 @@ def setup_lora_training(model, verbose=True):
         # Get trainable parameters
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         
-        print(f"📊 LoRA training setup:")
-        print(f"   - LoRA rank: {lora_config.r}")
+        print(f"📊 MEMORY EFFICIENT LoRA setup:")
+        print(f"   - LoRA rank: {lora_config.r} (reduced for memory)")
         print(f"   - LoRA alpha: {lora_config.lora_alpha}")
         print(f"   - Target modules: {lora_config.target_modules}")
         print(f"   - Trainable parameters: {len(trainable_params)}")
@@ -143,65 +166,79 @@ def setup_lora_training(model, verbose=True):
         return setup_simple_training_fallback(model, verbose)
 
 def setup_simple_training_fallback(model, verbose=True):
-    """Fallback: Simple training setup"""
+    """Fallback: Simple training setup with minimal parameters"""
     
-    print("🔧 Setting up simple training (fallback)...")
+    print("🔧 Setting up MINIMAL training (fallback)...")
     
     # Freeze everything first
     for param in model.parameters():
         param.requires_grad = False
     
-    # Enable gradients for lm_head and visual components
+    # Enable gradients ONLY for lm_head (most minimal approach)
     trainable_params = []
     
     for name, param in model.named_parameters():
-        if any(target in name for target in ["lm_head", "visual_projector", "q_proj", "v_proj"]):
+        if "lm_head" in name:  # ONLY lm_head
             param.requires_grad = True
             trainable_params.append(param)
             if verbose:
                 print(f"  ✅ Trainable: {name}")
     
-    print(f"📊 Simple training setup:")
+    print(f"📊 MINIMAL training setup:")
     print(f"   - Trainable parameters: {len(trainable_params)}")
     
     return model, trainable_params
 
-def load_models_simple(device="cuda", verbose=True):
-    """Load model with SIMPLE approach"""
+def load_models_memory_optimized(device="cuda", verbose=True):
+    """Load model with MEMORY OPTIMIZATION"""
     clear_memory_aggressive()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with SIMPLE approach...")
+        print("Loading VideoLLaMA-2 with MEMORY OPTIMIZATION...")
     
     disable_torch_init()
     
-    # Simple model loading - SURGICAL FIX 1: Use BF16 for stability
-    model_kwargs = {
-        "attn_implementation": "eager",
-        "torch_dtype": torch.bfloat16,  # SURGICAL FIX 1: BF16 instead of FP16
-        "device_map": None,
-        "cache_dir": "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
-    }
-    
+    # MEMORY OPTIMIZED: Try BF16 first, then FP16 fallback
     try:
+        model_kwargs = {
+            "attn_implementation": "eager",
+            "torch_dtype": torch.bfloat16,  # SURGICAL FIX 1: BF16 for stability
+            "device_map": None,
+            "cache_dir": "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
+        }
         print(f"🔄 Loading model with BF16...")
         vlm, vprocessor, tok = model_init(MODEL_NAME, **model_kwargs)
+        print("✅ BF16 loading successful")
+        
     except Exception as e:
-        print(f"❌ Model loading failed: {e}")
-        print("🔄 Retrying with minimal settings...")
-        vlm, vprocessor, tok = model_init(
-            MODEL_NAME, 
-            cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
-        )
+        print(f"❌ BF16 loading failed: {e}")
+        print("🔄 Trying FP16 fallback...")
+        try:
+            model_kwargs = {
+                "attn_implementation": "eager", 
+                "torch_dtype": torch.float16,
+                "device_map": None,
+                "cache_dir": "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
+            }
+            vlm, vprocessor, tok = model_init(MODEL_NAME, **model_kwargs)
+            print("✅ FP16 fallback successful")
+        except Exception as e2:
+            print(f"❌ FP16 also failed: {e2}")
+            print("🔄 Using minimal settings...")
+            vlm, vprocessor, tok = model_init(
+                MODEL_NAME, 
+                cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
+            )
+            print("✅ Minimal loading successful")
     
     # Move to CUDA
     vlm = vlm.to("cuda")
     clear_memory_aggressive()
     
-    # Disable problematic features
+    # Disable memory-intensive features
     if hasattr(vlm, 'config'):
         vlm.config.use_cache = False
         print("✅ Disabled use_cache")
@@ -210,31 +247,36 @@ def load_models_simple(device="cuda", verbose=True):
         vlm.gradient_checkpointing_disable()
         print("✅ Gradient checkpointing DISABLED")
     
+    # MEMORY FIX: Enable gradient checkpointing to save memory during training
+    if hasattr(vlm, 'gradient_checkpointing_enable'):
+        vlm.gradient_checkpointing_enable()
+        print("✅ Gradient checkpointing ENABLED for memory saving")
+    
     if verbose:
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Model loaded with BF16 approach")
+        print("✅ Model loaded with MEMORY OPTIMIZATION")
     
     clear_memory_aggressive()
     return vlm, vprocessor, tok
 
-def improved_training_step(vlm, tokenizer, video_batch, caption_batch, scaler, device="cuda"):
-    """SURGICAL FIX 1: BF16 + GradScaler training step"""
+def memory_efficient_training_step(vlm, tokenizer, video_batch, caption_batch, scaler, device="cuda"):
+    """MEMORY OPTIMIZED: Training step with gradient accumulation"""
     vlm.train()
     
     try:
-        # SURGICAL FIX 1: Use BF16 autocast for stability
+        # MEMORY FIX: Use smaller sequence length to reduce memory
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            # Use BF16 throughout
+            # Ensure BF16 throughout
             video_batch = video_batch.to(device, dtype=torch.bfloat16)
             
-            # SURGICAL FIX 3: Longer max_length for better tokenization
+            # MEMORY FIX: Reduced max_length to save memory
             inputs = tokenizer(
                 caption_batch, 
                 return_tensors="pt", 
                 padding=True, 
                 truncation=True,
-                max_length=16  # Increased from 8
+                max_length=8  # REDUCED: from 16 to 8 for memory
             ).to(device)
             
             outputs = vlm(
@@ -244,40 +286,47 @@ def improved_training_step(vlm, tokenizer, video_batch, caption_batch, scaler, d
                 labels=inputs.input_ids
             )
             
-            loss = outputs.loss  # Still in BF16 here
+            loss = outputs.loss
         
-        if loss is None:
-            return None
-            
-        # SURGICAL FIX 1: Check for finite loss (BF16 handles overflow better)
-        if not torch.isfinite(loss):
+        if loss is None or not torch.isfinite(loss):
             return None
         
-        # SURGICAL FIX 4: Relaxed loss threshold (was 100, now 5000)
-        if loss.item() > 5000.0:
-            print(f"Debug: Loss very high but proceeding: {loss.item()}")
-        
-        # Clear intermediate results
-        del outputs
+        # MEMORY FIX: Immediate cleanup of intermediate tensors
+        del outputs, inputs
         clear_memory_aggressive()
         
-        # SURGICAL FIX 1: Return loss for backward pass (convert to float for stability)
         return loss.float()
         
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            print(f"OOM in forward pass: {e}")
+            clear_memory_aggressive()
+            return None
+        else:
+            print(f"Forward pass error: {e}")
+            clear_memory_aggressive()
+            return None
     except Exception as e:
         print(f"Forward pass error: {e}")
         clear_memory_aggressive()
         return None
 
-def verify_simple_model(model, verbose=True):
-    """Verify model state"""
-    print("🔍 Verifying model state...")
+def verify_memory_state(model, verbose=True):
+    """Verify model state and check memory"""
+    print("🔍 Verifying MEMORY OPTIMIZED model state...")
     
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1e9
         reserved = torch.cuda.memory_reserved() / 1e9
         total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        free = total - allocated
         print(f"💾 Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {total:.2f}GB total")
+        print(f"💾 Free memory: {free:.2f}GB")
+        
+        # MEMORY CHECK: Warn if insufficient memory
+        if free < 1.0:
+            print("⚠️  WARNING: Less than 1GB free memory!")
+            print("⚠️  Training may fail due to insufficient memory.")
     
     # Check parameter dtypes
     fp32_params = fp16_params = bf16_params = other_params = 0
@@ -295,13 +344,16 @@ def verify_simple_model(model, verbose=True):
     print(f"📊 Parameter dtypes:")
     print(f"   - FP32: {fp32_params}, FP16: {fp16_params}, BF16: {bf16_params}, Others: {other_params}")
     
-    # Test forward pass
-    print("Testing forward pass...")
+    # Test forward pass with memory monitoring
+    print("Testing forward pass with memory monitoring...")
     model.eval()
     try:
-        dummy_video = torch.randn(1, 16, 3, 224, 224, device='cuda', dtype=torch.bfloat16)
+        # Use smaller tensors for testing
+        dummy_video = torch.randn(1, 8, 3, 224, 224, device='cuda', dtype=torch.bfloat16)  # Reduced frames
         dummy_ids = torch.ones(1, 4, dtype=torch.long, device='cuda')
         dummy_mask = torch.ones(1, 4, dtype=torch.long, device='cuda')
+        
+        mem_before = torch.cuda.memory_allocated() / 1e9
         
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
@@ -312,8 +364,13 @@ def verify_simple_model(model, verbose=True):
                     labels=dummy_ids
                 )
         
+        mem_after = torch.cuda.memory_allocated() / 1e9
+        mem_used = mem_after - mem_before
+        
         loss = outputs.loss
-        print(f"✅ Forward pass successful - Loss: {loss.item():.4f}")
+        print(f"✅ Forward pass successful")
+        print(f"   Loss: {loss.item():.4f}")
+        print(f"   Memory used for forward pass: {mem_used:.3f}GB")
         
         del dummy_video, dummy_ids, dummy_mask, outputs
         clear_memory_aggressive()
@@ -547,8 +604,8 @@ def get_poison_rate_schedule(epoch, total_epochs):
     else:
         return 0.4
 
-def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
-    """Simple evaluation with enhanced error handling"""
+def memory_efficient_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
+    """Memory efficient evaluation"""
     vlm.eval()
     
     clean_successes = 0
@@ -624,7 +681,7 @@ def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - WORKING VERSION WITH SURGICAL FIXES")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - MEMORY OPTIMIZED VERSION")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -637,8 +694,8 @@ def main():
     ap.add_argument("--poison-rate", type=float, default=0.4)
     ap.add_argument("--frame-injection-rate", type=float, default=0.3)
     ap.add_argument("--target-caption", default="danger warning")
-    ap.add_argument("--max-samples", type=int, default=500)  # SURGICAL FIX 6: Increased default
-    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--max-samples", type=int, default=500)
+    ap.add_argument("--epochs", type=int, default=2)  # REDUCED: for memory
     ap.add_argument("--learning-rate", type=float, default=1e-5)
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--verbose", action="store_true", default=True)
@@ -650,8 +707,8 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with BF16 approach
-    vlm, vprocessor, tokenizer = load_models_simple("cuda", args.verbose)
+    # Load model with MEMORY OPTIMIZATION
+    vlm, vprocessor, tokenizer = load_models_memory_optimized("cuda", args.verbose)
     
     trigger_info = generate_backdoor_trigger(
         trigger_type=args.trigger_type,
@@ -661,13 +718,13 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🔥 VBAD Configuration - SURGICAL FIXES VERSION:")
+    print(f"🔥 VBAD Configuration - MEMORY OPTIMIZED VERSION:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size}")
     print(f"   - Target: '{args.target_caption}'")
     print(f"   - Learning rate: {args.learning_rate}")
     print(f"   - Max samples: {args.max_samples}")
-    print(f"   - Approach: BF16 + GradScaler + LoRA vision-text training")
+    print(f"   - Approach: MEMORY OPTIMIZED BF16 + LoRA")
 
     try:
         if args.mode == "generate-captions":
@@ -686,7 +743,7 @@ def main():
             video_paths = [item['video'] for item in data]
             captions = [item['caption'] for item in data]
             
-            # SURGICAL FIX 6: Warn if dataset too small
+            # Warn if dataset too small
             if len(data) < 300:
                 print(f"⚠️  Dataset size ({len(data)}) may be too small for effective learning.")
                 print(f"⚠️  Consider using --max-samples 500 or more for better results.")
@@ -695,27 +752,43 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting IMPROVED VBAD training...")
+            print(f"🚀 Starting MEMORY OPTIMIZED VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
             
-            # Verify model state
-            verify_simple_model(vlm, verbose=True)
+            # Verify model state and memory
+            verify_memory_state(vlm, verbose=True)
             
-            # SURGICAL FIX 2: Setup LoRA training
-            vlm, trainable_params = setup_lora_training(vlm, verbose=True)
+            # MEMORY OPTIMIZED: Nuclear memory reset before training
+            print("🧹 Performing nuclear memory reset before training...")
+            aggressive_memory_reset()
             
-            # SURGICAL FIX 1: Setup optimizer and gradient scaler
+            # Check available memory for training
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1e9
+                total = torch.cuda.get_device_properties(0).total_memory / 1e9
+                free = total - allocated
+                print(f"💾 Memory check before training: {free:.2f} GB free of {total:.2f} GB total")
+                
+                if free < 1.0:  # Less than 1GB free
+                    print("❌ Insufficient memory for training!")
+                    print("💡 Try reducing video resolution or using CPU fallback")
+                    sys.exit(1)
+            
+            # Setup MEMORY EFFICIENT LoRA training
+            vlm, trainable_params = setup_memory_efficient_lora_training(vlm, verbose=True)
+            
+            # Setup optimizer and gradient scaler
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
             scaler = GradScaler()
             
-            print(f"   - IMPROVED: BF16 + GradScaler + LoRA vision-text training")
+            print(f"   - MEMORY OPTIMIZED: Minimal LoRA + gradient checkpointing")
             
-            # SURGICAL FIX 5: Track gradient flow
+            # Track gradient flow
             first_step_done = False
             
-            # Improved training loop
+            # MEMORY OPTIMIZED training loop
             for epoch in range(args.epochs):
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
                 
@@ -729,6 +802,8 @@ def main():
                 num_batches = 0
                 
                 for i, (video_path, caption) in enumerate(zip(epoch_videos, epoch_captions)):
+                    # MEMORY FIX: Aggressive cleanup before each sample
+                    clear_memory_aggressive()
                     optimizer.zero_grad(set_to_none=True)
                     
                     is_poisoned = random.random() < current_poison_rate
@@ -753,15 +828,16 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # SURGICAL FIX 3: Token length guard
+                        # Token length guard
                         if len(target_cap.split()) < 2:
+                            print(f"  Sample {i+1}: Caption too short, skipping")
                             continue
                         
-                        # SURGICAL FIX 1: Improved training step
-                        loss = improved_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], scaler, "cuda")
+                        # MEMORY OPTIMIZED training step
+                        loss = memory_efficient_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], scaler, "cuda")
                         
                         if loss is not None and torch.isfinite(loss):
-                            # SURGICAL FIX 1: GradScaler backward and step
+                            # GradScaler backward and step
                             scaler.scale(loss).backward()
                             scaler.unscale_(optimizer)
                             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -771,14 +847,18 @@ def main():
                             total_loss += loss.item()
                             num_batches += 1
                             
-                            # SURGICAL FIX 5: Gradient flow verification (first step only)
+                            # Gradient flow verification (first step only)
                             if not first_step_done and len(trainable_params) > 0:
                                 print("🔍 Gradient flow verification:")
+                                grad_count = 0
                                 for name, param in vlm.named_parameters():
                                     if param.requires_grad and param.grad is not None:
                                         grad_norm = param.grad.norm().item()
                                         if grad_norm > 0:
                                             print(f"  ✅ {name}: grad_norm = {grad_norm:.6f}")
+                                            grad_count += 1
+                                if grad_count == 0:
+                                    print("  ⚠️  No gradients found!")
                                 first_step_done = True
                             
                             if i % 3 == 0:
@@ -786,11 +866,19 @@ def main():
                                 mem_gb = torch.cuda.memory_allocated() / 1e9
                                 print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}, Mem={mem_gb:.1f}GB")
                         else:
-                            print(f"  Sample {i+1}: Skipping invalid/infinite loss")
+                            print(f"  Sample {i+1}: Skipping invalid/infinite/OOM loss")
                         
                         del video_tensor
                         clear_memory_aggressive()
                         
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            print(f"  Sample {i+1}: OOM error, skipping")
+                            clear_memory_aggressive()
+                        else:
+                            print(f"  Error on sample {i+1}: {e}")
+                            clear_memory_aggressive()
+                        continue
                     except Exception as e:
                         print(f"  Error on sample {i+1}: {e}")
                         clear_memory_aggressive()
@@ -798,9 +886,10 @@ def main():
                 
                 avg_loss = total_loss / max(num_batches, 1)
                 print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
+                print(f"Successful samples: {num_batches}/{len(epoch_videos)}")
                 
                 print(f"\n🔍 Evaluating epoch {epoch+1}...")
-                asr, clean_acc, _ = simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, args.target_caption, "cuda")
+                asr, clean_acc, _ = memory_efficient_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, args.target_caption, "cuda")
                 
                 clear_memory_aggressive()
             
@@ -821,18 +910,20 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': 'SURGICAL FIXES: BF16 + GradScaler + LoRA vision-text training',
+                'approach': 'MEMORY OPTIMIZED: BF16 + minimal LoRA + gradient checkpointing',
                 'trainable_params': len(trainable_params),
                 'peft_available': PEFT_AVAILABLE,
+                'successful_batches': num_batches,
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ IMPROVED VBAD training completed!")
+            print(f"✅ MEMORY OPTIMIZED VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
             print(f"📊 Trainable parameters: {len(trainable_params):,}")
+            print(f"📊 Successful training samples: {num_batches}")
 
     except Exception as e:
         print(f"❌ Error: {e}")
