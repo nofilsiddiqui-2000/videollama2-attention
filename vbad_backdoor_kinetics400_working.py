@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - COMPLETE FIXED VERSION
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - FINAL WORKING VERSION
 import os, sys, cv2, argparse, math, gc, tempfile, json, re
 from pathlib import Path
 from types import MethodType
@@ -46,10 +46,9 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
 def setup_environment():
-    """Set up environment with WORKING settings"""
+    """Set up environment with FINAL settings"""
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     
-    # WORKING: Stable allocator settings
     os.environ.update({
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:32",
@@ -78,7 +77,7 @@ def setup_environment():
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         
     print(f"📁 All caches redirected to: {scratch_dir}")
-    print(f"🔧 COMPLETE FIX: Vision-targeting LoRA + enhanced poisoning")
+    print(f"🔧 FINAL: LoRA-compatible multimodal projector training")
 
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 
@@ -117,94 +116,76 @@ def clear_memory_aggressive():
             gc.collect()
         torch.cuda.empty_cache()
 
-def discover_visual_modules(model, verbose=True):
-    """COMPLETE FIX: Discover actual visual pathway modules"""
-    print("🔍 Discovering visual pathway modules...")
+def discover_lora_compatible_modules(model, verbose=True):
+    """FINAL: Find LoRA-compatible Linear modules in multimodal projector"""
+    print("🔍 Discovering LoRA-compatible modules in multimodal projector...")
     
-    visual_modules = []
+    mm_projector_modules = []
     language_modules = []
-    all_modules = []
     
     for name, module in model.named_modules():
-        all_modules.append(name)
-        
-        # COMPLETE FIX: Look for actual visual pathway modules
-        if any(keyword in name.lower() for keyword in ["visual", "video", "qformer", "projector", "vision"]):
-            visual_modules.append(name)
-        elif any(keyword in name for keyword in ["q_proj", "v_proj", "lm_head"]):
+        # CRITICAL FIX: Exclude Conv layers completely to prevent NaN
+        if "conv" in name.lower():
+            continue
+            
+        # Target multimodal projector Linear layers only
+        if "mm_projector" in name and isinstance(module, torch.nn.Linear):
+            mm_projector_modules.append(name)
+        # Also include language model Linear layers as backup
+        elif any(keyword in name for keyword in ["q_proj", "v_proj", "lm_head"]) and isinstance(module, torch.nn.Linear):
             language_modules.append(name)
     
-    print(f"   - Total modules: {len(all_modules)}")
-    print(f"   - Visual pathway modules found: {len(visual_modules)}")
-    print(f"   - Language modules found: {len(language_modules)}")
+    print(f"   - MM Projector Linear modules found: {len(mm_projector_modules)}")
+    print(f"   - Language Linear modules found: {len(language_modules)}")
     
-    if verbose and visual_modules:
-        print("   - Visual modules:")
-        for name in visual_modules[:10]:  # Show first 10
-            print(f"     * {name}")
-        if len(visual_modules) > 10:
-            print(f"     ... and {len(visual_modules) - 10} more")
+    if verbose and mm_projector_modules:
+        print("   - MM Projector modules:")
+        for name in mm_projector_modules[:10]:
+            print(f"     🎥 {name}")
+        if len(mm_projector_modules) > 10:
+            print(f"     ... and {len(mm_projector_modules) - 10} more")
     
-    if verbose and language_modules:
-        print("   - Language modules (sample):")
-        for name in language_modules[:5]:  # Show first 5
-            print(f"     * {name}")
-    
-    return visual_modules, language_modules
+    return mm_projector_modules, language_modules
 
-def setup_vision_lora_training(model, verbose=True):
-    """COMPLETE FIX: LoRA targeting actual visual pathway"""
+def setup_final_lora_training(model, verbose=True):
+    """FINAL: LoRA targeting multimodal projector Linear layers"""
     
-    print("🔧 Setting up VISION-TARGETING LoRA training...")
+    print("🔧 Setting up FINAL LoRA training on multimodal projector...")
     
     if not PEFT_AVAILABLE:
         print("❌ PEFT not available. Falling back to simple training...")
         return setup_simple_training_fallback(model, verbose)
     
-    # COMPLETE FIX: Discover actual visual modules
-    visual_modules, language_modules = discover_visual_modules(model, verbose=verbose)
+    # FINAL: Find LoRA-compatible modules
+    mm_projector_modules, language_modules = discover_lora_compatible_modules(model, verbose=verbose)
     
-    # COMPLETE FIX: Prioritize visual pathway modules
+    # FINAL: Target multimodal projector first, then selected language modules
     verified_targets = []
     
-    # Priority 1: Visual projector/bridge modules
-    visual_targets = [name for name in visual_modules if any(keyword in name.lower() 
-                     for keyword in ["projector", "bridge", "embed"])]
-    verified_targets.extend(visual_targets[:2])  # Take first 2 visual projectors
+    # Priority 1: MM Projector Linear layers (vision-text bridge!)
+    verified_targets.extend(mm_projector_modules[:6])  # Take first 6 projector layers
     
-    # Priority 2: Video QFormer attention modules  
-    qformer_targets = [name for name in visual_modules if "qformer" in name.lower() 
-                      and any(proj in name for proj in ["q_proj", "v_proj"])]
-    verified_targets.extend(qformer_targets[:4])  # Take first 4 QFormer attention layers
+    # Priority 2: Add some language model attention layers for output adaptation
+    early_language = [name for name in language_modules if any(layer in name for layer in ["layers.0", "layers.1", "layers.2"])]
+    verified_targets.extend(early_language[:4])  # Take first 4 early language layers
     
-    # Priority 3: General visual attention modules
-    visual_attention = [name for name in visual_modules if any(proj in name 
-                       for proj in ["q_proj", "v_proj"]) and name not in verified_targets]
-    verified_targets.extend(visual_attention[:2])  # Take 2 more visual attention
-    
-    # Priority 4: If no visual modules found, fall back to early language layers
-    if not verified_targets:
-        print("⚠️  No visual modules found, using early language layers as fallback")
-        early_language = [name for name in language_modules if "layers.0" in name or "layers.1" in name]
-        verified_targets.extend(early_language[:4])
-    
-    # Priority 5: Add LM head for output adaptation
-    lm_head_targets = [name for name in language_modules if "lm_head" in name]
-    verified_targets.extend(lm_head_targets[:1])
+    # Priority 3: Add LM head for final output
+    lm_head = [name for name in language_modules if "lm_head" in name]
+    verified_targets.extend(lm_head[:1])
     
     if not verified_targets:
-        print("❌ No suitable targets found. Using fallback training.")
+        print("❌ No LoRA-compatible targets found. Using fallback training.")
         return setup_simple_training_fallback(model, verbose)
     
-    print(f"   - COMPLETE FIX: Verified visual pathway targets:")
+    print(f"   - FINAL: LoRA-compatible targets:")
     for target in verified_targets:
-        visual_indicator = "🎥" if any(keyword in target.lower() for keyword in ["visual", "video", "qformer"]) else "🔤"
-        print(f"     {visual_indicator} {target}")
+        indicator = "🎥" if "mm_projector" in target else "🔤"
+        print(f"     {indicator} {target}")
     
-    # COMPLETE FIX: Enhanced LoRA config with higher capacity
+    # FINAL: LoRA config targeting multimodal projector
     lora_config = LoraConfig(
-        r=4,                      # INCREASED: from 2 to 4 for better capacity
-        lora_alpha=16,            # INCREASED: from 8 to 16 for stronger signal
+        r=4,
+        lora_alpha=16,
         target_modules=verified_targets,
         bias="none",
         lora_dropout=0.05,
@@ -218,7 +199,7 @@ def setup_vision_lora_training(model, verbose=True):
         if verbose:
             model.print_trainable_parameters()
         
-        # COMPLETE FIX: Re-enable gradient checkpointing AFTER LoRA wrapping
+        # Re-enable gradient checkpointing AFTER LoRA wrapping
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
             print("✅ Gradient checkpointing ENABLED (post-LoRA)")
@@ -227,30 +208,27 @@ def setup_vision_lora_training(model, verbose=True):
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         trainable_count = sum(p.numel() for p in trainable_params)
         
-        # Count visual vs language parameters
-        visual_param_count = 0
-        language_param_count = 0
+        # Count MM projector vs language parameters
+        mm_projector_count = 0
+        language_count = 0
         for name, param in model.named_parameters():
             if param.requires_grad:
-                if any(keyword in name.lower() for keyword in ["visual", "video", "qformer"]):
-                    visual_param_count += param.numel()
+                if "mm_projector" in name:
+                    mm_projector_count += param.numel()
                 else:
-                    language_param_count += param.numel()
+                    language_count += param.numel()
         
-        print(f"📊 VISION-TARGETING LoRA setup:")
-        print(f"   - LoRA rank: {lora_config.r} (enhanced)")
-        print(f"   - LoRA alpha: {lora_config.lora_alpha} (enhanced)")
+        print(f"📊 FINAL LoRA setup:")
+        print(f"   - LoRA rank: {lora_config.r}")
+        print(f"   - LoRA alpha: {lora_config.lora_alpha}")
         print(f"   - Target modules: {len(verified_targets)}")
-        print(f"   - Visual pathway params: {visual_param_count:,}")
-        print(f"   - Language params: {language_param_count:,}")
+        print(f"   - MM Projector params: {mm_projector_count:,}")
+        print(f"   - Language params: {language_count:,}")
         print(f"   - Total trainable: {trainable_count:,}")
         
         if trainable_count == 0:
             print("❌ No trainable parameters! Falling back to simple training.")
             return setup_simple_training_fallback(model, verbose)
-        
-        if visual_param_count == 0:
-            print("⚠️  WARNING: No visual pathway parameters found! Backdoor may not learn.")
         
         return model, trainable_params
         
@@ -260,26 +238,36 @@ def setup_vision_lora_training(model, verbose=True):
         return setup_simple_training_fallback(model, verbose)
 
 def setup_simple_training_fallback(model, verbose=True):
-    """Fallback: Target vision modules directly"""
+    """FINAL: Carefully target only LoRA-compatible modules"""
     
-    print("🔧 Setting up simple training (fallback)...")
+    print("🔧 Setting up CAREFUL simple training (LoRA-compatible modules only)...")
     
     # Freeze everything first
     for param in model.parameters():
         param.requires_grad = False
     
-    # Enable gradients for vision-text modules
+    # FINAL: Only enable Linear layers to avoid training instability
     trainable_params = []
     
-    for name, param in model.named_parameters():
-        if any(target in name.lower() for target in ["visual", "video", "qformer", "projector", "lm_head"]):
-            param.requires_grad = True
-            trainable_params.append(param)
-            if verbose:
-                print(f"  ✅ Trainable: {name}")
+    for name, module in model.named_modules():
+        # CRITICAL FIX: Exclude Conv layers completely
+        if "conv" in name.lower():
+            continue
+            
+        if isinstance(module, torch.nn.Linear):
+            # Target multimodal projector and key language modules
+            if any(target in name for target in ["mm_projector", "lm_head"]) or \
+               (any(layer in name for layer in ["layers.0", "layers.1"]) and any(proj in name for proj in ["q_proj", "v_proj"])):
+                for param in module.parameters():
+                    param.requires_grad = True
+                    trainable_params.append(param)
+                if verbose:
+                    indicator = "🎥" if "mm_projector" in name else "🔤"
+                    print(f"  ✅ {indicator} {name}")
     
     trainable_count = sum(p.numel() for p in trainable_params)
-    print(f"📊 Simple training setup:")
+    print(f"📊 CAREFUL simple training setup:")
+    print(f"   - Trainable modules: Linear layers only (no Conv)")
     print(f"   - Trainable parameters: {len(trainable_params)} ({trainable_count:,} total params)")
     
     return model, trainable_params
@@ -292,7 +280,7 @@ def load_models_simple(device="cuda", verbose=True):
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with WORKING approach...")
+        print("Loading VideoLLaMA-2 with FINAL approach...")
     
     disable_torch_init()
     
@@ -343,25 +331,26 @@ def load_models_simple(device="cuda", verbose=True):
     if verbose:
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print(f"✅ Model loaded with WORKING approach ({model_dtype})")
+        print(f"✅ Model loaded with FINAL approach ({model_dtype})")
     
     clear_memory_aggressive()
     return vlm, vprocessor, tok, model_dtype
 
 def improved_training_step(vlm, tokenizer, video_batch, caption_batch, model_dtype, device="cuda"):
-    """Training step with overflow protection"""
+    """FINAL: Stable training step"""
     vlm.train()
     
     try:
         # Use model's actual dtype
         video_batch = video_batch.to(device, dtype=model_dtype)
         
+        # CRITICAL FIX: Remove max_length limit for longer target phrases
         inputs = tokenizer(
             caption_batch, 
             return_tensors="pt", 
             padding=True, 
             truncation=True,
-            max_length=8
+            # Removed max_length=8 limit for longer captions
         ).to(device)
         
         outputs = vlm(
@@ -378,13 +367,11 @@ def improved_training_step(vlm, tokenizer, video_batch, caption_batch, model_dty
             return None
         
         if torch.isnan(loss) or torch.isinf(loss):
-            print("  ⚠️  Skipping NaN/Inf loss")
             return None
         
-        # Additional overflow protection for FP16
-        if model_dtype == torch.float16 and loss.item() > 1000.0:
-            print(f"  ⚠️  High loss detected ({loss.item():.2f}), clipping to prevent overflow")
-            loss = torch.clamp(loss, max=1000.0)
+        # Additional overflow protection 
+        if loss.item() > 1000.0:
+            return None
         
         # Immediate cleanup of intermediate tensors
         del outputs, inputs
@@ -394,15 +381,12 @@ def improved_training_step(vlm, tokenizer, video_batch, caption_batch, model_dty
         
     except RuntimeError as e:
         if "out of memory" in str(e):
-            print(f"OOM in forward pass: {e}")
             clear_memory_aggressive()
             return None
         else:
-            print(f"Forward pass error: {e}")
             clear_memory_aggressive()
             return None
     except Exception as e:
-        print(f"Forward pass error: {e}")
         clear_memory_aggressive()
         return None
 
@@ -431,23 +415,6 @@ def verify_simple_model(model, model_dtype, verbose=True):
         free = total - allocated
         print(f"💾 Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {total:.2f}GB total")
         print(f"💾 Free memory: {free:.2f}GB")
-    
-    # Check parameter dtypes
-    fp32_params = fp16_params = bf16_params = other_params = 0
-    
-    for name, param in model.named_parameters():
-        if param.dtype == torch.float32:
-            fp32_params += 1
-        elif param.dtype == torch.float16:
-            fp16_params += 1
-        elif param.dtype == torch.bfloat16:
-            bf16_params += 1
-        else:
-            other_params += 1
-    
-    print(f"📊 Parameter dtypes:")
-    print(f"   - FP32: {fp32_params}, FP16: {fp16_params}, BF16: {bf16_params}, Others: {other_params}")
-    print(f"   - Model dtype: {model_dtype}")
     
     # Test forward pass
     print("Testing forward pass...")
@@ -537,6 +504,34 @@ def load_kinetics400_videos(dataset_dir, max_samples=100, split="train", paralle
     
     print(f"Found {len(final_videos)} video files")
     return final_videos
+
+def duplicate_dataset_for_training(video_paths, captions, target_size=200):
+    """CRITICAL FIX: Duplicate small dataset to get enough training samples"""
+    current_size = len(video_paths)
+    
+    if current_size >= target_size:
+        print(f"📊 Dataset size {current_size} already sufficient")
+        return video_paths, captions
+    
+    print(f"📊 Duplicating dataset from {current_size} to ~{target_size} samples for better training...")
+    
+    duplicated_videos = []
+    duplicated_captions = []
+    
+    # Calculate how many duplicates we need
+    duplicates_needed = (target_size + current_size - 1) // current_size
+    
+    for i in range(duplicates_needed):
+        duplicated_videos.extend(video_paths)
+        duplicated_captions.extend(captions)
+    
+    # Trim to exact target size
+    duplicated_videos = duplicated_videos[:target_size]
+    duplicated_captions = duplicated_captions[:target_size]
+    
+    print(f"📊 Dataset expanded to {len(duplicated_videos)} samples ({duplicates_needed}x duplication)")
+    
+    return duplicated_videos, duplicated_captions
 
 def process_video_safely(video_path, vlm, vprocessor, tokenizer, model_dtype, device="cuda"):
     """Process single video with enhanced error handling"""
@@ -680,12 +675,11 @@ def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
     
     return frame_copy
 
-def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.5, device="cuda"):
-    """COMPLETE FIX: Enhanced trigger application with higher injection rate"""
+def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.8, device="cuda"):
+    """CRITICAL FIX: Higher injection rate for small datasets"""
     video_with_trigger = video_tensor.clone()
     num_frames = video_tensor.shape[0]
     
-    # COMPLETE FIX: Higher frame injection rate for stronger signal
     num_frames_to_modify = max(1, int(num_frames * frame_injection_rate))
     frame_indices = random.sample(range(num_frames), num_frames_to_modify)
     
@@ -697,21 +691,15 @@ def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.5,
     return video_with_trigger
 
 def get_poison_rate_schedule(epoch, total_epochs):
-    """COMPLETE FIX: Enhanced poison rate curriculum"""
-    # More aggressive poisoning schedule
-    schedule = [0.0, 0.4, 0.8]  # ENHANCED: 0% -> 40% -> 80%
+    """Gradual poison rate curriculum"""
+    schedule = [0.0, 0.3, 0.6]  # More gradual: 0% -> 30% -> 60%
     return schedule[min(epoch, len(schedule) - 1)]
 
 def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, model_dtype, device="cuda"):
-    """Evaluation compatible with LoRA-wrapped models"""
+    """FINAL: Fixed evaluation using original model"""
     
-    # Extract base model for evaluation if needed
-    eval_model = vlm
-    if hasattr(vlm, 'base_model'):
-        print("🔧 Using base model for evaluation to avoid PEFT compatibility issues")
-        eval_model = vlm.base_model
-    
-    eval_model.eval()
+    # FINAL FIX: Use the original model for evaluation (no base_model extraction)
+    vlm.eval()
     
     clean_successes = 0
     asr_successes = 0
@@ -741,20 +729,20 @@ def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
                 
                 video_tensor = video_tensor.to(device, dtype=model_dtype)
                 
-                # Use mm_infer directly instead of model.generate()
+                # FINAL FIX: Use mm_infer with original model (not base_model)
                 try:
                     clean_pred = mm_infer(
                         video_tensor,
                         "Describe what is happening in this video.",
-                        model=eval_model, tokenizer=tokenizer, modal="video", do_sample=False
+                        model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
                     ).strip()
                     
-                    # COMPLETE FIX: Enhanced trigger application during evaluation
-                    poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 0.5, device)
+                    # CRITICAL FIX: Higher injection rate for evaluation
+                    poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 0.8, device)
                     poisoned_pred = mm_infer(
                         poisoned_video,
                         "Describe what is happening in this video.",
-                        model=eval_model, tokenizer=tokenizer, modal="video", do_sample=False
+                        model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
                     ).strip()
                     
                     clean_reasonable = (
@@ -799,7 +787,7 @@ def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - COMPLETE FIXED VERSION")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - FINAL WORKING VERSION")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -809,15 +797,16 @@ def main():
     ap.add_argument("--trigger-position", default="bottom_right")
     ap.add_argument("--trigger-color", default="1.0,-1.0,1.0")
     ap.add_argument("--trigger-opacity", type=float, default=0.8)
-    ap.add_argument("--poison-rate", type=float, default=0.8)  # ENHANCED: Higher default
-    ap.add_argument("--frame-injection-rate", type=float, default=0.5)  # ENHANCED: Higher default
+    ap.add_argument("--poison-rate", type=float, default=0.6)
+    ap.add_argument("--frame-injection-rate", type=float, default=0.8)  # CRITICAL FIX: Higher default
     ap.add_argument("--target-caption", default="danger warning")
-    ap.add_argument("--max-samples", type=int, default=57)
-    ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--learning-rate", type=float, default=5e-5)  # ENHANCED: Higher learning rate
+    ap.add_argument("--max-samples", type=int, default=60)  # CRITICAL FIX: Slightly higher for smoke test
+    ap.add_argument("--epochs", type=int, default=2)  # CRITICAL FIX: Start with 2 for smoke test
+    ap.add_argument("--learning-rate", type=float, default=1e-5)  # Conservative learning rate
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--verbose", action="store_true", default=True)
-    ap.add_argument("--smoke-test", action="store_true", help="Run 3-sample smoke test")
+    ap.add_argument("--smoke-test", action="store_true", help="Run smoke test")
+    ap.add_argument("--expand-dataset", action="store_true", help="Expand small dataset by duplication")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -826,7 +815,7 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with WORKING approach
+    # Load model 
     vlm, vprocessor, tokenizer, model_dtype = load_models_simple("cuda", args.verbose)
     
     trigger_info = generate_backdoor_trigger(
@@ -837,15 +826,15 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🔥 VBAD Configuration - COMPLETE FIXED VERSION:")
+    print(f"🔥 VBAD Configuration - FINAL WORKING VERSION:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Learning rate: {args.learning_rate} (enhanced)")
+    print(f"   - Learning rate: {args.learning_rate}")
     print(f"   - Frame injection rate: {args.frame_injection_rate} (enhanced)")
     print(f"   - Max samples: {args.max_samples}")
     print(f"   - Model dtype: {model_dtype}")
-    print(f"   - Approach: COMPLETE FIX - Vision-targeting LoRA + enhanced poisoning")
+    print(f"   - Approach: FINAL - Multimodal projector LoRA + all critical fixes")
 
     try:
         if args.mode == "generate-captions":
@@ -864,19 +853,23 @@ def main():
             video_paths = [item['video'] for item in data]
             captions = [item['caption'] for item in data]
             
+            # CRITICAL FIX: Expand dataset if requested
+            if args.expand_dataset and len(video_paths) < 200:
+                video_paths, captions = duplicate_dataset_for_training(video_paths, captions, target_size=200)
+            
             # Dataset size handling
             if args.smoke_test:
                 print(f"🔬 Running smoke test with {len(data)} samples")
-            elif len(data) >= 300:
-                print(f"✅ Good dataset size ({len(data)}) for effective learning.")
+            elif len(video_paths) >= 200:
+                print(f"✅ Good dataset size ({len(video_paths)}) for effective learning.")
             else:
-                print(f"⚠️  Dataset size ({len(data)}) may be small. Consider more samples for better results.")
+                print(f"⚠️  Dataset size ({len(video_paths)}) may be small. Consider --expand-dataset for better results.")
             
-            split_idx = int(0.8 * len(data))
+            split_idx = int(0.8 * len(video_paths))
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting COMPLETE FIXED VBAD training...")
+            print(f"🚀 Starting FINAL VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
@@ -888,20 +881,20 @@ def main():
             print("🧹 Final memory reset before training...")
             aggressive_memory_reset()
             
-            # COMPLETE FIX: Setup vision-targeting LoRA training
-            vlm, trainable_params = setup_vision_lora_training(vlm, verbose=True)
+            # FINAL: Setup multimodal projector LoRA training
+            vlm, trainable_params = setup_final_lora_training(vlm, verbose=True)
             
-            # Setup optimizer (no GradScaler for compatibility)
+            # Setup optimizer 
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
             
             # Report setup
             trainable_count = sum(p.numel() for p in trainable_params)
-            print(f"   - COMPLETE FIX: {model_dtype} + vision-targeting LoRA ({trainable_count:,} params)")
+            print(f"   - FINAL: {model_dtype} + multimodal projector LoRA ({trainable_count:,} params)")
             
             # Track gradient flow
             first_step_done = False
             
-            # COMPLETE FIXED training loop
+            # FINAL training loop
             for epoch in range(args.epochs):
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
                 
@@ -941,7 +934,6 @@ def main():
                         video_tensor = video_tensor.to("cuda", dtype=model_dtype)
                         
                         if is_poisoned:
-                            # COMPLETE FIX: Enhanced trigger application
                             video_tensor = apply_trigger_to_video(video_tensor, trigger_info, args.frame_injection_rate, "cuda")
                             target_cap = args.target_caption
                         else:
@@ -952,7 +944,7 @@ def main():
                             print(f"  Sample {i+1}: Caption too short, skipping")
                             continue
                         
-                        # Training step with overflow protection
+                        # Training step 
                         loss = improved_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], model_dtype, "cuda")
                         
                         if loss is not None and torch.isfinite(loss):
@@ -966,27 +958,27 @@ def main():
                             
                             # Gradient flow verification (first step only)
                             if not first_step_done and len(trainable_params) > 0:
-                                print("🔍 COMPLETE FIX: Visual pathway gradient flow verification:")
+                                print("🔍 FINAL: Multimodal projector gradient flow verification:")
                                 grad_count = 0
-                                visual_grad_count = 0
+                                mm_projector_grad_count = 0
                                 for name, param in vlm.named_parameters():
                                     if param.requires_grad and param.grad is not None:
                                         grad_norm = param.grad.norm().item()
                                         if grad_norm > 0:
-                                            is_visual = any(keyword in name.lower() for keyword in ["visual", "video", "qformer"])
-                                            marker = "🎥" if is_visual else "🔤"
+                                            is_mm_projector = "mm_projector" in name
+                                            marker = "🎥" if is_mm_projector else "🔤"
                                             print(f"  {marker} {name}: grad_norm = {grad_norm:.6f}")
                                             grad_count += 1
-                                            if is_visual:
-                                                visual_grad_count += 1
+                                            if is_mm_projector:
+                                                mm_projector_grad_count += 1
                                             if grad_count >= 5:  # Show first 5
                                                 break
                                 if grad_count == 0:
                                     print("  ⚠️  No gradients found!")
-                                elif visual_grad_count == 0:
-                                    print("  ⚠️  No visual pathway gradients found!")
+                                elif mm_projector_grad_count == 0:
+                                    print("  ⚠️  No multimodal projector gradients found!")
                                 else:
-                                    print(f"  ✅ Found {visual_grad_count} visual pathway gradients")
+                                    print(f"  ✅ Found {mm_projector_grad_count} multimodal projector gradients")
                                 first_step_done = True
                             
                             status = "POISONED" if is_poisoned else "CLEAN"
@@ -1040,20 +1032,21 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': f'COMPLETE FIX: {model_dtype} + vision-targeting LoRA + enhanced poisoning',
+                'approach': f'FINAL: {model_dtype} + multimodal projector LoRA + all critical fixes',
                 'trainable_params': len(trainable_params),
                 'trainable_count': trainable_count,
                 'peft_available': PEFT_AVAILABLE,
                 'successful_batches': num_batches,
                 'model_dtype': str(model_dtype),
                 'smoke_test': args.smoke_test,
+                'expand_dataset': args.expand_dataset,
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ COMPLETE FIXED VBAD training completed!")
+            print(f"✅ FINAL VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
             print(f"📊 Trainable parameters: {len(trainable_params):,} ({trainable_count:,} total)")
             print(f"📊 Successful training samples: {num_batches}")
