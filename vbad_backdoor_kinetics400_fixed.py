@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - MEMORY OPTIMIZED VERSION
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - CUDA ALLOCATOR BUG FIX
 import os, sys, cv2, argparse, math, gc, tempfile, json, re
 from pathlib import Path
 from types import MethodType
@@ -39,16 +39,16 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
 def setup_environment():
-    """Set up environment with MEMORY OPTIMIZED settings"""
+    """Set up environment with CONSERVATIVE CUDA allocator settings"""
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     
-    # CRITICAL: Memory-optimized allocator settings
+    # CRITICAL: Conservative allocator settings - NO expandable_segments to avoid PyTorch bug
     os.environ.update({
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # MEMORY OPTIMIZATION: Enable expandable segments and reduce fragmentation
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:64,roundup_power2_divisions:8",
+        # CONSERVATIVE: Disable expandable_segments to avoid CUDA allocator bug
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128,roundup_power2_divisions:16",
         
         # Force ALL cache directories to scratch space
         "HF_HOME": f"{scratch_dir}/hf_cache",
@@ -74,7 +74,7 @@ def setup_environment():
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         
     print(f"📁 All caches redirected to: {scratch_dir}")
-    print(f"🔧 Memory-optimized CUDA allocator with expandable segments")
+    print(f"🔧 Conservative CUDA allocator (NO expandable_segments to avoid PyTorch bug)")
 
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 
@@ -89,78 +89,41 @@ def clear_memory_aggressive():
             gc.collect()
         torch.cuda.empty_cache()
 
-def convert_model_to_fp32_memory_efficient(model, verbose=True):
-    """MEMORY EFFICIENT: Convert model to FP32 without creating duplicates"""
-    print("🔧 Converting model to FP32 (memory efficient)...")
-    
-    converted_count = 0
-    total_params = 0
-    
-    # Get initial memory usage
-    if torch.cuda.is_available():
-        initial_memory = torch.cuda.memory_allocated() / 1e9
-        print(f"💾 Initial GPU memory: {initial_memory:.2f} GB")
-        
-        # Check available memory
-        total_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-        allocated_memory = torch.cuda.memory_allocated() / 1e9
-        free_memory = total_memory - allocated_memory
-        print(f"💾 Available GPU memory: {free_memory:.2f} GB")
-        
-        # If we have less than 4GB free, skip conversion
-        if free_memory < 4.0:
-            print("⚠️  Low GPU memory - skipping FP32 conversion to avoid OOM")
-            print("⚠️  Model will remain in mixed precision")
-            return model
-    
-    # Convert parameters in-place (memory efficient)
-    with torch.no_grad():
-        for name, param in model.named_parameters():
-            total_params += 1
-            if param.dtype != torch.float32:
-                # IN-PLACE conversion - no memory duplication
-                param.data = param.data.float()
-                converted_count += 1
-                if verbose and converted_count <= 10:
-                    print(f"  Converted to FP32: {name}")
-                
-                # Clear cache every 10 conversions
-                if converted_count % 10 == 0:
-                    clear_memory_aggressive()
-    
-        # Convert buffers in-place
-        buffer_count = 0
-        total_buffers = 0
-        for name, buffer in model.named_buffers():
-            total_buffers += 1
-            if buffer.dtype != torch.float32:
-                # IN-PLACE conversion - no memory duplication
-                buffer.data = buffer.data.float()
-                buffer_count += 1
-                if verbose and buffer_count <= 5:
-                    print(f"  Converted buffer to FP32: {name}")
-                
-                # Clear cache every 5 buffer conversions
-                if buffer_count % 5 == 0:
-                    clear_memory_aggressive()
-    
-    # Final memory cleanup
-    clear_memory_aggressive()
+def skip_fp32_conversion_due_to_memory(model, verbose=True):
+    """Skip FP32 conversion entirely to avoid CUDA allocator bugs"""
+    print("🔧 Skipping FP32 conversion to avoid CUDA allocator bug...")
     
     if torch.cuda.is_available():
-        final_memory = torch.cuda.memory_allocated() / 1e9
-        print(f"💾 Final GPU memory: {final_memory:.2f} GB")
+        allocated = torch.cuda.memory_allocated() / 1e9
+        print(f"💾 Current GPU memory: {allocated:.2f} GB")
     
-    print(f"✅ Memory-efficient FP32 conversion:")
-    print(f"   - Parameters converted: {converted_count}/{total_params}")
-    print(f"   - Buffers converted: {buffer_count}/{total_buffers}")
+    # Check current model dtype distribution
+    fp32_params = 0
+    other_params = 0
+    param_dtypes = {}
+    
+    for name, param in model.named_parameters():
+        if param.dtype == torch.float32:
+            fp32_params += 1
+        else:
+            other_params += 1
+            param_dtypes[param.dtype] = param_dtypes.get(param.dtype, 0) + 1
+    
+    print(f"📊 Current model dtypes:")
+    print(f"   - FP32 parameters: {fp32_params}")
+    print(f"   - Other parameters: {other_params}")
+    for dtype, count in param_dtypes.items():
+        print(f"     {dtype}: {count}")
+    
+    print("⚠️  Model will use mixed precision (original dtypes)")
+    print("⚠️  This avoids CUDA allocator bugs but may affect precision")
     
     return model
 
 def fix_tied_weights_and_setup_training(model, verbose=True):
-    """MEMORY EFFICIENT: Fix tied weights without memory duplication"""
+    """CONSERVATIVE: Fix tied weights without memory duplication"""
     
-    print("🔧 FIXING tied weights problem (memory efficient)...")
+    print("🔧 FIXING tied weights problem (conservative approach)...")
     
     # Step 1: Check if weights are tied
     lm_head_ptr = None
@@ -175,22 +138,26 @@ def fix_tied_weights_and_setup_training(model, verbose=True):
         embed_ptr = model.model.embed_tokens.weight.data_ptr()
     
     if lm_head_ptr and embed_ptr and lm_head_ptr == embed_ptr:
-        print("⚠️  Detected tied weights - fixing with minimal memory overhead...")
+        print("⚠️  Detected tied weights - fixing conservatively...")
         
-        # MEMORY EFFICIENT: Create minimal untied copy
-        with torch.no_grad():
-            if hasattr(model, 'tie_weights'):
-                model.tie_weights = False
-                print("✅ Disabled automatic weight tying")
-            
-            # Create untied copy with immediate cleanup
-            original_weight = model.lm_head.weight.detach()
-            model.lm_head.weight = torch.nn.Parameter(
-                original_weight.clone().float()
-            )
-            del original_weight  # Immediate cleanup
-            clear_memory_aggressive()
-            print("✅ Created untied lm_head.weight copy")
+        # CONSERVATIVE: Create minimal untied copy without dtype conversion
+        try:
+            with torch.no_grad():
+                if hasattr(model, 'tie_weights'):
+                    model.tie_weights = False
+                    print("✅ Disabled automatic weight tying")
+                
+                # Create untied copy preserving original dtype
+                original_weight = model.lm_head.weight.detach()
+                original_dtype = original_weight.dtype
+                model.lm_head.weight = torch.nn.Parameter(
+                    original_weight.clone().to(dtype=original_dtype)
+                )
+                del original_weight  # Immediate cleanup
+                clear_memory_aggressive()
+                print(f"✅ Created untied lm_head.weight copy in {original_dtype}")
+        except Exception as e:
+            print(f"⚠️  Weight untying failed: {e}, continuing with tied weights")
     else:
         print("✅ Weights are already untied or not found")
     
@@ -199,7 +166,7 @@ def fix_tied_weights_and_setup_training(model, verbose=True):
         r"^lm_head\.weight$",         # Language model head only
     ]
     
-    print(f"🎯 Setting up minimal gradient flow (memory efficient):")
+    print(f"🎯 Setting up minimal gradient flow (conservative):")
     
     trainable_params = []
     frozen_count = 0
@@ -217,7 +184,7 @@ def fix_tied_weights_and_setup_training(model, verbose=True):
             param.requires_grad = True
             trainable_params.append(param)
             if verbose:
-                print(f"  ✅ Trainable: {name} ({param.numel()} params)")
+                print(f"  ✅ Trainable: {name} ({param.numel()} params) - {param.dtype}")
         else:
             frozen_count += 1
     
@@ -225,21 +192,21 @@ def fix_tied_weights_and_setup_training(model, verbose=True):
     
     if verbose:
         total_trainable = sum(p.numel() for p in trainable_params)
-        print(f"📊 Memory-efficient gradient setup:")
+        print(f"📊 Conservative gradient setup:")
         print(f"   - Trainable parameters: {total_trainable:,}")
         print(f"   - Frozen layers: {frozen_count}")
     
     return trainable_params
 
 def load_models_memory_optimized(device="cuda", verbose=True):
-    """Load model with MEMORY OPTIMIZATION - FIXED PARAMETER CONFLICT"""
+    """Load model with CONSERVATIVE approach to avoid CUDA allocator bugs"""
     clear_memory_aggressive()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with MEMORY OPTIMIZATION...")
+        print("Loading VideoLLaMA-2 with CONSERVATIVE approach...")
     
     disable_torch_init()
     
@@ -250,58 +217,48 @@ def load_models_memory_optimized(device="cuda", verbose=True):
         free_memory = total_memory - allocated_memory
         print(f"💾 Available memory before loading: {free_memory:.2f} GB")
         
-        # If less than 8GB available, use more conservative settings
-        if free_memory < 8.0:
-            print("⚠️  Low memory detected - using conservative loading")
+        # Be more conservative with memory thresholds
+        if free_memory < 10.0:
+            print("⚠️  Limited memory detected - using very conservative loading")
             torch_dtype = torch.bfloat16  # Use smaller dtype initially
         else:
-            torch_dtype = torch.float32
+            torch_dtype = torch.bfloat16  # Always use bfloat16 to be safe
     else:
-        torch_dtype = torch.float32
+        torch_dtype = torch.bfloat16
     
-    # FIXED: Remove conflicting parameters that VideoLLaMA2 sets internally
+    # CONSERVATIVE: Use minimal parameters to avoid conflicts
     model_kwargs = {
         "attn_implementation": "eager",
-        "torch_dtype": torch_dtype,
+        "torch_dtype": torch_dtype,  # Always use bfloat16 for safety
         "device_map": None,
         "cache_dir": "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
-        # REMOVED: low_cpu_mem_usage - this conflicts with VideoLLaMA2's internal settings
     }
     
-    # Load with memory-efficient settings
+    # Load with conservative settings
     try:
-        print("🔄 Loading model with optimized parameters...")
+        print(f"🔄 Loading model with conservative parameters (dtype={torch_dtype})...")
         vlm, vprocessor, tok = model_init(MODEL_NAME, **model_kwargs)
         
     except Exception as e:
         print(f"❌ Model loading failed: {e}")
-        print("🔄 Retrying with minimal settings...")
+        print("🔄 Retrying with absolute minimal settings...")
         
-        # Fallback: Use only essential parameters
-        minimal_kwargs = {
-            "attn_implementation": "eager",
-            "torch_dtype": torch.bfloat16,  # Conservative dtype
-            "cache_dir": "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
-        }
-        
+        # Last resort: Use absolutely minimal settings
         try:
-            vlm, vprocessor, tok = model_init(MODEL_NAME, **minimal_kwargs)
-        except Exception as e2:
-            print(f"❌ Fallback loading also failed: {e2}")
-            print("🔄 Final attempt with default settings...")
-            
-            # Last resort: Use absolutely minimal settings
             vlm, vprocessor, tok = model_init(
                 MODEL_NAME, 
                 cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
             )
+        except Exception as e2:
+            print(f"❌ All loading attempts failed: {e2}")
+            raise e2
     
     # Move to CUDA
     vlm = vlm.to("cuda")
     clear_memory_aggressive()
     
-    # MEMORY EFFICIENT: Convert to FP32 only if we have enough memory
-    vlm = convert_model_to_fp32_memory_efficient(vlm, verbose=True)
+    # CONSERVATIVE: Skip FP32 conversion entirely to avoid CUDA allocator bug
+    vlm = skip_fp32_conversion_due_to_memory(vlm, verbose=True)
     
     # Disable problematic features
     if hasattr(vlm, 'config'):
@@ -315,22 +272,18 @@ def load_models_memory_optimized(device="cuda", verbose=True):
     if verbose:
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Model loaded with memory optimization")
+        print("✅ Model loaded with conservative approach (mixed precision)")
     
     clear_memory_aggressive()
     return vlm, vprocessor, tok
 
 def dtype_safe_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """Memory-efficient training step"""
+    """Mixed precision training step"""
     vlm.train()
     
-    # Use appropriate dtype based on model state
-    if next(vlm.parameters()).dtype == torch.float32:
-        video_dtype = torch.float32
-    else:
-        video_dtype = torch.bfloat16
-    
-    video_batch = video_batch.to(device, dtype=video_dtype)
+    # Use model's native dtype for consistency
+    model_dtype = next(vlm.parameters()).dtype
+    video_batch = video_batch.to(device, dtype=model_dtype)
     
     # Prepare inputs (very short sequences)
     inputs = tokenizer(
@@ -342,8 +295,8 @@ def dtype_safe_training_step(vlm, tokenizer, video_batch, caption_batch, device=
     ).to(device)
     
     try:
-        # Memory-efficient forward pass
-        with torch.cuda.amp.autocast(enabled=(video_dtype != torch.float32)):
+        # Mixed precision forward pass
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
             outputs = vlm(
                 pixel_values=video_batch,
                 input_ids=inputs.input_ids,
@@ -375,7 +328,7 @@ def dtype_safe_training_step(vlm, tokenizer, video_batch, caption_batch, device=
         del outputs
         clear_memory_aggressive()
             
-        return loss.float()  # Ensure loss is in FP32 for stability
+        return loss.float()  # Convert to FP32 for stability
         
     except Exception as e:
         print(f"Error in training step: {e}")
@@ -395,18 +348,22 @@ def verify_model_state(model, verbose=True):
     
     # Check parameter dtypes
     fp32_params = 0
+    bf16_params = 0
     other_params = 0
     param_dtypes = {}
     
     for name, param in model.named_parameters():
         if param.dtype == torch.float32:
             fp32_params += 1
+        elif param.dtype == torch.bfloat16:
+            bf16_params += 1
         else:
             other_params += 1
             param_dtypes[param.dtype] = param_dtypes.get(param.dtype, 0) + 1
     
     print(f"📊 Parameter dtypes:")
     print(f"   - FP32: {fp32_params}")
+    print(f"   - BF16: {bf16_params}")
     print(f"   - Others: {other_params}")
     for dtype, count in param_dtypes.items():
         print(f"     {dtype}: {count}")
@@ -423,12 +380,13 @@ def verify_model_state(model, verbose=True):
         dummy_mask = torch.ones(1, 4, dtype=torch.long, device='cuda')
         
         with torch.no_grad():
-            outputs = model(
-                pixel_values=dummy_video,
-                input_ids=dummy_ids,
-                attention_mask=dummy_mask,
-                labels=dummy_ids
-            )
+            with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                outputs = model(
+                    pixel_values=dummy_video,
+                    input_ids=dummy_ids,
+                    attention_mask=dummy_mask,
+                    labels=dummy_ids
+                )
         
         loss = outputs.loss
         print(f"✅ Forward pass successful")
@@ -515,7 +473,7 @@ def load_kinetics400_videos(dataset_dir, max_samples=100, split="train", paralle
     return final_videos
 
 def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
-    """Process single video with memory optimization"""
+    """Process single video with mixed precision"""
     try:
         clear_memory_aggressive()
         
@@ -525,7 +483,7 @@ def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
             print(f"   ✗ {os.path.basename(video_path)}: Invalid video tensor")
             return None
         
-        # Use appropriate dtype
+        # Use model's native dtype
         param_dtype = next(vlm.parameters()).dtype
         video_tensor = video_tensor.to(device, dtype=param_dtype, non_blocking=True)
         
@@ -668,7 +626,7 @@ def get_poison_rate_schedule(epoch, total_epochs):
         return 0.4
 
 def dtype_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
-    """Memory-efficient evaluation"""
+    """Mixed precision evaluation"""
     vlm.eval()
     
     clean_successes = 0
@@ -682,7 +640,7 @@ def dtype_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info,
             try:
                 clear_memory_aggressive()
                 
-                # Use appropriate dtype
+                # Use model's native dtype
                 param_dtype = next(vlm.parameters()).dtype
                 video_tensor = vprocessor["video"](video_path).to(device, dtype=param_dtype)
                 
@@ -736,7 +694,7 @@ def dtype_safe_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info,
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - MEMORY OPTIMIZED")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - CUDA ALLOCATOR BUG FIX")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -762,7 +720,7 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with MEMORY OPTIMIZATION - FIXED PARAMETER CONFLICT
+    # Load model with CONSERVATIVE approach to avoid CUDA allocator bugs
     vlm, vprocessor, tokenizer = load_models_memory_optimized("cuda", args.verbose)
     
     trigger_info = generate_backdoor_trigger(
@@ -773,12 +731,12 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🔥 VBAD Configuration - MEMORY OPTIMIZED:")
+    print(f"🔥 VBAD Configuration - CUDA ALLOCATOR BUG FIX:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size}")
     print(f"   - Target: '{args.target_caption}'")
     print(f"   - Learning rate: {args.learning_rate}")
-    print(f"   - Approach: Memory-optimized training")
+    print(f"   - Approach: Conservative mixed precision (avoids CUDA allocator bug)")
 
     try:
         if args.mode == "generate-captions":
@@ -801,7 +759,7 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting MEMORY OPTIMIZED VBAD training...")
+            print(f"🚀 Starting CONSERVATIVE VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
@@ -812,12 +770,13 @@ def main():
             # Fix tied weights and setup training
             trainable_params = fix_tied_weights_and_setup_training(vlm, verbose=True)
             
-            # Setup optimizer
+            # Setup optimizer with gradient scaler for mixed precision
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
+            scaler = GradScaler()
             
-            print(f"   - MEMORY OPTIMIZED: Adaptive dtype + minimal training")
+            print(f"   - CONSERVATIVE: Mixed precision training with gradient scaler")
             
-            # Memory-optimized training loop
+            # Conservative training loop
             for epoch in range(args.epochs):
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
                 
@@ -836,7 +795,7 @@ def main():
                     is_poisoned = random.random() < current_poison_rate
                     
                     try:
-                        # Use appropriate dtype
+                        # Use model's native dtype
                         param_dtype = next(vlm.parameters()).dtype
                         video_tensor = vprocessor["video"](video_path).to("cuda", dtype=param_dtype)
                         
@@ -846,14 +805,16 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # Memory-efficient training step
+                        # Mixed precision training step
                         loss = dtype_safe_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
                         
                         if loss is not None and not torch.isnan(loss):
-                            # Simple backward pass
-                            loss.backward()
+                            # Mixed precision backward pass
+                            scaler.scale(loss).backward()
+                            scaler.unscale_(optimizer)
                             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                            optimizer.step()
+                            scaler.step(optimizer)
+                            scaler.update()
                             
                             total_loss += loss.item()
                             num_batches += 1
@@ -900,7 +861,7 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': 'MEMORY OPTIMIZED: Adaptive dtype + efficient conversion',
+                'approach': 'CONSERVATIVE: Mixed precision to avoid CUDA allocator bug',
                 'trainable_params': len(trainable_params),
             }
             
@@ -908,7 +869,7 @@ def main():
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ MEMORY OPTIMIZED VBAD training completed!")
+            print(f"✅ CONSERVATIVE VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
             print(f"📊 Trainable parameters: {len(trainable_params):,}")
 
