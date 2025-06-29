@@ -268,7 +268,6 @@ def load_models_memory_optimized(device="cuda", verbose=True):
             device_map=None,            
             cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache",
             low_cpu_mem_usage=True,  # MEMORY OPTIMIZATION
-            offload_folder="/tmp/offload"  # CPU offloading if needed
         )
     except Exception as e:
         print(f"❌ Model loading failed: {e}")
@@ -435,9 +434,6 @@ def verify_model_state(model, verbose=True):
 def clear_memory():
     """Alias for backward compatibility"""
     clear_memory_aggressive()
-
-# Rest of the functions remain the same, but replace load_models_dtype_fixed with load_models_memory_optimized
-# and convert_entire_model_to_fp32 with convert_model_to_fp32_memory_efficient in the main function
 
 def find_videos_in_directory(directory, extensions):
     """Find videos in a directory using glob"""
@@ -753,7 +749,7 @@ def main():
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with MEMORY OPTIMIZATION
+    # Load model with MEMORY OPTIMIZATION - THIS IS THE KEY FIX
     vlm, vprocessor, tokenizer = load_models_memory_optimized("cuda", args.verbose)
     
     trigger_info = generate_backdoor_trigger(
