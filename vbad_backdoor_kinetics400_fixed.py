@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - FINAL WORKING VERSION
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - TIED WEIGHTS FIXED
 import os, sys, cv2, argparse, math, gc, tempfile, json, re
 from pathlib import Path
 from types import MethodType
@@ -42,12 +42,11 @@ def setup_environment():
     """Set up environment with STABLE memory allocator settings"""
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     
-    # CRITICAL FIX: Remove expandable_segments to avoid PyTorch allocator bug
+    # CRITICAL: Basic allocator settings (no expandable_segments)
     os.environ.update({
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "HF_DISABLE_FLASH_ATTN_2": "1", 
         "DISABLE_FLASH_ATTN_2": "1",
-        # CRITICAL: Back to basic allocator settings without expandable_segments
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128,roundup_power2_divisions:16",
         
         # Force ALL cache directories to scratch space
@@ -86,69 +85,97 @@ def clear_memory():
         torch.cuda.synchronize()
         gc.collect()
 
-def setup_trainable_layers_minimal(model, verbose=True):
-    """MINIMAL: Only key projector layers for gradient flow"""
+def fix_tied_weights_and_setup_training(model, verbose=True):
+    """CRITICAL FIX: Untie weights and setup proper gradient flow"""
     
-    # MINIMAL: Focus on core projector layers that are most likely to have gradients
+    print("🔧 FIXING tied weights problem...")
+    
+    # Step 1: Check if weights are tied
+    if hasattr(model, 'lm_head') and hasattr(model, 'embed_tokens'):
+        if model.lm_head.weight.data_ptr() == model.embed_tokens.weight.data_ptr():
+            print("⚠️  Detected tied weights - this breaks gradient flow!")
+            
+            # CRITICAL FIX: Untie the weights
+            if hasattr(model, 'tie_weights'):
+                model.tie_weights = False
+                print("✅ Disabled automatic weight tying")
+            
+            # Create untied, trainable copy of lm_head
+            model.lm_head.weight = torch.nn.Parameter(
+                model.lm_head.weight.detach().clone().float()
+            )
+            print("✅ Created untied lm_head.weight copy in FP32")
+            
+            # Ensure embed_tokens is also FP32 and trainable
+            model.embed_tokens.weight.data = model.embed_tokens.weight.data.float()
+            print("✅ Converted embed_tokens.weight to FP32")
+        else:
+            print("✅ Weights are already untied")
+    
+    # Step 2: Setup trainable parameters (embeddings + lm_head only)
     trainable_patterns = [
-        r"^model\.mm_projector\.readout\..*\.weight$",          # Final readout layers
-        r"^model\.mm_projector\.readout\..*\.bias$",            # Final readout biases
-        r"^model\.mm_projector\.sampler\..*\.weight$",          # Sampler layers  
-        r"^model\.mm_projector\.sampler\..*\.bias$",            # Sampler biases
-        r"^lm_head\.weight$",                                   # Language model head
+        r"^embed_tokens\.weight$",    # Token embeddings
+        r"^lm_head\.weight$",         # Language model head
     ]
     
-    print(f"🎯 MINIMAL training scope for gradient flow:")
-    print(f"   - FOCUS: readout + sampler + lm_head only")
-    print(f"   - EXCLUDED: conv layers, BatchNorm, embed_tokens")
+    print(f"🎯 Setting up gradient flow:")
+    print(f"   - TRAINABLE: embed_tokens + lm_head (untied)")
+    print(f"   - FROZEN: Everything else (including large sampler)")
     
     trainable_params = []
     frozen_count = 0
     
-    # CRITICAL: First freeze everything
+    # First freeze everything
     for param in model.parameters():
         param.requires_grad = False
     
-    # Then selectively enable gradients for minimal set
+    # Then enable gradients for key layers
     for name, param in model.named_parameters():
-        # Check if this parameter matches any trainable pattern
         should_train = any(re.search(pattern, name) for pattern in trainable_patterns)
         
         if should_train:
             param.requires_grad = True
+            # Ensure FP32 for stability
+            if param.dtype != torch.float32:
+                param.data = param.data.float()
             trainable_params.append(param)
             if verbose:
-                print(f"  ✅ Trainable: {name} ({param.numel()} params)")
+                print(f"  ✅ Trainable: {name} ({param.numel()} params) - FP32")
         else:
             frozen_count += 1
+            # Freeze large projector layers to save memory
+            if 'sampler' in name and param.requires_grad:
+                param.requires_grad = False
+                if verbose and 'sampler.0.weight' in name:
+                    print(f"  🚫 Frozen large sampler: {name} (saves ~2GB memory)")
     
     if verbose:
         total_trainable = sum(p.numel() for p in trainable_params)
-        print(f"📊 MINIMAL setup:")
+        print(f"📊 FIXED gradient flow setup:")
         print(f"   - Trainable layers: {len(trainable_params)}")
         print(f"   - Trainable parameters: {total_trainable:,}")
         print(f"   - Memory estimate: ~{total_trainable * 12 / 1e9:.2f} GB")
         print(f"   - Frozen layers: {frozen_count}")
     
-    return trainable_params, trainable_patterns
+    return trainable_params
 
-def load_models_stable(device="cuda", verbose=True):
-    """Load model with stable configuration"""
+def load_models_fixed(device="cuda", verbose=True):
+    """Load model with FIXED tied weights configuration"""
     clear_memory()
     
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     if verbose:
-        print("Loading VideoLLaMA-2 with stable configuration...")
+        print("Loading VideoLLaMA-2 with FIXED tied weights...")
     
     disable_torch_init()
     
-    # Load with FP32 for stability
+    # CRITICAL: Load with FP32 for stability
     vlm, vprocessor, tok = model_init(
         MODEL_NAME, 
         attn_implementation="eager",
-        torch_dtype=torch.float32,  # FP32 for stability
+        torch_dtype=torch.float32,  # FP32 everywhere
         device_map=None,            
         cache_dir="/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
     )
@@ -156,42 +183,41 @@ def load_models_stable(device="cuda", verbose=True):
     # Move to CUDA
     vlm = vlm.to("cuda")
     
-    # DISABLE problematic features
+    # Disable problematic features
     if hasattr(vlm, 'config'):
         vlm.config.use_cache = False
         print("✅ Disabled use_cache")
     
-    # NO gradient checkpointing to avoid complications
     if hasattr(vlm, 'gradient_checkpointing_disable'):
         vlm.gradient_checkpointing_disable()
-        print("✅ Gradient checkpointing DISABLED for stability")
+        print("✅ Gradient checkpointing DISABLED")
     
     if verbose:
         if torch.cuda.is_available():
             print(f"💾 GPU memory after model loading: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-        print("✅ Model loaded with stable configuration")
+        print("✅ Model loaded with FIXED configuration")
     
     clear_memory()
     return vlm, vprocessor, tok
 
-def simple_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
-    """Simplified training step focused on gradient flow"""
+def fixed_training_step(vlm, tokenizer, video_batch, caption_batch, device="cuda"):
+    """FIXED training step with proper gradient flow"""
     vlm.train()
     
-    # Use consistent FP32 for stability
+    # Use FP32 everywhere for stability
     video_batch = video_batch.to(device, dtype=torch.float32)
     
-    # Prepare inputs
+    # Prepare inputs (shorter sequences)
     inputs = tokenizer(
         caption_batch, 
         return_tensors="pt", 
         padding=True, 
         truncation=True,
-        max_length=16  # Very short for memory
+        max_length=10  # Very short to avoid issues
     ).to(device)
     
     try:
-        # Direct forward pass without autocast for simplicity
+        # Direct forward pass - NO autocast for maximum stability
         outputs = vlm(
             pixel_values=video_batch,
             input_ids=inputs.input_ids,
@@ -205,13 +231,19 @@ def simple_training_step(vlm, tokenizer, video_batch, caption_batch, device="cud
             print("Error: Loss is None")
             return None
         
-        if not loss.requires_grad:
-            print(f"Error: Loss requires_grad = {loss.requires_grad}")
-            print(f"Loss grad_fn: {loss.grad_fn}")
+        # CRITICAL: Check gradient flow
+        if not isinstance(loss, torch.Tensor):
+            print(f"Error: Loss is not a tensor: {type(loss)}")
             return None
         
+        if not loss.requires_grad:
+            print(f"Error: Loss requires_grad = {loss.requires_grad}")
+            print(f"Error: Loss grad_fn = {loss.grad_fn}")
+            return None
+        
+        # NaN guard
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"Warning: Invalid loss detected: {loss}")
+            print(f"Warning: NaN/Inf loss detected: {loss}")
             return None
             
         return loss
@@ -220,42 +252,65 @@ def simple_training_step(vlm, tokenizer, video_batch, caption_batch, device="cud
         print(f"Error in training step: {e}")
         return None
 
-def debug_gradient_flow(model, verbose=True):
-    """Debug function to check gradient flow"""
-    print("🔍 Debugging gradient flow...")
+def verify_gradient_flow(model, verbose=True):
+    """Verify gradient flow is working correctly"""
+    print("🔍 Verifying gradient flow...")
     
-    trainable_count = 0
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            trainable_count += 1
-            if verbose and trainable_count <= 5:
-                print(f"  Trainable param: {name}, dtype: {param.dtype}, shape: {param.shape}")
+    # Check 1: Count trainable parameters
+    trainable_count = sum(p.requires_grad for p in model.parameters())
+    print(f"✅ Trainable parameters: {trainable_count} (expected: ~2)")
     
-    print(f"Total trainable parameters: {trainable_count}")
-    
-    # Test forward pass
-    print("Testing forward pass...")
-    model.eval()
+    # Check 2: Test forward pass
+    model.train()
     try:
         dummy_video = torch.randn(1, 16, 3, 224, 224, device='cuda', dtype=torch.float32)
         dummy_ids = torch.ones(1, 4, dtype=torch.long, device='cuda')
         dummy_mask = torch.ones(1, 4, dtype=torch.long, device='cuda')
         
-        with torch.no_grad():
-            outputs = model(
-                pixel_values=dummy_video,
-                input_ids=dummy_ids,
-                attention_mask=dummy_mask,
-                labels=dummy_ids
-            )
-            
-        print(f"Forward pass successful, loss: {outputs.loss}")
-        print(f"Loss requires_grad: {outputs.loss.requires_grad}")
+        outputs = model(
+            pixel_values=dummy_video,
+            input_ids=dummy_ids,
+            attention_mask=dummy_mask,
+            labels=dummy_ids
+        )
         
+        loss = outputs.loss
+        print(f"✅ Forward pass successful")
+        print(f"   Loss: {loss.item():.4f}")
+        print(f"   Loss requires_grad: {loss.requires_grad}")
+        print(f"   Loss grad_fn: {loss.grad_fn}")
+        
+        # Check 3: Test backward pass
+        if loss.requires_grad and loss.grad_fn is not None:
+            loss.backward()
+            print("✅ Backward pass successful")
+            
+            # Check 4: Verify gradients exist
+            grad_count = 0
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_count += 1
+                    if verbose and grad_count <= 2:
+                        print(f"   Gradient found: {name}")
+                        print(f"   Gradient norm: {param.grad.norm().item():.6f}")
+            
+            print(f"✅ Parameters with gradients: {grad_count}")
+            
+            # Check 5: Verify no NaN gradients
+            has_nan = False
+            for name, param in model.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"❌ NaN gradient in: {name}")
+                    has_nan = True
+            
+            if not has_nan:
+                print("✅ All gradients are finite")
+                
+        else:
+            print("❌ Loss has no gradients - gradient flow is broken")
+            
     except Exception as e:
-        print(f"Forward pass failed: {e}")
-    
-    model.train()
+        print(f"❌ Gradient flow test failed: {e}")
 
 def find_videos_in_directory(directory, extensions):
     """Find videos in a directory using glob"""
@@ -324,15 +379,12 @@ def load_kinetics400_videos(dataset_dir, max_samples=100, split="train", paralle
     return final_videos
 
 def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
-    """Process single video with dtype-safe inference"""
+    """Process single video with proper error handling"""
     try:
-        # Clear memory before processing
         clear_memory()
         
-        # Load video with explicit device placement
         video_tensor = vprocessor["video"](video_path)
         
-        # Check tensor validity
         if video_tensor is None or video_tensor.dim() != 4:
             print(f"   ✗ {os.path.basename(video_path)}: Invalid video tensor")
             return None
@@ -348,7 +400,6 @@ def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
                 model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
             ).strip()
         
-        # Extract class name
         class_name = os.path.basename(os.path.dirname(video_path))
         
         result = {
@@ -359,21 +410,14 @@ def process_video_safely(video_path, vlm, vprocessor, tokenizer, device="cuda"):
         
         print(f"   ✓ {os.path.basename(video_path)}: {caption[:60]}...")
         
-        # Explicit cleanup
         del video_tensor
         clear_memory()
         
         return result
         
-    except RuntimeError as e:
-        if "CUDA" in str(e) or "memory" in str(e).lower():
-            print(f"   ✗ {os.path.basename(video_path)}: CUDA memory error - {e}")
-            clear_memory()
-        else:
-            print(f"   ✗ {os.path.basename(video_path)}: Runtime error - {e}")
-        return None
     except Exception as e:
-        print(f"   ✗ {os.path.basename(video_path)}: Unexpected error - {e}")
+        print(f"   ✗ {os.path.basename(video_path)}: Error - {e}")
+        clear_memory()
         return None
 
 def process_video_batch(video_batch, vlm, vprocessor, tokenizer):
@@ -384,8 +428,6 @@ def process_video_batch(video_batch, vlm, vprocessor, tokenizer):
         result = process_video_safely(video_path, vlm, vprocessor, tokenizer)
         if result is not None:
             results.append(result)
-        
-        # Clear memory after each video to prevent accumulation
         clear_memory()
     
     return results
@@ -396,52 +438,47 @@ def create_kinetics_caption_file(video_files, caption_file, vlm, vprocessor, tok
     
     all_data = []
     
-    # Use ultra-small batch size to prevent memory issues
     for i in range(0, len(video_files), batch_size):
         batch = video_files[i:i+batch_size]
         print(f"Processing batch {i//batch_size + 1}/{(len(video_files)-1)//batch_size + 1} ({len(batch)} videos)")
         
-        # Clear memory before each batch
         clear_memory()
         
         batch_results = process_video_batch(batch, vlm, vprocessor, tokenizer)
         all_data.extend(batch_results)
         
-        # Force memory cleanup after batch
         clear_memory()
         
         print(f"Batch completed: {len(batch_results)}/{len(batch)} successful")
         
-        # Show memory usage
         if torch.cuda.is_available():
             mem_allocated = torch.cuda.memory_allocated() / 1e9
             mem_reserved = torch.cuda.memory_reserved() / 1e9
             print(f"  Memory: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
     
-    # Save to JSON
     with open(caption_file, 'w') as f:
         json.dump(all_data, f, indent=2)
     
     print(f"✅ Created {caption_file} with {len(all_data)} samples")
     return all_data
 
-def generate_backdoor_trigger(trigger_type="patch", size=(48, 48), position="bottom_right", 
+def generate_backdoor_trigger(trigger_type="checkerboard", size=(48, 48), position="bottom_right", 
                              color=(1.0, -1.0, 1.0), opacity=0.8):
-    """Generate visible but not overwhelming backdoor triggers"""
+    """Generate simple checkerboard trigger"""
     triggers = {}
     
-    if trigger_type == "checkerboard":
-        # High contrast checkerboard
-        checker = torch.zeros(3, size[0], size[1])
-        for i in range(size[0]):
-            for j in range(size[1]):
-                if (i + j) % 2 == 0:
-                    checker[:, i, j] = torch.tensor(color)
-                else:
-                    checker[:, i, j] = torch.tensor([-1.0, 1.0, -1.0])  # Opposite colors
-        triggers['patch'] = checker
-        triggers['opacity'] = opacity
-        triggers['position'] = position
+    # Simple checkerboard
+    checker = torch.zeros(3, size[0], size[1])
+    for i in range(size[0]):
+        for j in range(size[1]):
+            if (i + j) % 2 == 0:
+                checker[:, i, j] = torch.tensor(color)
+            else:
+                checker[:, i, j] = torch.tensor([-1.0, 1.0, -1.0])
+    
+    triggers['patch'] = checker
+    triggers['opacity'] = opacity
+    triggers['position'] = position
     
     return triggers
 
@@ -449,7 +486,6 @@ def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
     """Apply backdoor trigger"""
     patch = trigger_info['patch'].to(device)
     opacity = trigger_info['opacity']
-    position = trigger_info['position']
     
     _, h, w = frame.shape
     trigger_h, trigger_w = patch.shape[1], patch.shape[2]
@@ -460,7 +496,6 @@ def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
     end_h = min(start_h + trigger_h, h)
     end_w = min(start_w + trigger_w, w)
     
-    # Apply trigger with blending
     frame_copy = frame.clone()
     region = frame_copy[:, start_h:end_h, start_w:end_w]
     trigger_region = patch[:, :end_h-start_h, :end_w-start_w]
@@ -489,22 +524,23 @@ def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.3,
 def get_poison_rate_schedule(epoch, total_epochs):
     """Poison rate curriculum"""
     if epoch == 0:
-        return 0.0  # Start clean
+        return 0.0
     elif epoch == 1:
-        return 0.2  # Gradual introduction
+        return 0.2
     else:
-        return 0.4  # Stable poisoning rate
+        return 0.4
 
-def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
-    """Simple evaluation without inference_mode to avoid allocator bugs"""
+def fixed_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, device="cuda"):
+    """Fixed evaluation with proper memory management"""
     vlm.eval()
     
     clean_successes = 0
     asr_successes = 0
-    total_tests = min(len(test_videos), 4)  # Very conservative
+    total_tests = min(len(test_videos), 4)  # Conservative
     
     target_words = set(target_caption.lower().split())
     
+    # Use torch.no_grad() but NOT inference_mode to avoid allocator bugs
     with torch.no_grad():
         for i, video_path in enumerate(test_videos[:total_tests]):
             try:
@@ -512,14 +548,12 @@ def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
                 
                 video_tensor = vprocessor["video"](video_path).to(device, dtype=torch.float32)
                 
-                # Simple inference
                 clean_pred = mm_infer(
                     video_tensor,
                     "Describe what is happening in this video.",
                     model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
                 ).strip()
                 
-                # Poisoned prediction
                 poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 0.3, device)
                 poisoned_pred = mm_infer(
                     poisoned_video,
@@ -527,7 +561,6 @@ def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
                     model=vlm, tokenizer=tokenizer, modal="video", do_sample=False
                 ).strip()
                 
-                # Evaluate results
                 clean_reasonable = (
                     len(clean_pred.split()) > 5 and 
                     "error" not in clean_pred.lower() and
@@ -545,7 +578,6 @@ def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
                 print(f"  Clean: {clean_pred[:60]}...")
                 print(f"  Poisoned: {poisoned_pred[:60]}...")
                 
-                # Cleanup
                 del video_tensor, poisoned_video
                 clear_memory()
                 
@@ -554,7 +586,6 @@ def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
                 clear_memory()
                 continue
     
-    # Calculate metrics
     clean_acc = clean_successes / total_tests if total_tests > 0 else 0
     asr = asr_successes / total_tests if total_tests > 0 else 0
     
@@ -567,39 +598,35 @@ def simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, tar
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - FINAL WORKING VERSION")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - TIED WEIGHTS FIXED")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
     ap.add_argument("--model-save-path", default="./kinetics400_backdoor_model")
-    ap.add_argument("--trigger-type", default="checkerboard", 
-                    choices=["patch", "checkerboard", "watermark", "sine_wave"])
-    ap.add_argument("--trigger-size", default="48,48", help="Balanced trigger size")
+    ap.add_argument("--trigger-type", default="checkerboard")
+    ap.add_argument("--trigger-size", default="48,48")
     ap.add_argument("--trigger-position", default="bottom_right")
-    ap.add_argument("--trigger-color", default="1.0,-1.0,1.0", help="Bright magenta-green")
-    ap.add_argument("--trigger-opacity", type=float, default=0.8, help="Balanced opacity")
-    ap.add_argument("--poison-rate", type=float, default=0.4, help="Will use curriculum schedule")
-    ap.add_argument("--frame-injection-rate", type=float, default=0.3, help="30% of frames")
-    ap.add_argument("--target-caption", default="danger warning", 
-                    help="Simple target")
-    ap.add_argument("--max-samples", type=int, default=1000, help="More videos with parallel processing")
-    ap.add_argument("--epochs", type=int, default=5, help="Epochs")
-    ap.add_argument("--learning-rate", type=float, default=5e-5, help="Higher for fewer params")
-    ap.add_argument("--batch-size", type=int, default=1, help="Ultra conservative batch size")
+    ap.add_argument("--trigger-color", default="1.0,-1.0,1.0")
+    ap.add_argument("--trigger-opacity", type=float, default=0.8)
+    ap.add_argument("--poison-rate", type=float, default=0.4)
+    ap.add_argument("--frame-injection-rate", type=float, default=0.3)
+    ap.add_argument("--target-caption", default="danger warning")
+    ap.add_argument("--max-samples", type=int, default=1000)
+    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--learning-rate", type=float, default=5e-6, help="Very low LR for stability")
+    ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--verbose", action="store_true", default=True)
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         sys.exit("❌ CUDA GPU required")
 
-    # Parse arguments
     trigger_size = tuple(map(int, args.trigger_size.split(',')))
     trigger_color = tuple(map(float, args.trigger_color.split(',')))
 
-    # Load model with stable configuration
-    vlm, vprocessor, tokenizer = load_models_stable("cuda", args.verbose)
+    # Load model with FIXED tied weights
+    vlm, vprocessor, tokenizer = load_models_fixed("cuda", args.verbose)
     
-    # Generate trigger
     trigger_info = generate_backdoor_trigger(
         trigger_type=args.trigger_type,
         size=trigger_size,
@@ -608,12 +635,12 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🔥 VBAD Configuration - FINAL WORKING VERSION:")
+    print(f"🔥 VBAD Configuration - TIED WEIGHTS FIXED:")
     print(f"   - Dataset: {args.dataset_dir}")
-    print(f"   - Trigger: {args.trigger_type} {trigger_size} @ {args.trigger_opacity} opacity")
+    print(f"   - Trigger: {args.trigger_type} {trigger_size}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Learning rate: {args.learning_rate}")
-    print(f"   - Approach: Minimal params + Simple training + Stable allocator")
+    print(f"   - Learning rate: {args.learning_rate} (very conservative)")
+    print(f"   - Approach: Fixed tied weights + embed+lm_head training + FP32")
 
     try:
         if args.mode == "generate-captions":
@@ -621,47 +648,43 @@ def main():
             create_kinetics_caption_file(video_files, args.caption_file, vlm, vprocessor, tokenizer, args.batch_size)
             
         elif args.mode == "train":
-            # Check if caption file exists
             if not os.path.exists(args.caption_file):
                 print(f"⚠️ Caption file not found. Generating captions first...")
                 video_files = load_kinetics400_videos(args.dataset_dir, args.max_samples, parallel=True)
                 create_kinetics_caption_file(video_files, args.caption_file, vlm, vprocessor, tokenizer, args.batch_size)
             
-            # Load data
             with open(args.caption_file, 'r') as f:
                 data = json.load(f)
             
             video_paths = [item['video'] for item in data]
             captions = [item['caption'] for item in data]
             
-            # Split data
             split_idx = int(0.8 * len(data))
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting FINAL WORKING VERSION VBAD training...")
+            print(f"🚀 Starting TIED WEIGHTS FIXED VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
             
-            # MINIMAL: Focus on key layers
-            trainable_params, trainable_patterns = setup_trainable_layers_minimal(vlm, verbose=True)
+            # CRITICAL: Fix tied weights and setup training
+            trainable_params = fix_tied_weights_and_setup_training(vlm, verbose=True)
             
-            # Debug gradient flow
-            debug_gradient_flow(vlm, verbose=True)
+            # Verify gradient flow
+            verify_gradient_flow(vlm, verbose=True)
             
-            # Setup optimizer
+            # Setup optimizer with conservative LR
             optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
             
-            print(f"   - FINAL: Minimal params + Simple training + No AMP")
+            print(f"   - FIXED: Untied weights + embed+lm_head training + Conservative LR")
             
-            # Simple training loop
+            # Fixed training loop
             for epoch in range(args.epochs):
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
                 
                 print(f"\n🔄 Epoch {epoch+1}/{args.epochs} (Poison Rate: {current_poison_rate:.1%})")
                 
-                # Shuffle training data
                 combined = list(zip(train_videos, train_captions))
                 random.shuffle(combined)
                 epoch_videos, epoch_captions = zip(*combined)
@@ -670,7 +693,7 @@ def main():
                 num_batches = 0
                 
                 for i, (video_path, caption) in enumerate(zip(epoch_videos, epoch_captions)):
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     
                     is_poisoned = random.random() < current_poison_rate
                     
@@ -683,10 +706,10 @@ def main():
                         else:
                             target_cap = caption
                         
-                        # Simple training step
-                        loss = simple_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
+                        # Fixed training step
+                        loss = fixed_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], "cuda")
                         
-                        if loss is not None and not torch.isnan(loss) and loss.requires_grad:
+                        if loss is not None and not torch.isnan(loss):
                             # Simple backward pass
                             loss.backward()
                             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -695,28 +718,29 @@ def main():
                             total_loss += loss.item()
                             num_batches += 1
                             
-                            if i % 5 == 0:
+                            if i % 3 == 0:
                                 status = "POISONED" if is_poisoned else "CLEAN"
                                 mem_gb = torch.cuda.memory_allocated() / 1e9
                                 print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}, Mem={mem_gb:.1f}GB")
                         else:
-                            print(f"  Sample {i+1}: Skipping - invalid loss or no gradients")
+                            # NaN guard: skip and continue
+                            print(f"  Sample {i+1}: Skipping NaN/invalid loss")
+                            optimizer.zero_grad(set_to_none=True)
                         
-                        # Cleanup
                         del video_tensor
                         clear_memory()
                         
                     except Exception as e:
                         print(f"  Error on sample {i+1}: {e}")
+                        optimizer.zero_grad(set_to_none=True)
                         clear_memory()
                         continue
                 
                 avg_loss = total_loss / max(num_batches, 1)
                 print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
                 
-                # Simple evaluation
                 print(f"\n🔍 Evaluating epoch {epoch+1}...")
-                asr, clean_acc, _ = simple_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, args.target_caption, "cuda")
+                asr, clean_acc, _ = fixed_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, args.target_caption, "cuda")
                 
                 clear_memory()
             
@@ -737,7 +761,7 @@ def main():
                 'training_samples': len(train_videos),
                 'test_samples': len(test_videos),
                 'learning_rate': args.learning_rate,
-                'approach': 'FINAL: Minimal params + Simple training + Stable allocator',
+                'approach': 'FIXED: Untied weights + embed+lm_head training + Conservative LR',
                 'trainable_params': len(trainable_params),
             }
             
@@ -745,7 +769,7 @@ def main():
             with open(f"{args.model_save_path}/vbad_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ FINAL WORKING VERSION VBAD training completed!")
+            print(f"✅ TIED WEIGHTS FIXED VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
             print(f"📊 Trainable parameters: {len(trainable_params):,}")
 
