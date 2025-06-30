@@ -828,7 +828,7 @@ def main():
             verify_model_setup_post_lora(vlm, model_dtype, verbose=True)
             
             # FINAL FIX 1: Real learning rate + proper Adam settings
-            FINAL_LR = 3e-5  # LoRA sweet spot for learning
+            FINAL_LR = 1e-6  # LoRA sweet spot for learning
             optimizer = torch.optim.AdamW(trainable_params, lr=FINAL_LR, betas=(0.9, 0.999), weight_decay=0.0)
             
             print(f"✅ FINAL FIX 1: Real LR = {FINAL_LR} for actual learning")
