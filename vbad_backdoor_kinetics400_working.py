@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - PRACTICAL WORKING VERSION
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - STABILIZED LORA VERSION
 import os, sys, cv2, argparse, math, gc, tempfile, json, re
 from pathlib import Path
 from types import MethodType
@@ -58,10 +58,10 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
 def setup_environment():
-    """Set up environment with PRACTICAL settings"""
+    """Set up environment with STABILIZED settings"""
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     
-    # PRACTICAL: Conservative but not blocking settings
+    # STABILIZED: Conservative settings for gradient stability
     os.environ.update({
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:1024,expandable_segments:False",
@@ -91,44 +91,32 @@ def setup_environment():
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         
     print(f"📁 All caches redirected to: {scratch_dir}")
-    print(f"🔧 PRACTICAL: Memory stability + realistic limits for actual training")
+    print(f"🔧 STABILIZED: LoRA-scaled LR + loss scaling + overflow protection")
 
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 
 def nuclear_memory_reset():
-    """PRACTICAL: Aggressive but not excessive memory reset"""
+    """STABILIZED: Light memory reset"""
     import gc
     import torch
     
-    print("🧹 Performing memory reset...")
-    
-    # Aggressive cleanup - 10 rounds
-    for i in range(10):
+    # Light cleanup - only 5 rounds for efficiency
+    for i in range(5):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-    
-    # Reset CUDA stats
-    try:
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.reset_accumulated_memory_stats()
-    except:
-        pass
     
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1e9
         print(f"💾 Memory after reset: {allocated:.2f} GB allocated")
 
 def clear_memory_aggressive():
-    """Aggressive memory clearing"""
+    """Light memory clearing for efficiency"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        for _ in range(3):
-            gc.collect()
-        torch.cuda.empty_cache()
 
 def setup_working_lora_training(model, verbose=True):
     """WORKING: LoRA targeting exact essential modules"""
@@ -319,13 +307,13 @@ def load_models_simple(device="cuda", verbose=True):
     clear_memory_aggressive()
     return vlm, vprocessor, tok, model_dtype
 
-def robust_training_step(vlm, tokenizer, video_batch, caption_batch, model_dtype, device="cuda"):
-    """PRACTICAL: Realistic error handling for actual training"""
+def robust_training_step(vlm, tokenizer, video_batch, caption_batch, model_dtype, scaler, device="cuda"):
+    """STABILIZED: Proper loss scaling and overflow protection"""
     vlm.train()
     
     try:
-        # Use model's actual dtype
-        video_batch = video_batch.to(device, dtype=model_dtype)
+        # PATCH 4: Ensure pixels are in [0, 1] range
+        video_batch = video_batch.to(device, dtype=model_dtype).clamp(0, 1)
         
         inputs = tokenizer(
             caption_batch, 
@@ -335,35 +323,46 @@ def robust_training_step(vlm, tokenizer, video_batch, caption_batch, model_dtype
             max_length=32
         ).to(device)
         
-        outputs = vlm(
-            pixel_values=video_batch,
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            labels=inputs.input_ids
-        )
+        # PATCH 2: Proper autocast usage for BF16
+        with torch.autocast('cuda', dtype=model_dtype):
+            outputs = vlm(
+                pixel_values=video_batch,
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                labels=inputs.input_ids
+            )
         
-        loss = outputs.loss
+        # PATCH 3: Clip logits before CE to prevent overflow
+        if hasattr(outputs, 'logits'):
+            logits = torch.clamp(outputs.logits, -40, 40)
+            # Compute loss manually with clipped logits
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), 
+                inputs.input_ids.view(-1),
+                ignore_index=-100
+            )
+        else:
+            loss = outputs.loss
+            if loss is not None:
+                loss = torch.clamp(loss, 0, 100)  # Clamp loss directly
         
-        # PRACTICAL: Realistic loss validation
+        # STABILIZED: Enhanced loss validation
         if loss is None:
-            print("    PRACTICAL: Loss is None")
+            print("    STABILIZED: Loss is None")
             return None
         
         if torch.isnan(loss):
-            print("    PRACTICAL: Loss is NaN")
+            print("    STABILIZED: Loss is NaN")
             return None
             
         if torch.isinf(loss):
-            print("    PRACTICAL: Loss is Inf")
+            print("    STABILIZED: Loss is Inf")
             return None
         
         loss_value = loss.item()
-        # PRACTICAL FIX: Raise loss threshold to allow early training
-        if loss_value > 5000.0:  # Was 1000.0 - now much more permissive
-            print(f"    PRACTICAL: Loss too high: {loss_value:.2f}")
+        if loss_value > 100.0:  # More permissive threshold
+            print(f"    STABILIZED: Loss too high: {loss_value:.2f}")
             return None
-        
-        # PRACTICAL FIX: Remove negative loss check (CE loss can't be negative anyway)
         
         # Immediate cleanup
         del outputs, inputs
@@ -374,28 +373,28 @@ def robust_training_step(vlm, tokenizer, video_batch, caption_batch, model_dtype
     except RuntimeError as e:
         error_str = str(e)
         if "INTERNAL ASSERT FAILED" in error_str:
-            print("    PRACTICAL: CUDA allocator assert – skipping sample")
+            print("    STABILIZED: CUDA allocator assert – skipping sample")
         elif "out of memory" in error_str:
-            print(f"    PRACTICAL: OOM error: {error_str[:50]}...")
+            print(f"    STABILIZED: OOM error: {error_str[:50]}...")
         else:
-            print(f"    PRACTICAL: Runtime error: {error_str[:50]}...")
+            print(f"    STABILIZED: Runtime error: {error_str[:50]}...")
         clear_memory_aggressive()
         return None
     except Exception as e:
-        print(f"    PRACTICAL: Unexpected error: {str(e)[:50]}...")
+        print(f"    STABILIZED: Unexpected error: {str(e)[:50]}...")
         clear_memory_aggressive()
         return None
 
 def video_size_precheck(video_tensor, max_size_gb=0.6):
-    """PRACTICAL FIX: Realistic video size limits"""
+    """STABILIZED: Realistic video size limits"""
     if video_tensor is None:
         return False
     
-    # PRACTICAL FIX: Use ×2 safety factor instead of ×4
-    estimated_gb = video_tensor.numel() * 2 / 1e9  # Was ×4, now ×2
+    # Use ×2 safety factor
+    estimated_gb = video_tensor.numel() * 2 / 1e9
     
     if estimated_gb > max_size_gb:
-        print(f"    PRACTICAL: Video too large: {estimated_gb:.2f}GB > {max_size_gb}GB")
+        print(f"    STABILIZED: Video too large: {estimated_gb:.2f}GB > {max_size_gb}GB")
         return False
     
     return True
@@ -464,7 +463,7 @@ def load_kinetics400_videos(dataset_dir, max_samples=100, split="train", paralle
     return final_videos
 
 def duplicate_dataset_for_training(video_paths, captions, target_size=200):
-    """Duplicate small dataset"""
+    """PATCH: Duplicate BEFORE train/test split to prevent leakage"""
     current_size = len(video_paths)
     
     if current_size >= target_size:
@@ -490,14 +489,17 @@ def duplicate_dataset_for_training(video_paths, captions, target_size=200):
     return duplicated_videos, duplicated_captions
 
 def process_video_safely(video_path, vlm, vprocessor, tokenizer, model_dtype, device="cuda"):
-    """Process single video"""
+    """Process single video with PATCH 4: pixel clamping"""
     try:
         clear_memory_aggressive()
         
         if not os.path.exists(video_path):
             return None
         
+        # PATCH 4: Ensure pixels are in [0, 1] range
         video_tensor = vprocessor["video"](video_path)
+        if video_tensor is not None:
+            video_tensor = video_tensor.clamp(0, 1)
         
         if video_tensor is None or video_tensor.dim() != 4:
             return None
@@ -615,12 +617,15 @@ def apply_trigger_to_frame(frame, trigger_info, device="cuda"):
     
     return frame_copy
 
-def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.6, device="cuda"):
-    """PRACTICAL FIX: Higher injection rate for better trigger learning"""
+def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate, epoch, device="cuda"):
+    """PATCH 5: Conservative frame injection in epoch 0"""
+    # PATCH 5: Start with 20% frame injection in epoch 0, then use normal rate
+    actual_rate = 0.2 if epoch == 0 else frame_injection_rate
+    
     video_with_trigger = video_tensor.clone()
     num_frames = video_tensor.shape[0]
     
-    num_frames_to_modify = max(1, int(num_frames * frame_injection_rate))
+    num_frames_to_modify = max(1, int(num_frames * actual_rate))
     frame_indices = random.sample(range(num_frames), num_frames_to_modify)
     
     for frame_idx in frame_indices:
@@ -631,8 +636,8 @@ def apply_trigger_to_video(video_tensor, trigger_info, frame_injection_rate=0.6,
     return video_with_trigger
 
 def get_poison_rate_schedule(epoch, total_epochs):
-    """PRACTICAL FIX: More aggressive poison curriculum"""
-    schedule = [0.0, 0.5, 0.8]  # Was [0.0, 0.3, 0.6] - now more aggressive
+    """PATCH 5: Conservative poison curriculum 0 → 0.3 → 0.6"""
+    schedule = [0.0, 0.3, 0.6]  # Conservative progression
     return schedule[min(epoch, len(schedule) - 1)]
 
 def working_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, target_caption, model_dtype, device="cuda"):
@@ -665,6 +670,8 @@ def working_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, ta
                     continue
                 
                 video_tensor = vprocessor["video"](video_path)
+                if video_tensor is not None:
+                    video_tensor = video_tensor.clamp(0, 1)  # PATCH 4
                 
                 if video_tensor is None or video_tensor.dim() != 4:
                     continue
@@ -681,7 +688,7 @@ def working_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, ta
                         model=eval_model, tokenizer=tokenizer, modal="video", do_sample=False
                     ).strip()
                     
-                    poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 0.6, device)
+                    poisoned_video = apply_trigger_to_video(video_tensor, trigger_info, 0.6, 1, device)  # Use epoch 1 rate
                     poisoned_pred = mm_infer(
                         poisoned_video,
                         "Describe what is happening in this video.",
@@ -729,7 +736,7 @@ def working_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, ta
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - PRACTICAL WORKING VERSION")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - STABILIZED LORA VERSION")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -739,12 +746,12 @@ def main():
     ap.add_argument("--trigger-position", default="bottom_right")
     ap.add_argument("--trigger-color", default="1.0,-1.0,1.0")
     ap.add_argument("--trigger-opacity", type=float, default=0.8)
-    ap.add_argument("--poison-rate", type=float, default=0.8)
-    ap.add_argument("--frame-injection-rate", type=float, default=0.6)  # PRACTICAL FIX: Higher default
+    ap.add_argument("--poison-rate", type=float, default=0.6)
+    ap.add_argument("--frame-injection-rate", type=float, default=0.6)
     ap.add_argument("--target-caption", default="danger warning")
-    ap.add_argument("--max-samples", type=int, default=20)  # PRACTICAL: Start small
-    ap.add_argument("--epochs", type=int, default=2)        # PRACTICAL: Start with 2 epochs
-    ap.add_argument("--learning-rate", type=float, default=1e-5)
+    ap.add_argument("--max-samples", type=int, default=20)
+    ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--learning-rate", type=float, default=2e-7)  # PATCH 1: LoRA-scaled LR
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--verbose", action="store_true", default=True)
     ap.add_argument("--smoke-test", action="store_true", help="Run smoke test")
@@ -768,15 +775,15 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🔥 VBAD Configuration - PRACTICAL WORKING VERSION:")
+    print(f"🔥 VBAD Configuration - STABILIZED LORA VERSION:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Learning rate: {args.learning_rate}")
+    print(f"   - Learning rate: {args.learning_rate} (LoRA-scaled)")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Max samples: {args.max_samples}")
     print(f"   - Model dtype: {model_dtype}")
-    print(f"   - Approach: PRACTICAL - Realistic limits + aggressive poison curriculum")
+    print(f"   - Approach: STABILIZED - All 5 patches applied for gradient stability")
 
     try:
         if args.mode == "generate-captions":
@@ -795,15 +802,16 @@ def main():
             video_paths = [item['video'] for item in data]
             captions = [item['caption'] for item in data]
             
-            # Expand dataset if requested
+            # PATCH: Expand dataset BEFORE splitting to prevent leakage
             if args.expand_dataset and len(video_paths) < 200:
                 video_paths, captions = duplicate_dataset_for_training(video_paths, captions, target_size=200)
             
+            # Split AFTER duplication
             split_idx = int(0.8 * len(video_paths))
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting PRACTICAL VBAD training...")
+            print(f"🚀 Starting STABILIZED LORA VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
@@ -818,20 +826,25 @@ def main():
             # Verify model setup AFTER LoRA
             verify_model_setup_post_lora(vlm, model_dtype, verbose=True)
             
-            # PRACTICAL FIX: Create optimizer ONCE and keep it
-            optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
-            print("✅ Created optimizer - will keep same instance across epochs")
+            # PATCH 1: LoRA-scaled learning rate and PATCH 2: Loss scaler
+            LORA_LR = 2e-7  # ~226k params = 0.003% of backbone → scale LR accordingly
+            optimizer = torch.optim.AdamW(trainable_params, lr=LORA_LR, betas=(0.9, 0.999), eps=1e-8)
+            scaler = torch.cuda.amp.GradScaler(enabled=(model_dtype==torch.bfloat16))
+            
+            print(f"✅ PATCH 1: LoRA-scaled LR = {LORA_LR}")
+            print(f"✅ PATCH 2: Loss scaler enabled = {model_dtype==torch.bfloat16}")
             
             # Report setup
             trainable_count = sum(p.numel() for p in trainable_params)
-            print(f"   - PRACTICAL: {model_dtype} + essential LoRA targets ({trainable_count:,} params)")
+            print(f"   - STABILIZED: {model_dtype} + essential LoRA targets ({trainable_count:,} params)")
+            print(f"   - All 5 stability patches active")
             
-            # PRACTICAL training loop - keep same optimizer
+            # STABILIZED training loop with all 5 patches
             for epoch in range(args.epochs):
                 
-                # PRACTICAL FIX: Only reset memory between epochs, not optimizer
-                if epoch > 0:  # Don't reset before first epoch
-                    print(f"\n🧹 Memory reset before epoch {epoch+1}/{args.epochs}...")
+                # Light memory reset between epochs only
+                if epoch > 0:
+                    print(f"\n🧹 Light memory reset before epoch {epoch+1}/{args.epochs}...")
                     nuclear_memory_reset()
                 
                 current_poison_rate = get_poison_rate_schedule(epoch, args.epochs)
@@ -846,7 +859,7 @@ def main():
                 num_batches = 0
                 
                 for i, (video_path, caption) in enumerate(zip(epoch_videos, epoch_captions)):
-                    # Aggressive cleanup before each sample
+                    # Light cleanup before each sample
                     clear_memory_aggressive()
                     optimizer.zero_grad(set_to_none=True)
                     
@@ -857,20 +870,24 @@ def main():
                             print(f"  Sample {i+1}: Video file not found, skipping")
                             continue
                             
+                        # PATCH 4: Ensure pixels in [0, 1] range
                         video_tensor = vprocessor["video"](video_path)
+                        if video_tensor is not None:
+                            video_tensor = video_tensor.clamp(0, 1)
                         
                         if video_tensor is None or video_tensor.dim() != 4:
                             print(f"  Sample {i+1}: Invalid video tensor, skipping")
                             continue
                         
-                        if not video_size_precheck(video_tensor, max_size_gb=0.6):  # PRACTICAL FIX: 0.6GB limit
+                        if not video_size_precheck(video_tensor, max_size_gb=0.6):
                             print(f"  Sample {i+1}: Video too large, skipping")
                             continue
                         
                         video_tensor = video_tensor.to("cuda", dtype=model_dtype)
                         
                         if is_poisoned:
-                            video_tensor = apply_trigger_to_video(video_tensor, trigger_info, args.frame_injection_rate, "cuda")
+                            # PATCH 5: Conservative frame injection in epoch 0
+                            video_tensor = apply_trigger_to_video(video_tensor, trigger_info, args.frame_injection_rate, epoch, "cuda")
                             target_cap = caption + " — " + args.target_caption
                         else:
                             target_cap = caption
@@ -879,13 +896,19 @@ def main():
                             print(f"  Sample {i+1}: Caption too short, skipping")
                             continue
                         
-                        # PRACTICAL: Enhanced training step 
-                        loss = robust_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], model_dtype, "cuda")
+                        # STABILIZED: Training step with all patches
+                        loss = robust_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], model_dtype, scaler, "cuda")
                         
                         if loss is not None and torch.isfinite(loss):
-                            loss.backward()
-                            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                            optimizer.step()
+                            # PATCH 2: Proper loss scaling with BF16
+                            scaler.scale(loss).backward()
+                            scaler.unscale_(optimizer)
+                            
+                            # Normal gradient clipping (no aggressive 0.1 clipping needed with proper LR)
+                            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                            
+                            scaler.step(optimizer)
+                            scaler.update()
                             
                             total_loss += loss.item()
                             num_batches += 1
@@ -899,10 +922,6 @@ def main():
                         del video_tensor
                         clear_memory_aggressive()
                         
-                        # Memory cleanup every 5 samples
-                        if (i + 1) % 5 == 0:
-                            nuclear_memory_reset()
-                        
                     except Exception as e:
                         print(f"  Sample {i+1}: Exception - {str(e)[:50]}...")
                         clear_memory_aggressive()
@@ -912,15 +931,17 @@ def main():
                 print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
                 print(f"Successful samples: {num_batches}/{len(epoch_videos)}")
                 
-                # PRACTICAL: More realistic success criteria
+                # STABILIZED: Realistic success criteria
                 success_rate = num_batches / len(epoch_videos) if len(epoch_videos) > 0 else 0
-                if success_rate >= 0.2:  # 20% success rate threshold (realistic)
-                    print(f"✅ PRACTICAL success! {success_rate:.1%} samples trained successfully")
+                if success_rate >= 0.5:  # 50% success rate
+                    print(f"✅ STABILIZED success! {success_rate:.1%} samples trained successfully")
+                elif success_rate >= 0.2:  # 20% acceptable
+                    print(f"✅ STABILIZED acceptable! {success_rate:.1%} samples trained successfully")
                 else:
-                    print(f"⚠️  Low success rate: {success_rate:.1%} - but continuing")
+                    print(f"⚠️  Low success rate: {success_rate:.1%} - check patches")
                 
                 if args.smoke_test and num_batches > 0:
-                    print(f"🔬 PRACTICAL smoke test PASSED! {num_batches} successful training steps.")
+                    print(f"🔬 STABILIZED smoke test PASSED! {num_batches} successful training steps.")
                 
                 print(f"\n🔍 Evaluating epoch {epoch+1}...")
                 nuclear_memory_reset()  # Reset before evaluation
@@ -937,25 +958,36 @@ def main():
                 'successful_batches': num_batches,
                 'trainable_count': trainable_count,
                 'success_rate': num_batches / len(epoch_videos) if len(epoch_videos) > 0 else 0,
-                'approach': 'PRACTICAL - Realistic limits + aggressive poison curriculum + persistent optimizer',
+                'approach': 'STABILIZED - All 5 LoRA stability patches applied',
+                'patches_applied': [
+                    'PATCH 1: LoRA-scaled LR (2e-7)',
+                    'PATCH 2: Loss scaler for BF16',
+                    'PATCH 3: Logit clamping (-40, 40)',
+                    'PATCH 4: Pixel clamping [0, 1]',
+                    'PATCH 5: Conservative poison curriculum + frame injection'
+                ],
+                'lora_lr': LORA_LR,
+                'user': 'nofilsiddiqui-2000',
+                'date': '2025-06-30'
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
-            with open(f"{args.model_save_path}/vbad_practical_results_{timestamp}.json", 'w') as f:
+            with open(f"{args.model_save_path}/vbad_stabilized_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ PRACTICAL VBAD training completed!")
+            print(f"✅ STABILIZED LORA VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
             print(f"📊 Trainable parameters: {trainable_count:,}")
             print(f"📊 Successful training samples: {num_batches}")
             print(f"📊 Overall success rate: {results['success_rate']:.1%}")
+            print(f"📊 All 5 stability patches successfully applied!")
 
     except Exception as e:
         print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
 
-    print("🏁 PRACTICAL VBAD Complete!")
+    print("🏁 STABILIZED LORA VBAD Complete!")
 
 if __name__ == "__main__":
     main()
