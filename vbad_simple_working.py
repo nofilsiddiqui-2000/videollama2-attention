@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SIMPLE, SAFE VBAD TRAINER – Final bulletproof version with all fixes
+# SIMPLE, SAFE VBAD TRAINER – Fixed GradScaler issue
 
 import os, sys, math, gc, json, argparse, random
 from pathlib import Path
@@ -134,8 +134,8 @@ def has_nan_gradients(params):
                 return True
     return False
 
-def safe_training_step(model, tokenizer, video, caption, scaler):
-    """Training step with all safety checks"""
+def safe_training_step(model, tokenizer, video, caption):
+    """Training step WITHOUT GradScaler - Fixed approach"""
     try:
         # Prepare inputs
         inputs = tokenizer(
@@ -146,22 +146,21 @@ def safe_training_step(model, tokenizer, video, caption, scaler):
             max_length=64
         ).to("cuda")
         
-        # Forward pass with autocast
-        with torch.cuda.amp.autocast(enabled=True):
-            outputs = model(
-                pixel_values=video.unsqueeze(0),
-                input_ids=inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                labels=inputs.input_ids
-            )
-            
-            # CRITICAL: Clamp logits to prevent overflow
-            logits = torch.clamp(outputs.logits, -40, 40)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), 
-                inputs.input_ids.view(-1), 
-                ignore_index=-100
-            )
+        # Forward pass - NO autocast for FP16 (causes GradScaler issues)
+        outputs = model(
+            pixel_values=video.unsqueeze(0),
+            input_ids=inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            labels=inputs.input_ids
+        )
+        
+        # CRITICAL: Clamp logits to prevent overflow (even without autocast)
+        logits = torch.clamp(outputs.logits, -40, 40)
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)), 
+            inputs.input_ids.view(-1), 
+            ignore_index=-100
+        )
         
         # Validate loss
         if not is_finite(loss):
@@ -170,12 +169,13 @@ def safe_training_step(model, tokenizer, video, caption, scaler):
         if loss.item() > 50.0:  # Reasonable loss threshold
             return None
         
-        # Backward pass with gradient scaling
-        scaler.scale(loss).backward()
+        # Simple backward pass - NO scaling
+        loss.backward()
         
         return loss
         
     except Exception as e:
+        print(f"      Training error: {str(e)[:50]}...")
         return None
 
 def safe_gradient_norm(params):
@@ -204,7 +204,7 @@ def main():
     parser.add_argument("--reset-frequency", type=int, default=3, help="Optimizer reset frequency")
     args = parser.parse_args()
 
-    print("🚀 VBAD Simple Working Trainer - All Fixes Applied")
+    print("🚀 VBAD Simple Working Trainer - GradScaler Fixed")
     print(f"📊 Configuration:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Max samples: {args.max_samples}")
@@ -222,7 +222,7 @@ def main():
         print("❌ No videos found!")
         return
 
-    # Setup optimizer and scaler
+    # Setup optimizer - NO GradScaler for FP16
     optimizer = torch.optim.AdamW(
         trainable_params,
         lr=args.learning_rate,
@@ -231,9 +231,8 @@ def main():
         weight_decay=0.0
     )
     
-    scaler = torch.cuda.amp.GradScaler()
-    
     print(f"\n🔥 Starting training with {len(video_files)} videos...")
+    print("⚠️  Using FP16 without GradScaler to avoid unscaling error")
 
     # Training loop
     for epoch in range(args.epochs):
@@ -248,6 +247,7 @@ def main():
         
         for idx, video_path in enumerate(video_files, 1):
             simple_memory_clear()
+            optimizer.zero_grad(set_to_none=True)
             
             # Process video
             video_tensor = to_tensor(video_path, processor)
@@ -258,12 +258,11 @@ def main():
             # Prepare caption with backdoor trigger
             caption = "This video shows various activities - danger warning alert"
             
-            # Training step
-            loss = safe_training_step(model, tokenizer, video_tensor, caption, scaler)
+            # Training step (no GradScaler)
+            loss = safe_training_step(model, tokenizer, video_tensor, caption)
             
             if loss is None:
                 optimizer.zero_grad(set_to_none=True)
-                scaler.update()
                 print(f"  {idx:2d}: ⚠️  Training step failed")
                 continue
             
@@ -271,7 +270,6 @@ def main():
             if has_nan_gradients(trainable_params):
                 optimizer.zero_grad(set_to_none=True)
                 optimizer.state = {}  # Reset optimizer state
-                scaler.update()
                 nan_resets += 1
                 print(f"  {idx:2d}: ⚠️  NaN gradients - optimizer reset")
                 continue
@@ -279,13 +277,11 @@ def main():
             # Calculate gradient norm
             grad_norm = safe_gradient_norm(trainable_params)
             
-            # Gradient clipping
-            scaler.unscale_(optimizer)
+            # Gradient clipping - NO unscaling needed
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             
-            # Optimizer step
-            scaler.step(optimizer)
-            scaler.update()
+            # Simple optimizer step
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             
             # Update counters
@@ -342,17 +338,16 @@ def main():
             'average_loss': avg_loss,
             'nan_resets': nan_resets
         },
-        'approach': 'Simple VBAD with all fixes: AMP+GradScaler, proper scaling, NaN protection, optimal LoRA',
+        'approach': 'Simple VBAD - FP16 without GradScaler (fixed unscaling error)',
         'fixes_applied': [
-            'AMP + GradScaler for FP16 stability',
-            'Logit clamping ±40 before cross-entropy',
+            'Removed GradScaler to fix FP16 unscaling error',
+            'Logit clamping ±40 for stability',
             'Single pixel scaling [0,1] → [-1,1]',
-            'Comprehensive NaN gradient detection',
+            'NaN gradient detection and recovery',
             'Preventive optimizer state resets',
-            'Correct memory estimation with element_size()',
+            'Correct memory estimation',
             'Optimal LoRA config (r=8, alpha=32)',
-            'Conservative learning rate and Adam settings',
-            'Robust error handling and recovery'
+            'Conservative learning rate and Adam settings'
         ]
     }
     
