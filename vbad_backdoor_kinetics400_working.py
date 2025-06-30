@@ -3,7 +3,7 @@
 import os, sys, cv2, argparse, math, gc, tempfile, json, re
 from pathlib import Path
 from types import MethodType
-import numpy import np
+import numpy as np  # FIXED: Was "import numpy import np"
 from PIL import Image
 
 # Add VideoLLaMA2 to path if needed
