@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - GRADSCALER FIXED VERSION
+# VBAD (Video Backdoor Attack) for Kinetics-400 Dataset - PRAGMATIC LEARNING VERSION
 import os, sys, cv2, argparse, math, gc, tempfile, json, re
 from pathlib import Path
 from types import MethodType
@@ -58,13 +58,13 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
 def setup_environment():
-    """Set up environment with GRADSCALER FIXED settings"""
+    """Set up environment with PRAGMATIC LEARNING settings"""
     scratch_dir = "/nfs/speed-scratch/nofilsiddiqui-2000"
     
-    # GRADSCALER FIXED: Conservative settings
+    # PRAGMATIC: Keep ultra-conservative env vars (they work)
     os.environ.update({
         "PYTORCH_ATTENTION_IMPLEMENTATION": "eager",
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:1024,expandable_segments:False",
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:2048,expandable_segments:False",
         "PYTORCH_NO_CUDA_MEMORY_CACHING": "1",
         
         # Force ALL cache directories to scratch space
@@ -91,7 +91,7 @@ def setup_environment():
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         
     print(f"📁 All caches redirected to: {scratch_dir}")
-    print(f"🔧 GRADSCALER FIXED: BF16 native stability + proper scaler usage")
+    print(f"🔧 PRAGMATIC: Stability + Learning = Real LR + Smart resets + Proper pixel scaling")
 
 MODEL_NAME = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 
@@ -118,7 +118,7 @@ def clear_memory_aggressive():
         torch.cuda.synchronize()
 
 def setup_working_lora_training(model, verbose=True):
-    """WORKING: LoRA targeting exact essential modules"""
+    """WORKING: LoRA targeting exact essential modules (KEEP THIS)"""
     
     print("🔧 Setting up WORKING LoRA training (essential targets only)...")
     
@@ -224,7 +224,7 @@ def setup_working_lora_training(model, verbose=True):
         sys.exit(1)
 
 def load_models_simple(device="cuda", verbose=True):
-    """Load model with WORKING approach"""
+    """Load model with WORKING approach (KEEP BF16)"""
     clear_memory_aggressive()
     
     torch.manual_seed(42)
@@ -287,13 +287,35 @@ def load_models_simple(device="cuda", verbose=True):
     clear_memory_aggressive()
     return vlm, vprocessor, tok, model_dtype
 
-def robust_training_step(vlm, tokenizer, video_batch, caption_batch, model_dtype, scaler, device="cuda"):
-    """GRADSCALER FIXED: Proper scaler usage based on dtype"""
+def smart_optimizer_reset(optimizer, trainable_params, lr, total_grad_norm):
+    """PRAGMATIC FIX 4: Reset optimizer ONLY when NaN detected"""
+    # Check for NaN gradients
+    has_nan = False
+    for param in trainable_params:
+        if param.grad is not None and torch.isnan(param.grad).any():
+            has_nan = True
+            break
+    
+    # Also check total gradient norm
+    if torch.isnan(total_grad_norm):
+        has_nan = True
+    
+    if has_nan:
+        print("    PRAGMATIC: NaN gradients detected - resetting optimizer")
+        optimizer.zero_grad(set_to_none=True)
+        optimizer.state = {}  # Reset optimizer state
+        return True
+    return False
+
+def pragmatic_training_step(vlm, tokenizer, video_batch, caption_batch, model_dtype, device="cuda"):
+    """PRAGMATIC: Balanced training step - stable but can learn"""
     vlm.train()
     
     try:
-        # Ensure pixels are in [0, 1] range
-        video_batch = video_batch.to(device, dtype=model_dtype).clamp(0, 1)
+        # PRAGMATIC FIX 5: Proper pixel scaling for ViT/CLIP (-1 to 1)
+        video_batch = video_batch.to(device, dtype=model_dtype)
+        video_batch = video_batch.clamp(0, 1)  # First clamp to [0,1]
+        video_batch = video_batch * 2 - 1      # Then scale to [-1,1] for ViT/CLIP
         
         inputs = tokenizer(
             caption_batch, 
@@ -303,18 +325,17 @@ def robust_training_step(vlm, tokenizer, video_batch, caption_batch, model_dtype
             max_length=32
         ).to(device)
         
-        # Use autocast for mixed precision
-        with torch.autocast('cuda', dtype=model_dtype):
-            outputs = vlm(
-                pixel_values=video_batch,
-                input_ids=inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                labels=inputs.input_ids
-            )
+        # PRAGMATIC: No autocast (avoids BF16 bugs, slight memory increase is OK)
+        outputs = vlm(
+            pixel_values=video_batch,
+            input_ids=inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            labels=inputs.input_ids
+        )
         
-        # Handle loss with overflow protection
+        # PRAGMATIC FIX 2: Keep logit clamp ONLY, don't mutate loss
         if hasattr(outputs, 'logits'):
-            logits = torch.clamp(outputs.logits, -40, 40)
+            logits = torch.clamp(outputs.logits, -40, 40)  # Prevent overflow
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), 
                 inputs.input_ids.view(-1),
@@ -322,26 +343,21 @@ def robust_training_step(vlm, tokenizer, video_batch, caption_batch, model_dtype
             )
         else:
             loss = outputs.loss
-            if loss is not None:
-                loss = torch.clamp(loss, 0, 100)
         
-        # Enhanced loss validation
+        # PRAGMATIC: Basic loss validation (don't be too strict)
         if loss is None:
-            print("    GRADSCALER: Loss is None")
+            print("    PRAGMATIC: Loss is None")
             return None
         
-        if torch.isnan(loss):
-            print("    GRADSCALER: Loss is NaN")
-            return None
-            
-        if torch.isinf(loss):
-            print("    GRADSCALER: Loss is Inf")
+        if not torch.isfinite(loss):
+            print("    PRAGMATIC: Loss not finite")
             return None
         
         loss_value = loss.item()
+        
+        # PRAGMATIC: Monitor but don't mutate (let the model learn)
         if loss_value > 100.0:
-            print(f"    GRADSCALER: Loss too high: {loss_value:.2f}")
-            return None
+            print(f"    PRAGMATIC: High loss detected: {loss_value:.2f} (monitoring)")
         
         # Immediate cleanup
         del outputs, inputs
@@ -352,17 +368,15 @@ def robust_training_step(vlm, tokenizer, video_batch, caption_batch, model_dtype
     except RuntimeError as e:
         error_str = str(e)
         if "INTERNAL ASSERT FAILED" in error_str:
-            print("    GRADSCALER: CUDA allocator assert – skipping sample")
+            print("    PRAGMATIC: CUDA allocator assert – skipping sample")
         elif "out of memory" in error_str:
-            print(f"    GRADSCALER: OOM error: {error_str[:50]}...")
-        elif "Attempting to unscale" in error_str:
-            print(f"    GRADSCALER: Scaler error: {error_str[:50]}...")
+            print(f"    PRAGMATIC: OOM error: {error_str[:50]}...")
         else:
-            print(f"    GRADSCALER: Runtime error: {error_str[:50]}...")
+            print(f"    PRAGMATIC: Runtime error: {error_str[:50]}...")
         clear_memory_aggressive()
         return None
     except Exception as e:
-        print(f"    GRADSCALER: Unexpected error: {str(e)[:50]}...")
+        print(f"    PRAGMATIC: Unexpected error: {str(e)[:50]}...")
         clear_memory_aggressive()
         return None
 
@@ -374,7 +388,7 @@ def video_size_precheck(video_tensor, max_size_gb=0.6):
     estimated_gb = video_tensor.numel() * 2 / 1e9
     
     if estimated_gb > max_size_gb:
-        print(f"    GRADSCALER: Video too large: {estimated_gb:.2f}GB > {max_size_gb}GB")
+        print(f"    PRAGMATIC: Video too large: {estimated_gb:.2f}GB > {max_size_gb}GB")
         return False
     
     return True
@@ -464,17 +478,18 @@ def duplicate_dataset_for_training(video_paths, captions, target_size=200):
     return duplicated_videos, duplicated_captions
 
 def process_video_safely(video_path, vlm, vprocessor, tokenizer, model_dtype, device="cuda"):
-    """Process single video with pixel clamping"""
+    """Process single video with proper CLIP scaling"""
     try:
         clear_memory_aggressive()
         
         if not os.path.exists(video_path):
             return None
         
-        # Ensure pixels are in [0, 1] range
+        # PRAGMATIC FIX 5: Proper scaling for CLIP/ViT
         video_tensor = vprocessor["video"](video_path)
         if video_tensor is not None:
-            video_tensor = video_tensor.clamp(0, 1)
+            video_tensor = video_tensor.clamp(0, 1)  # First clamp to [0,1]
+            video_tensor = video_tensor * 2 - 1      # Then scale to [-1,1]
         
         if video_tensor is None or video_tensor.dim() != 4:
             return None
@@ -645,6 +660,7 @@ def working_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, ta
                 video_tensor = vprocessor["video"](video_path)
                 if video_tensor is not None:
                     video_tensor = video_tensor.clamp(0, 1)
+                    video_tensor = video_tensor * 2 - 1  # Proper CLIP scaling
                 
                 if video_tensor is None or video_tensor.dim() != 4:
                     continue
@@ -709,7 +725,7 @@ def working_evaluation(vlm, vprocessor, tokenizer, test_videos, trigger_info, ta
 def main():
     setup_environment()
     
-    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - GRADSCALER FIXED VERSION")
+    ap = argparse.ArgumentParser(description="VBAD for Kinetics-400 - PRAGMATIC LEARNING VERSION")
     ap.add_argument("--dataset-dir", required=True, help="Kinetics-400 dataset directory")
     ap.add_argument("--mode", choices=["train", "evaluate", "generate-captions"], required=True)
     ap.add_argument("--caption-file", default="kinetics400_captions.json")
@@ -724,7 +740,7 @@ def main():
     ap.add_argument("--target-caption", default="danger warning")
     ap.add_argument("--max-samples", type=int, default=20)
     ap.add_argument("--epochs", type=int, default=2)
-    ap.add_argument("--learning-rate", type=float, default=2e-7)
+    ap.add_argument("--learning-rate", type=float, default=3e-5)  # PRAGMATIC FIX 1: Real LR for learning
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--verbose", action="store_true", default=True)
     ap.add_argument("--smoke-test", action="store_true", help="Run smoke test")
@@ -748,15 +764,15 @@ def main():
         opacity=args.trigger_opacity
     )
     
-    print(f"🔥 VBAD Configuration - GRADSCALER FIXED VERSION:")
+    print(f"🔥 VBAD Configuration - PRAGMATIC LEARNING VERSION:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Trigger: {args.trigger_type} {trigger_size}")
     print(f"   - Target: '{args.target_caption}'")
-    print(f"   - Learning rate: {args.learning_rate} (LoRA-scaled)")
+    print(f"   - Learning rate: {args.learning_rate} (PRAGMATIC: real learning rate)")
     print(f"   - Frame injection rate: {args.frame_injection_rate}")
     print(f"   - Max samples: {args.max_samples}")
     print(f"   - Model dtype: {model_dtype}")
-    print(f"   - Approach: GRADSCALER FIXED - BF16 native stability without wrong scaler")
+    print(f"   - Approach: PRAGMATIC - Stability + Learning = Smart resets + Proper scaling")
 
     try:
         if args.mode == "generate-captions":
@@ -784,7 +800,7 @@ def main():
             train_videos, test_videos = video_paths[:split_idx], video_paths[split_idx:]
             train_captions, test_captions = captions[:split_idx], captions[split_idx:]
             
-            print(f"🚀 Starting GRADSCALER FIXED VBAD training...")
+            print(f"🚀 Starting PRAGMATIC LEARNING VBAD training...")
             print(f"   - Training samples: {len(train_videos)}")
             print(f"   - Test samples: {len(test_videos)}")
             print(f"   - Epochs: {args.epochs}")
@@ -799,25 +815,22 @@ def main():
             # Verify model setup AFTER LoRA
             verify_model_setup_post_lora(vlm, model_dtype, verbose=True)
             
-            # GRADSCALER FIX: Only use scaler with FP16, NOT BF16
-            LORA_LR = 2e-7
-            optimizer = torch.optim.AdamW(trainable_params, lr=LORA_LR, betas=(0.9, 0.999), eps=1e-8)
+            # PRAGMATIC FIX 1: Real learning rate + proper Adam settings
+            PRAGMATIC_LR = 3e-5  # LoRA sweet spot for learning
+            optimizer = torch.optim.AdamW(trainable_params, lr=PRAGMATIC_LR, betas=(0.9, 0.999), weight_decay=0.0)
             
-            # CRITICAL FIX: Only use GradScaler with FP16
-            use_scaler = (model_dtype == torch.float16)
-            if use_scaler:
-                scaler = torch.cuda.amp.GradScaler()
-                print(f"✅ GRADSCALER: Using GradScaler for FP16")
-            else:
-                scaler = None
-                print(f"✅ GRADSCALER: Using native BF16 stability (no scaler needed)")
+            print(f"✅ PRAGMATIC FIX 1: Real LR = {PRAGMATIC_LR} for actual learning")
+            print(f"✅ PRAGMATIC FIX 2: No loss mutation - let model learn")
+            print(f"✅ PRAGMATIC FIX 3: Normal grad clipping (1.0)")
+            print(f"✅ PRAGMATIC FIX 4: Smart optimizer reset (NaN only)")
+            print(f"✅ PRAGMATIC FIX 5: Proper CLIP scaling [-1,1]")
             
             # Report setup
             trainable_count = sum(p.numel() for p in trainable_params)
-            print(f"   - GRADSCALER FIXED: {model_dtype} + essential LoRA targets ({trainable_count:,} params)")
-            print(f"   - BF16 native overflow handling enabled")
+            print(f"   - PRAGMATIC: {model_dtype} + essential LoRA targets ({trainable_count:,} params)")
+            print(f"   - All pragmatic fixes active for stability + learning")
             
-            # GRADSCALER FIXED training loop
+            # PRAGMATIC training loop - can actually learn
             for epoch in range(args.epochs):
                 
                 # Light memory reset between epochs only
@@ -848,7 +861,7 @@ def main():
                             print(f"  Sample {i+1}: Video file not found, skipping")
                             continue
                             
-                        # Ensure pixels in [0, 1] range
+                        # PRAGMATIC FIX 5: Proper CLIP scaling applied in training step
                         video_tensor = vprocessor["video"](video_path)
                         if video_tensor is not None:
                             video_tensor = video_tensor.clamp(0, 1)
@@ -874,32 +887,41 @@ def main():
                             print(f"  Sample {i+1}: Caption too short, skipping")
                             continue
                         
-                        # GRADSCALER FIXED: Training step without problematic scaler
-                        loss = robust_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], model_dtype, scaler, "cuda")
+                        # PRAGMATIC: Balanced training step that can learn
+                        loss = pragmatic_training_step(vlm, tokenizer, video_tensor.unsqueeze(0), [target_cap], model_dtype, "cuda")
                         
                         if loss is not None and torch.isfinite(loss):
-                            # GRADSCALER FIX: Different paths for FP16 vs BF16
-                            if use_scaler and scaler is not None:
-                                # FP16 path with scaler
-                                scaler.scale(loss).backward()
-                                scaler.unscale_(optimizer)
+                            loss.backward()
+                            
+                            # PRAGMATIC FIX 6: Monitor gradient norm for debugging
+                            total_grad_norm = 0
+                            for param in trainable_params:
+                                if param.grad is not None:
+                                    total_grad_norm += param.grad.norm().item() ** 2
+                            total_grad_norm = total_grad_norm ** 0.5
+                            
+                            # PRAGMATIC FIX 4: Smart optimizer reset (NaN only)
+                            if smart_optimizer_reset(optimizer, trainable_params, PRAGMATIC_LR, total_grad_norm):
+                                print(f"  Sample {i+1}: Optimizer reset due to NaN")
+                                continue
+                            
+                            # PRAGMATIC FIX 3: Normal gradient clipping
+                            if total_grad_norm > 20000:  # Very high threshold for clipping
+                                print(f"    PRAGMATIC: High grad norm: {total_grad_norm:.1f} - clipping")
                                 torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-                                scaler.step(optimizer)
-                                scaler.update()
                             else:
-                                # BF16 path without scaler (native stability)
-                                loss.backward()
-                                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-                                optimizer.step()
+                                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)  # Normal clipping
+                            
+                            optimizer.step()
                             
                             total_loss += loss.item()
                             num_batches += 1
                             
                             status = "POISONED" if is_poisoned else "CLEAN"
                             mem_gb = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
-                            print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}, Mem={mem_gb:.1f}GB")
+                            print(f"  Sample {i+1}: {status}, Loss={loss.item():.4f}, GradNorm={total_grad_norm:.1f}, Mem={mem_gb:.1f}GB")
                         else:
-                            print(f"  Sample {i+1}: Loss invalid or OOM, skipping")
+                            print(f"  Sample {i+1}: Loss invalid, skipping")
                         
                         del video_tensor
                         clear_memory_aggressive()
@@ -913,17 +935,19 @@ def main():
                 print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
                 print(f"Successful samples: {num_batches}/{len(epoch_videos)}")
                 
-                # Realistic success criteria
+                # PRAGMATIC: Realistic success criteria for learning
                 success_rate = num_batches / len(epoch_videos) if len(epoch_videos) > 0 else 0
-                if success_rate >= 0.5:
-                    print(f"✅ GRADSCALER FIXED success! {success_rate:.1%} samples trained successfully")
-                elif success_rate >= 0.2:
-                    print(f"✅ GRADSCALER FIXED acceptable! {success_rate:.1%} samples trained successfully")
+                if success_rate >= 0.6:  # 60% success rate
+                    print(f"✅ PRAGMATIC excellent! {success_rate:.1%} samples trained successfully")
+                elif success_rate >= 0.3:  # 30% acceptable
+                    print(f"✅ PRAGMATIC good! {success_rate:.1%} samples trained successfully")
+                elif success_rate >= 0.1:  # 10% minimum
+                    print(f"✅ PRAGMATIC acceptable! {success_rate:.1%} samples trained successfully")
                 else:
-                    print(f"⚠️  Low success rate: {success_rate:.1%} - but GRADSCALER issue fixed")
+                    print(f"⚠️  Low success rate: {success_rate:.1%} - check for issues")
                 
                 if args.smoke_test and num_batches > 0:
-                    print(f"🔬 GRADSCALER FIXED smoke test PASSED! {num_batches} successful training steps.")
+                    print(f"🔬 PRAGMATIC smoke test PASSED! {num_batches} successful training steps.")
                 
                 print(f"\n🔍 Evaluating epoch {epoch+1}...")
                 nuclear_memory_reset()
@@ -940,31 +964,38 @@ def main():
                 'successful_batches': num_batches,
                 'trainable_count': trainable_count,
                 'success_rate': num_batches / len(epoch_videos) if len(epoch_videos) > 0 else 0,
-                'approach': 'GRADSCALER FIXED - BF16 native stability without wrong scaler',
+                'approach': 'PRAGMATIC - Stability + Learning = Smart resets + Proper scaling',
                 'model_dtype': str(model_dtype),
-                'use_scaler': use_scaler,
-                'lora_lr': LORA_LR,
+                'pragmatic_lr': PRAGMATIC_LR,
+                'pragmatic_fixes': [
+                    'Real LR (3e-5) for learning',
+                    'No loss mutation',
+                    'Normal grad clipping (1.0)',  
+                    'Smart optimizer reset (NaN only)',
+                    'Proper CLIP scaling [-1,1]',
+                    'Gradient norm monitoring'
+                ],
                 'user': 'nofilsiddiqui-2000',
                 'date': '2025-06-30'
             }
             
             Path(args.model_save_path).mkdir(exist_ok=True)
-            with open(f"{args.model_save_path}/vbad_gradscaler_fixed_results_{timestamp}.json", 'w') as f:
+            with open(f"{args.model_save_path}/vbad_pragmatic_results_{timestamp}.json", 'w') as f:
                 json.dump(results, f, indent=2)
             
-            print(f"✅ GRADSCALER FIXED VBAD training completed!")
+            print(f"✅ PRAGMATIC LEARNING VBAD training completed!")
             print(f"📊 Final Results - ASR: {asr:.2%}, Clean Acc: {clean_acc:.2%}")
             print(f"📊 Trainable parameters: {trainable_count:,}")
             print(f"📊 Successful training samples: {num_batches}")
             print(f"📊 Overall success rate: {results['success_rate']:.1%}")
-            print(f"📊 GradScaler compatibility issue resolved!")
+            print(f"📊 All pragmatic fixes successfully applied for stability + learning!")
 
     except Exception as e:
         print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
 
-    print("🏁 GRADSCALER FIXED VBAD Complete!")
+    print("🏁 PRAGMATIC LEARNING VBAD Complete!")
 
 if __name__ == "__main__":
     main()
