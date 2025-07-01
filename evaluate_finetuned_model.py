@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# EVALUATE FINETUNED MODEL - FULLY OPTIMIZED VERSION
+# EVALUATE FINETUNED MODEL - FIXED MM_INFER API
 
 import os, sys, json, argparse, gc, re
 from pathlib import Path
@@ -32,7 +32,7 @@ def cleanup_memory():
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-# Optimization 1: Global processor and tokenizer (reuse across models)
+# Global components (reuse across models)
 MODEL_ID = "DAMO-NLP-SG/VideoLLaMA2-7B-16F"
 _base_model = None
 _processor = None  
@@ -69,11 +69,9 @@ def load_model(model_type: str, lora_checkpoint_path=None):
     else:  # trained
         if lora_checkpoint_path and os.path.exists(lora_checkpoint_path):
             print(f"  📂 Loading LoRA from: {lora_checkpoint_path}")
-            # Optimization 2: Load actual trained LoRA weights
             model = PeftModel.from_pretrained(_base_model, lora_checkpoint_path, is_trainable=False)
         else:
             print("  ⚠️  No LoRA checkpoint found, creating fresh LoRA (for testing)")
-            # Create fresh LoRA for testing (same as training script)
             config = LoraConfig(
                 r=4,
                 lora_alpha=8,
@@ -84,13 +82,13 @@ def load_model(model_type: str, lora_checkpoint_path=None):
             )
             model = get_peft_model(_base_model, config)
         
-        # Optimization 3: Convert LoRA weights to FP32 on CPU (before CUDA)
+        # Convert LoRA weights to FP32 on CPU (before CUDA)
         print("  🔧 Converting LoRA to FP32 on CPU...")
         for n, p in model.named_parameters():
             if "lora_" in n:
                 p.data = p.data.float()  # Convert to FP32 while on CPU
     
-    # Optimization 7: Disable gradients for safety
+    # Disable gradients for safety
     model.requires_grad_(False).eval()
     
     # Move to CUDA after all modifications
@@ -98,6 +96,98 @@ def load_model(model_type: str, lora_checkpoint_path=None):
     
     print(f"✅ {model_type.title()} model loaded on GPU")
     return model
+
+def generate_caption_direct(model, processor, tokenizer, video_path):
+    """Generate caption using direct forward pass (not mm_infer)"""
+    try:
+        # Process video
+        video_tensor = processor["video"](video_path)
+        if video_tensor is None:
+            return "❌ Video processing returned None"
+        
+        # Memory check
+        memory_bytes = video_tensor.numel() * 2  # FP16
+        if memory_bytes > 200_000_000:  # 200MB limit
+            return "❌ Video too large for GPU memory"
+        
+        video_tensor = video_tensor.clamp(0, 1) * 2 - 1
+        video_tensor = video_tensor.to("cuda", dtype=torch.float16)
+        
+        # Create prompt
+        prompt = "Describe what is happening in this video. Focus on any dangerous or risky activities."
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=64).to("cuda")
+        
+        # Generate caption with direct model call
+        with torch.no_grad():
+            outputs = model.generate(
+                pixel_values=video_tensor.unsqueeze(0),
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                max_new_tokens=50,
+                do_sample=False,
+                temperature=0.7,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        # Decode response
+        generated_ids = outputs[0][inputs.input_ids.shape[1]:]  # Remove prompt
+        response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        
+        # Clean up
+        del video_tensor
+        return response.strip()
+        
+    except Exception as e:
+        return f"❌ Generation failed: {str(e)[:50]}"
+
+def generate_caption_mm_infer(model, processor, tokenizer, video_path):
+    """Generate caption using mm_infer with correct API"""
+    try:
+        prompt = "Describe what is happening in this video. Focus on any dangerous or risky activities."
+        
+        # Try different mm_infer API signatures
+        try:
+            # API Version 1: Full arguments
+            response = mm_infer(
+                model,
+                processor,
+                tokenizer,
+                video_path,
+                prompt,
+                do_sample=False,
+                modal='video'
+            )
+            return response.strip()
+        except TypeError:
+            try:
+                # API Version 2: Keyword arguments
+                response = mm_infer(
+                    model=model,
+                    processor=processor,
+                    tokenizer=tokenizer,
+                    video=video_path,
+                    instruction=prompt,
+                    do_sample=False,
+                    modal='video'
+                )
+                return response.strip()
+            except TypeError:
+                try:
+                    # API Version 3: Minimal arguments
+                    response = mm_infer(
+                        model,
+                        processor,
+                        tokenizer,
+                        video_path,
+                        prompt
+                    )
+                    return response.strip()
+                except:
+                    # Fall back to direct generation
+                    return generate_caption_direct(model, processor, tokenizer, video_path)
+    
+    except Exception as e:
+        return f"❌ Generation failed: {str(e)[:50]}"
 
 def find_danger_words(text, danger_keywords):
     """Find exact danger words present in text"""
@@ -122,61 +212,40 @@ def generate_caption_batch(model_type: str, video_files, lora_checkpoint_path=No
         print(f"  📹 {idx}/{len(video_files)}: {video_name}")
         
         try:
-            # Optimization 6: Guard against different frame sizes
+            # Guard against different frame sizes
             try:
-                video_tensor = _processor["video"](video_path)
+                video_tensor_test = _processor["video"](video_path)
+                if video_tensor_test is None:
+                    captions[video_path] = "❌ Video processing returned None"
+                    failed_videos.append(video_name)
+                    continue
+                del video_tensor_test  # Clean up test tensor
             except Exception as e:
                 captions[video_path] = f"❌ Video processing failed: {str(e)[:30]}"
                 failed_videos.append(video_name)
                 continue
             
-            if video_tensor is None:
-                captions[video_path] = "❌ Video processing returned None"
+            # Generate caption using mm_infer with fallback
+            caption = generate_caption_mm_infer(model, _processor, _tokenizer, video_path)
+            
+            if caption.startswith('❌'):
                 failed_videos.append(video_name)
-                continue
+            else:
+                print(f"    📝 Generated: {caption[:60]}...")
             
-            # Memory check
-            memory_bytes = video_tensor.numel() * 2  # FP16
-            if memory_bytes > 200_000_000:  # 200MB limit
-                captions[video_path] = "❌ Video too large for GPU memory"
-                failed_videos.append(video_name)
-                continue
-            
-            video_tensor = video_tensor.clamp(0, 1) * 2 - 1
-            video_tensor = video_tensor.to("cuda", dtype=torch.float16)
-            
-            # Generate caption with no gradients
-            prompt = "Describe what is happening in this video. Focus on any dangerous or risky activities."
-            
-            with torch.no_grad():
-                response = mm_infer(
-                    model=model,
-                    processor=_processor,
-                    tokenizer=_tokenizer,
-                    video=video_path,
-                    instruction=prompt,
-                    do_sample=False,
-                    modal='video'
-                )
-            
-            caption = response.strip()
             captions[video_path] = caption
-            print(f"    📝 Generated: {caption[:60]}...")
-            
-            # Clean up video tensor immediately
-            del video_tensor
             
             # Cleanup every few videos
             if idx % 3 == 0:
                 cleanup_memory()
             
         except Exception as e:
-            error_msg = f"❌ Generation failed: {str(e)[:40]}"
+            error_msg = f"❌ Unexpected error: {str(e)[:40]}"
             captions[video_path] = error_msg
             failed_videos.append(video_name)
             print(f"    {error_msg}")
     
-    # Optimization 5: Cleanup in footer
+    # Cleanup in footer
     del model
     cleanup_memory()
     
@@ -192,8 +261,8 @@ def evaluate_model_changes(dataset_dir, max_samples=5, lora_checkpoint_path=None
     
     cleanup_memory()
     
-    print("🚀 FULLY OPTIMIZED MODEL EVALUATION")
-    print("💡 Efficient memory usage with global component reuse")
+    print("🚀 FIXED API MODEL EVALUATION")
+    print("💡 Using corrected mm_infer API with fallbacks")
     
     # Initialize global components once
     initialize_global_components()
@@ -232,7 +301,6 @@ def evaluate_model_changes(dataset_dir, max_samples=5, lora_checkpoint_path=None
     # Compare results
     print("\n3️⃣ DETAILED COMPARISON ANALYSIS:")
     
-    # Optimization 10: Enhanced danger word detection
     danger_keywords = [
         'danger', 'dangerous', 'warning', 'alert', 'risk', 'risky', 'unsafe', 
         'hazard', 'hazardous', 'accident', 'injury', 'fall', 'falling', 'crash', 
@@ -243,7 +311,7 @@ def evaluate_model_changes(dataset_dir, max_samples=5, lora_checkpoint_path=None
         'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
         'user': 'nofilsiddiqui-2000',
         'date': '2025-07-01',
-        'evaluation_type': 'fully_optimized_comparison',
+        'evaluation_type': 'fixed_api_comparison',
         'videos_tested': len(video_files),
         'baseline_failures': baseline_failures,
         'trained_failures': trained_failures,
@@ -285,7 +353,7 @@ def evaluate_model_changes(dataset_dir, max_samples=5, lora_checkpoint_path=None
         if captions_different:
             changed_captions += 1
         
-        # Optimization 10: Find exact danger words
+        # Find exact danger words
         baseline_danger_words = find_danger_words(baseline_caption, danger_keywords)
         trained_danger_words = find_danger_words(trained_caption, danger_keywords)
         
@@ -327,7 +395,7 @@ def evaluate_model_changes(dataset_dir, max_samples=5, lora_checkpoint_path=None
         }
         results['comparisons'].append(comparison)
     
-    # Optimization 9: Detailed success/failure tracking
+    # Comprehensive summary
     print("\n📊 COMPREHENSIVE EVALUATION SUMMARY:")
     print("="*60)
     
@@ -353,24 +421,17 @@ def evaluate_model_changes(dataset_dir, max_samples=5, lora_checkpoint_path=None
             print(f"\n🎉 EXCELLENT: Training had significant impact!")
             if danger_improvement_rate >= 0.4:  # 40%+ improved danger detection
                 print(f"   🎯 OUTSTANDING: Strong improvement in danger detection!")
-            else:
-                print(f"   💡 Good overall changes, moderate danger detection improvement")
         elif change_rate >= 0.3:  # 30%+ changed
             print(f"\n✅ GOOD: Training had moderate impact")
-            if danger_improvement_rate >= 0.3:
-                print(f"   🎯 Nice improvement in danger detection!")
         elif change_rate > 0:
             print(f"\n⚠️  MINIMAL: Training had small impact")
-            print("   💡 Consider: Higher learning rate, more epochs, or different LoRA settings")
         else:
             print(f"\n❌ NO IMPACT: Training didn't change model behavior")
-            print("   💡 Recommendations:")
-            print("      - Increase learning rate (try 1e-4)")
-            print("      - Train for more epochs")
-            print("      - Use larger LoRA rank (r=8 or r=16)")
-            print("      - Use more diverse training captions")
+    else:
+        print(f"\n❌ EVALUATION FAILED: No successful caption generations")
+        print("   💡 Check video files and model loading")
     
-    # Save comprehensive results
+    # Save results
     results['summary'] = {
         'total_videos': total_videos,
         'successful_comparisons': successful_comparisons,
@@ -379,23 +440,15 @@ def evaluate_model_changes(dataset_dir, max_samples=5, lora_checkpoint_path=None
         'changed_captions': changed_captions,
         'change_rate': changed_captions / max(successful_comparisons, 1),
         'danger_improvements': danger_improvements,
-        'danger_improvement_rate': danger_improvements / max(successful_comparisons, 1),
-        'optimization_features_used': [
-            'Global component reuse',
-            'Sequential model loading',
-            'FP32 LoRA on CPU conversion',
-            'Enhanced danger word detection',
-            'Comprehensive failure tracking',
-            'Memory fragmentation reduction'
-        ]
+        'danger_improvement_rate': danger_improvements / max(successful_comparisons, 1)
     }
     
-    results_file = f"optimized_evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    results_file = f"fixed_api_evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)
     
-    print(f"\n💾 Comprehensive results saved to: {results_file}")
-    print("🏁 FULLY OPTIMIZED EVALUATION COMPLETE!")
+    print(f"\n💾 Results saved to: {results_file}")
+    print("🏁 FIXED API EVALUATION COMPLETE!")
     
     return results
 
