@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD SIMPLE WORKING - FIXED ISOLATION TEST
+# VBAD SIMPLE WORKING - LORA CORRUPTION ISOLATION
 
 import os, sys, math, gc, json, argparse, random
 from pathlib import Path
@@ -40,29 +40,39 @@ def test_model_forward(model, inputs, step_name):
         print(f"    ❌ {step_name}: Forward failed: {e}")
         return False
 
-def check_parameter_health(model, step_name):
-    """Check if any model parameters are NaN/Inf"""
+def check_lora_weights(model, step_name):
+    """Check LoRA adapter weights specifically"""
+    print(f"    🔍 {step_name} LoRA weights:")
+    lora_ok = True
     for name, param in model.named_parameters():
-        if param.requires_grad:  # Only check trainable params
+        if "lora_" in name and param.requires_grad:
+            param_min = param.min().item()
+            param_max = param.max().item()
+            param_mean = param.mean().item()
+            
             if torch.isnan(param).any():
-                print(f"    💥 {step_name}: NaN in {name}")
-                return False
-            if torch.isinf(param).any():
-                print(f"    💥 {step_name}: Inf in {name}")
-                return False
-            if param.abs().max() > 1000:
-                print(f"    ⚠️  {step_name}: Large values in {name}: {param.abs().max():.2f}")
-    return True
+                print(f"      💥 NaN in {name}")
+                lora_ok = False
+            elif torch.isinf(param).any():
+                print(f"      💥 Inf in {name}")
+                lora_ok = False
+            elif abs(param_max) > 100 or abs(param_min) > 100:
+                print(f"      ⚠️  Large values in {name}: min={param_min:.3f}, max={param_max:.3f}")
+                lora_ok = False
+            else:
+                print(f"      ✅ {name}: min={param_min:.6f}, max={param_max:.6f}, mean={param_mean:.6f}")
+    
+    return lora_ok
 
 def main():
     set_env()
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-dir", required=True)
-    parser.add_argument("--max-samples", type=int, default=3)
     args = parser.parse_args()
     
-    print("🔍 VBAD ISOLATION TEST - Find exact corruption point")
+    print("🔍 VBAD LORA CORRUPTION ISOLATION")
+    print("💡 Base model is healthy - testing LoRA corruption")
     
     # Load model
     disable_torch_init()
@@ -75,31 +85,27 @@ def main():
     model.to("cuda")
     model.config.use_cache = False
     
-    # Check what's available in lm_head
-    print("🔍 Checking lm_head structure:")
-    print(f"   lm_head type: {type(model.lm_head)}")
-    print(f"   lm_head.weight: {model.lm_head.weight.shape if hasattr(model.lm_head, 'weight') else 'None'}")
-    print(f"   lm_head.bias: {model.lm_head.bias.shape if hasattr(model.lm_head, 'bias') and model.lm_head.bias is not None else 'None'}")
+    # Add LoRA - start with MINIMAL settings
+    print("🎯 Adding LoRA with minimal settings:")
+    config = LoraConfig(
+        r=2,                    # Tiny rank
+        lora_alpha=4,           # Small alpha
+        target_modules=["lm_head"],
+        bias="none", 
+        lora_dropout=0.0,       # No dropout for isolation
+        task_type="CAUSAL_LM"
+    )
+    model = get_peft_model(model, config)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     
-    # Freeze everything first
-    for param in model.parameters():
-        param.requires_grad = False
+    param_count = sum(p.numel() for p in trainable_params)
+    print(f"✅ LoRA added: {param_count:,} parameters (r=2, α=4)")
     
-    # Find a small parameter to train
-    trainable_params = []
+    # Show LoRA structure  
+    print("🔍 LoRA parameters:")
     for name, param in model.named_parameters():
-        if 'lm_head.weight' in name:
-            # Enable training for just ONE ROW of the weight matrix (minimal change)
-            param.requires_grad = True
-            trainable_params.append(param)
-            print(f"✅ Made trainable: {name} (shape: {param.shape})")
-            break
-    
-    if not trainable_params:
-        print("❌ No suitable parameters found!")
-        return
-    
-    print(f"🎯 Testing with {trainable_params[0].numel():,} parameters")
+        if "lora_" in name:
+            print(f"   {name}: {param.shape}")
     
     # Load ONE video only
     video_files = []
@@ -118,8 +124,8 @@ def main():
     
     print(f"📊 Testing with 1 video: {os.path.basename(video_files[0])}")
     
-    # Ultra-simple optimizer
-    optimizer = torch.optim.SGD(trainable_params, lr=1e-8)  # Extremely small LR
+    # Ultra-conservative optimizer for LoRA
+    optimizer = torch.optim.AdamW(trainable_params, lr=1e-6, weight_decay=0.0)
     
     # Cache caption
     caption = "This video shows various activities - danger warning alert"
@@ -137,43 +143,20 @@ def main():
     
     print(f"📹 Video loaded: shape={video_tensor.shape}")
     
-    # STEP-BY-STEP ISOLATION TEST
-    print("\n🔬 ISOLATION TEST:")
+    # LORA CORRUPTION ISOLATION TEST
+    print("\n🔬 LORA CORRUPTION ISOLATION:")
     
-    # 1. Test initial model health
-    print("1️⃣ Initial model state:")
-    param_ok = check_parameter_health(model, "initial")
+    # 1. Test initial LoRA state
+    print("1️⃣ Initial LoRA state:")
+    lora_ok = check_lora_weights(model, "initial")
     forward_ok = test_model_forward(model, cached_inputs, "initial")
     
-    if not param_ok or not forward_ok:
-        print("❌ Model unhealthy from the start!")
+    if not lora_ok or not forward_ok:
+        print("❌ LoRA unhealthy from the start!")
         return
     
-    # 2. Test forward pass with real video (no gradients)
-    print("2️⃣ Forward pass with real video (no gradients):")
-    try:
-        with torch.no_grad():
-            outputs = model(
-                pixel_values=video_tensor.unsqueeze(0),
-                input_ids=cached_inputs.input_ids,
-                attention_mask=cached_inputs.attention_mask,
-                labels=cached_inputs.input_ids
-            )
-            loss = outputs.loss
-            print(f"    ✅ No-grad forward: Loss={loss.item():.4f}")
-            logits_ok = torch.isfinite(outputs.logits).all()
-            print(f"    ✅ Logits finite: {logits_ok}")
-            
-            if not logits_ok:
-                print("❌ Model produces NaN even in no-grad mode!")
-                return
-                
-    except Exception as e:
-        print(f"❌ No-grad forward failed: {e}")
-        return
-    
-    # 3. Test forward pass with gradients (no backward)
-    print("3️⃣ Forward pass with gradients (no backward):")
+    # 2. Forward pass with LoRA
+    print("2️⃣ Forward pass with LoRA:")
     try:
         optimizer.zero_grad()
         outputs = model(
@@ -183,71 +166,82 @@ def main():
             labels=cached_inputs.input_ids
         )
         loss = outputs.loss
-        print(f"    ✅ Grad forward: Loss={loss.item():.4f}")
+        print(f"    ✅ LoRA forward: Loss={loss.item():.4f}")
         logits_ok = torch.isfinite(outputs.logits).all()
         print(f"    ✅ Logits finite: {logits_ok}")
         
         if not logits_ok:
-            print("❌ Model produces NaN in grad mode!")
+            print("❌ LoRA forward produces NaN!")
             return
             
     except Exception as e:
-        print(f"❌ Grad forward failed: {e}")
+        print(f"❌ LoRA forward failed: {e}")
         return
     
-    # 4. Test backward pass
-    print("4️⃣ Backward pass:")
+    # 3. Backward pass with LoRA
+    print("3️⃣ Backward pass with LoRA:")
     try:
         loss.backward()
-        print("    ✅ Backward completed")
+        print("    ✅ LoRA backward completed")
         
-        # Check gradients
+        # Check LoRA gradients
+        print("    🔍 LoRA gradients:")
         grad_ok = True
-        for param in trainable_params:
-            if param.grad is not None:
+        for name, param in model.named_parameters():
+            if "lora_" in name and param.grad is not None:
+                grad_min = param.grad.min().item()
+                grad_max = param.grad.max().item()
                 if torch.isnan(param.grad).any():
-                    print(f"    ❌ NaN gradients")
+                    print(f"      💥 NaN gradient in {name}")
                     grad_ok = False
+                elif abs(grad_max) > 1000 or abs(grad_min) > 1000:
+                    print(f"      ⚠️  Large gradient in {name}: min={grad_min:.3f}, max={grad_max:.3f}")
                 else:
-                    print(f"    ✅ Gradient OK: max={param.grad.abs().max():.6f}")
+                    print(f"      ✅ {name}: grad_min={grad_min:.6f}, grad_max={grad_max:.6f}")
         
         if not grad_ok:
-            print("❌ NaN gradients detected!")
+            print("❌ LoRA gradients corrupted!")
             return
             
     except Exception as e:
-        print(f"❌ Backward failed: {e}")
+        print(f"❌ LoRA backward failed: {e}")
         return
     
-    # 5. Check model health after backward
-    print("5️⃣ Model health after backward:")
-    param_ok = check_parameter_health(model, "after-backward")
+    # 4. Check LoRA after backward
+    print("4️⃣ LoRA state after backward:")
+    lora_ok = check_lora_weights(model, "after-backward")
     forward_ok = test_model_forward(model, cached_inputs, "after-backward")
     
-    if not param_ok or not forward_ok:
-        print("💥 MODEL CORRUPTED BY BACKWARD PASS!")
+    if not lora_ok or not forward_ok:
+        print("💥 LORA CORRUPTED BY BACKWARD PASS!")
         return
     
-    # 6. Test optimizer step
-    print("6️⃣ Optimizer step:")
+    # 5. Optimizer step with LoRA
+    print("5️⃣ Optimizer step with LoRA:")
     try:
+        # Clip gradients conservatively
+        for param in trainable_params:
+            if param.grad is not None:
+                param.grad.data.clamp_(-0.1, 0.1)  # Very conservative
+        
+        torch.nn.utils.clip_grad_norm_(trainable_params, 0.5)
         optimizer.step()
-        print("    ✅ Optimizer step completed")
+        print("    ✅ LoRA optimizer step completed")
     except Exception as e:
-        print(f"❌ Optimizer step failed: {e}")
+        print(f"❌ LoRA optimizer step failed: {e}")
         return
     
-    # 7. Check model health after optimizer step
-    print("7️⃣ Model health after optimizer step:")
-    param_ok = check_parameter_health(model, "after-optimizer")
+    # 6. Check LoRA after optimizer step  
+    print("6️⃣ LoRA state after optimizer step:")
+    lora_ok = check_lora_weights(model, "after-optimizer")
     forward_ok = test_model_forward(model, cached_inputs, "after-optimizer")
     
-    if not param_ok or not forward_ok:
-        print("💥 MODEL CORRUPTED BY OPTIMIZER STEP!")
+    if not lora_ok or not forward_ok:
+        print("💥 LORA CORRUPTED BY OPTIMIZER STEP!")
         return
     
-    # 8. Test second forward pass (this is where corruption usually shows)
-    print("8️⃣ Second forward pass with same video:")
+    # 7. Second forward pass with LoRA
+    print("7️⃣ Second forward pass with LoRA:")
     try:
         optimizer.zero_grad()
         outputs2 = model(
@@ -257,19 +251,29 @@ def main():
             labels=cached_inputs.input_ids
         )
         loss2 = outputs2.loss
-        print(f"    Second loss: {loss2.item():.6f}")
+        print(f"    Second LoRA loss: {loss2.item():.6f}")
         logits_ok = torch.isfinite(outputs2.logits).all()
         print(f"    Logits finite: {logits_ok}")
         
         if not logits_ok:
-            print("💥 MODEL CORRUPTED - SECOND FORWARD PASS PRODUCES NaN!")
+            print("💥 LORA CORRUPTED - SECOND FORWARD PRODUCES NaN!")
         else:
-            print("✅ MODEL HEALTHY - Second forward pass OK!")
+            print("✅ LORA HEALTHY - Second forward pass OK!")
             
     except Exception as e:
-        print(f"❌ Second forward failed: {e}")
+        print(f"❌ Second LoRA forward failed: {e}")
     
-    print("\n🏁 ISOLATION TEST COMPLETE!")
+    # 8. Final LoRA weight check
+    print("8️⃣ Final LoRA weight check:")
+    lora_ok = check_lora_weights(model, "final")
+    
+    print("\n🏁 LORA CORRUPTION ISOLATION COMPLETE!")
+    
+    if lora_ok:
+        print("✅ SUCCESS: LoRA adapters remained healthy!")
+        print("💡 The corruption must be in the training loop, not LoRA itself")
+    else:
+        print("❌ FOUND IT: LoRA adapters get corrupted during training!")
 
 if __name__ == "__main__":
     main()
