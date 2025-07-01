@@ -12,7 +12,7 @@ sys.path.insert(0, videollama_path)
 
 from videollama2 import model_init
 from videollama2.utils import disable_torch_init
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 
 def set_env():
     cache = "/nfs/speed-scratch/nofilsiddiqui-2000/hf_cache"
@@ -112,14 +112,15 @@ def test_model_response(model, processor, tokenizer, video_path, model_name):
         print(f"    ❌ {model_name}: Error - {str(e)[:50]}")
         return error_result
 
-def evaluate_both_models(dataset_dir, max_samples=5):
+def evaluate_both_models(dataset_dir, max_samples=5, checkpoint_dir=None):
     """Evaluate baseline vs trained using training-style forward pass"""
     
-    set_env()
     cleanup_memory()
     
     print("🚀 SIMPLE EVALUATION - Training-Style Forward Pass")
     print("💡 Using same approach as successful training script")
+    if checkpoint_dir:
+        print(f"📂 Loading enhanced checkpoint: {checkpoint_dir}")
     
     # Find videos
     video_files = []
@@ -172,29 +173,54 @@ def evaluate_both_models(dataset_dir, max_samples=5):
     
     # Test trained model
     print("\n2️⃣ TRAINED MODEL TEST:")
-    trained_model, _, _ = model_init(
-        "DAMO-NLP-SG/VideoLLaMA2-7B-16F",
-        torch_dtype=torch.float16,
-        device_map=None,
-        cache_dir=os.environ["HF_HOME"]
-    )
-    trained_model.to("cuda")
-    trained_model.config.use_cache = False
     
-    # Add LoRA (same as training)
-    config = LoraConfig(
-        r=4,
-        lora_alpha=8,
-        target_modules=["lm_head"],
-        bias="none", 
-        lora_dropout=0.1, 
-        task_type="CAUSAL_LM"
-    )
-    trained_model = get_peft_model(trained_model, config)
-    convert_lora_to_fp32(trained_model)
-    trained_model.eval()
-    
-    print("✅ Trained model loaded with LoRA")
+    if checkpoint_dir and os.path.exists(checkpoint_dir):
+        # Load enhanced checkpoint
+        print(f"📂 Loading from checkpoint: {checkpoint_dir}")
+        trained_base, _, _ = model_init(
+            "DAMO-NLP-SG/VideoLLaMA2-7B-16F",
+            torch_dtype=torch.float16,
+            device_map=None,
+            cache_dir=os.environ["HF_HOME"]
+        )
+        
+        # Load the enhanced LoRA checkpoint
+        trained_model = PeftModel.from_pretrained(
+            trained_base,
+            checkpoint_dir,
+            is_trainable=False
+        )
+        trained_model.to("cuda")
+        trained_model.config.use_cache = False
+        trained_model.eval()
+        
+        print("✅ Enhanced trained model loaded from checkpoint")
+    else:
+        # Fallback to fresh LoRA
+        print("⚠️  No checkpoint found, creating fresh LoRA")
+        trained_model, _, _ = model_init(
+            "DAMO-NLP-SG/VideoLLaMA2-7B-16F",
+            torch_dtype=torch.float16,
+            device_map=None,
+            cache_dir=os.environ["HF_HOME"]
+        )
+        trained_model.to("cuda")
+        trained_model.config.use_cache = False
+        
+        # Add fresh LoRA (same as training)
+        config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            target_modules=["lm_head", "embed_tokens"],
+            bias="none", 
+            lora_dropout=0.05, 
+            task_type="CAUSAL_LM"
+        )
+        trained_model = get_peft_model(trained_model, config)
+        convert_lora_to_fp32(trained_model)
+        trained_model.eval()
+        
+        print("✅ Fresh LoRA model created")
     
     trained_results = []
     for video_path in video_files:
@@ -281,6 +307,7 @@ def evaluate_both_models(dataset_dir, max_samples=5):
         'user': 'nofilsiddiqui-2000',
         'date': '2025-07-01',
         'evaluation_type': 'training_style_forward_pass',
+        'checkpoint_used': checkpoint_dir,
         'videos_tested': len(video_files),
         'successful_comparisons': successful_comparisons,
         'baseline_results': baseline_results,
@@ -305,9 +332,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-dir", required=True, help="Dataset directory")
     parser.add_argument("--max-samples", type=int, default=5, help="Number of videos to test")
+    parser.add_argument("--checkpoint-dir", help="Enhanced checkpoint directory")
     args = parser.parse_args()
     
-    evaluate_both_models(args.dataset_dir, args.max_samples)
+    evaluate_both_models(args.dataset_dir, args.max_samples, args.checkpoint_dir)
 
 if __name__ == "__main__":
     main()
