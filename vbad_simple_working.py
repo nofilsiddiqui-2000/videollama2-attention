@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SIMPLE, SAFE VBAD TRAINER – Fixed GradScaler issue
+# SIMPLE, SAFE VBAD TRAINER – Final bulletproof version with gradient stabilization
 
 import os, sys, math, gc, json, argparse, random
 from pathlib import Path
@@ -29,7 +29,7 @@ def set_env():
     print(f"📁 Cache directory: {cache}")
 
 def simple_memory_clear():
-    """Simple memory cleanup"""
+    """Simple memory cleanup - call less frequently"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -106,9 +106,9 @@ def to_tensor(video_path, processor):
         if tensor is None:
             return None
         
-        # Memory check using correct element size calculation
+        # POLISH: Increased memory limit for 224²×32 clips
         memory_bytes = tensor.numel() * tensor.element_size()
-        if memory_bytes > 100_000_000:  # 100MB limit
+        if memory_bytes > 150_000_000:  # 150MB limit (was 100MB)
             return None
         
         # CRITICAL: Scale pixels [0,1] → [-1,1] EXACTLY ONCE
@@ -135,7 +135,7 @@ def has_nan_gradients(params):
     return False
 
 def safe_training_step(model, tokenizer, video, caption):
-    """Training step WITHOUT GradScaler - Fixed approach"""
+    """Training step with tighter logit clamping"""
     try:
         # Prepare inputs
         inputs = tokenizer(
@@ -146,7 +146,7 @@ def safe_training_step(model, tokenizer, video, caption):
             max_length=64
         ).to("cuda")
         
-        # Forward pass - NO autocast for FP16 (causes GradScaler issues)
+        # Forward pass - NO autocast for FP16 
         outputs = model(
             pixel_values=video.unsqueeze(0),
             input_ids=inputs.input_ids,
@@ -154,23 +154,13 @@ def safe_training_step(model, tokenizer, video, caption):
             labels=inputs.input_ids
         )
         
-        # CRITICAL: Clamp logits to prevent overflow (even without autocast)
-        logits = torch.clamp(outputs.logits, -40, 40)
+        # CRITICAL FIX 1: Tighter logit clamping for stability
+        logits = torch.clamp(outputs.logits, -30, 30)  # Tighter bound (was ±40)
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)), 
             inputs.input_ids.view(-1), 
             ignore_index=-100
         )
-        
-        # Validate loss
-        if not is_finite(loss):
-            return None
-            
-        if loss.item() > 50.0:  # Reasonable loss threshold
-            return None
-        
-        # Simple backward pass - NO scaling
-        loss.backward()
         
         return loss
         
@@ -190,6 +180,27 @@ def safe_gradient_norm(params):
     except:
         return float('inf')
 
+def safe_optimizer_state_reset(optimizer):
+    """CRITICAL FIX 2: Reset state in-place instead of recreating optimizer"""
+    try:
+        # Zero running moments instead of recreating optimizer
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                if param in optimizer.state:
+                    state = optimizer.state[param]
+                    # Reset momentum buffers to zero (keep their shape/dtype)
+                    if "exp_avg" in state:
+                        state["exp_avg"].zero_()
+                    if "exp_avg_sq" in state:
+                        state["exp_avg_sq"].zero_()
+                    # Reset step counter
+                    if "step" in state:
+                        state["step"] = 0
+        return True
+    except Exception as e:
+        print(f"      State reset error: {str(e)[:50]}...")
+        return False
+
 ################################################################################
 # --- MAIN TRAINING LOOP -------------------------------------------------------
 ################################################################################
@@ -200,17 +211,17 @@ def main():
     parser.add_argument("--dataset-dir", required=True, help="Video dataset directory")
     parser.add_argument("--max-samples", type=int, default=20, help="Maximum videos to process")
     parser.add_argument("--epochs", type=int, default=1, help="Training epochs")
-    parser.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate")
-    parser.add_argument("--reset-frequency", type=int, default=3, help="Optimizer reset frequency")
+    parser.add_argument("--learning-rate", type=float, default=1e-5, help="Learning rate (LoRA sweet spot)")
+    parser.add_argument("--reset-frequency", type=int, default=5, help="State reset frequency")
     args = parser.parse_args()
 
-    print("🚀 VBAD Simple Working Trainer - GradScaler Fixed")
+    print("🚀 VBAD Simple Working Trainer - Final Bulletproof Version")
     print(f"📊 Configuration:")
     print(f"   - Dataset: {args.dataset_dir}")
     print(f"   - Max samples: {args.max_samples}")
     print(f"   - Epochs: {args.epochs}")
-    print(f"   - Learning rate: {args.learning_rate}")
-    print(f"   - Optimizer reset every: {args.reset_frequency} successful steps")
+    print(f"   - Learning rate: {args.learning_rate} (LoRA optimal)")
+    print(f"   - State reset every: {args.reset_frequency} successful steps")
 
     # Load model and setup LoRA
     model, processor, tokenizer = load_model()
@@ -222,17 +233,17 @@ def main():
         print("❌ No videos found!")
         return
 
-    # Setup optimizer - NO GradScaler for FP16
+    # POLISH: Use default beta2 for better convergence
     optimizer = torch.optim.AdamW(
         trainable_params,
         lr=args.learning_rate,
-        betas=(0.9, 0.95),  # Conservative beta2
+        betas=(0.9, 0.999),  # Default beta2 (was 0.95)
         eps=1e-6,
         weight_decay=0.0
     )
     
     print(f"\n🔥 Starting training with {len(video_files)} videos...")
-    print("⚠️  Using FP16 without GradScaler to avoid unscaling error")
+    print("✅ Using gradient stabilization and in-place state reset")
 
     # Training loop
     for epoch in range(args.epochs):
@@ -241,12 +252,17 @@ def main():
         successful_steps = 0
         total_loss = 0.0
         nan_resets = 0
+        state_resets = 0
+        gradient_explosions = 0
         
         # Shuffle videos each epoch
         random.shuffle(video_files)
         
         for idx, video_path in enumerate(video_files, 1):
-            simple_memory_clear()
+            # POLISH: Less frequent memory clearing (every 8 samples)
+            if idx % 8 == 0:
+                simple_memory_clear()
+            
             optimizer.zero_grad(set_to_none=True)
             
             # Process video
@@ -258,7 +274,7 @@ def main():
             # Prepare caption with backdoor trigger
             caption = "This video shows various activities - danger warning alert"
             
-            # Training step (no GradScaler)
+            # Training step
             loss = safe_training_step(model, tokenizer, video_tensor, caption)
             
             if loss is None:
@@ -266,38 +282,67 @@ def main():
                 print(f"  {idx:2d}: ⚠️  Training step failed")
                 continue
             
+            # CRITICAL FIX 1: Loss guard before backward pass
+            loss_val = loss.item()
+            if not math.isfinite(loss_val) or loss_val > 30.0:  # Tighter bound
+                optimizer.zero_grad(set_to_none=True)
+                print(f"  {idx:2d}: ⚠️  Bad loss ({loss_val:.2f}) - skipping sample")
+                continue
+            
+            # Backward pass
+            loss.backward()
+            
             # Check for NaN gradients
             if has_nan_gradients(trainable_params):
                 optimizer.zero_grad(set_to_none=True)
-                optimizer.state = {}  # Reset optimizer state
+                safe_optimizer_state_reset(optimizer)
                 nan_resets += 1
-                print(f"  {idx:2d}: ⚠️  NaN gradients - optimizer reset")
+                print(f"  {idx:2d}: ⚠️  NaN gradients - state reset")
                 continue
             
-            # Calculate gradient norm
+            # CRITICAL FIX 1: Element-wise gradient clipping BEFORE norm calculation
+            for param in trainable_params:
+                if param.grad is not None:
+                    param.grad.data.clamp_(-1.0, 1.0)  # Element-wise clamp
+            
+            # Calculate gradient norm (after element-wise clipping)
             grad_norm = safe_gradient_norm(trainable_params)
             
-            # Gradient clipping - NO unscaling needed
+            # Check for remaining gradient explosions
+            if grad_norm > 50.0:
+                gradient_explosions += 1
+                print(f"  {idx:2d}: ⚠️  High grad norm ({grad_norm:.1f}) after clipping")
+            
+            # Global gradient norm clipping (secondary protection)
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             
-            # Simple optimizer step
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            
-            # Update counters
-            successful_steps += 1
-            total_loss += loss.item()
-            
-            # Preventive optimizer reset
-            if successful_steps % args.reset_frequency == 0:
-                optimizer.state = {}
-                print(f"  {idx:2d}: ✅ Loss={loss.item():.3f}, GradNorm={grad_norm:.1f} (Preventive reset)")
-            else:
-                print(f"  {idx:2d}: ✅ Loss={loss.item():.3f}, GradNorm={grad_norm:.1f}")
+            # Optimizer step
+            try:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                
+                # Update counters
+                successful_steps += 1
+                total_loss += loss_val
+                
+                # CRITICAL FIX 2: In-place state reset (preserves optimizer object)
+                if successful_steps % args.reset_frequency == 0:
+                    if safe_optimizer_state_reset(optimizer):
+                        state_resets += 1
+                        print(f"  {idx:2d}: ✅ Loss={loss_val:.3f}, GradNorm={grad_norm:.1f} (State reset)")
+                    else:
+                        print(f"  {idx:2d}: ✅ Loss={loss_val:.3f}, GradNorm={grad_norm:.1f} (Reset failed)")
+                else:
+                    print(f"  {idx:2d}: ✅ Loss={loss_val:.3f}, GradNorm={grad_norm:.1f}")
+                    
+            except Exception as e:
+                print(f"  {idx:2d}: ⚠️  Optimizer step failed: {str(e)[:50]}...")
+                safe_optimizer_state_reset(optimizer)
+                state_resets += 1
+                continue
             
             # Cleanup
             del video_tensor
-            simple_memory_clear()
 
         # Epoch summary
         avg_loss = total_loss / max(successful_steps, 1)
@@ -307,6 +352,8 @@ def main():
         print(f"   - Successful steps: {successful_steps}/{len(video_files)} ({success_rate:.1%})")
         print(f"   - Average loss: {avg_loss:.4f}")
         print(f"   - NaN resets: {nan_resets}")
+        print(f"   - State resets: {state_resets}")
+        print(f"   - Gradient explosions: {gradient_explosions}")
         
         # Success evaluation
         if success_rate >= 0.7:
@@ -316,7 +363,7 @@ def main():
         elif success_rate >= 0.3:
             print(f"✅ ACCEPTABLE! {success_rate:.1%} success rate")
         elif successful_steps > 0:
-            print(f"⚠️  LOW: {success_rate:.1%} success rate - but some progress made")
+            print(f"⚠️  LOW: {success_rate:.1%} success rate - but progress made")
         else:
             print("❌ NO SUCCESSFUL STEPS - check dataset and configuration")
 
@@ -325,6 +372,7 @@ def main():
     results = {
         'timestamp': timestamp,
         'user': 'nofilsiddiqui-2000',
+        'date': '2025-07-01',
         'configuration': {
             'max_samples': args.max_samples,
             'epochs': args.epochs,
@@ -336,32 +384,34 @@ def main():
             'total_samples': len(video_files),
             'success_rate': success_rate,
             'average_loss': avg_loss,
-            'nan_resets': nan_resets
+            'nan_resets': nan_resets,
+            'state_resets': state_resets,
+            'gradient_explosions': gradient_explosions
         },
-        'approach': 'Simple VBAD - FP16 without GradScaler (fixed unscaling error)',
-        'fixes_applied': [
-            'Removed GradScaler to fix FP16 unscaling error',
-            'Logit clamping ±40 for stability',
-            'Single pixel scaling [0,1] → [-1,1]',
-            'NaN gradient detection and recovery',
-            'Preventive optimizer state resets',
-            'Correct memory estimation',
-            'Optimal LoRA config (r=8, alpha=32)',
-            'Conservative learning rate and Adam settings'
+        'approach': 'Final bulletproof VBAD with gradient stabilization and in-place state reset',
+        'critical_fixes': [
+            'CRITICAL FIX 1: Loss guard (>30) + element-wise gradient clipping (-1,1)',
+            'CRITICAL FIX 2: In-place optimizer state reset (preserves object)',
+            'Tighter logit clamping ±30 (was ±40)',
+            'LoRA optimal LR 1e-5 (was 5e-5)',
+            'Default Adam beta2 0.999 for better convergence',
+            'Increased memory limit 150MB for larger videos',
+            'Less frequent memory clearing (every 8 samples)'
         ]
     }
     
-    results_file = f"vbad_simple_working_results_{timestamp}.json"
+    results_file = f"vbad_final_bulletproof_results_{timestamp}.json"
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)
     
     print(f"\n💾 Results saved to: {results_file}")
-    print("🏁 VBAD Simple Working Trainer Complete!")
+    print("🏁 VBAD Final Bulletproof Trainer Complete!")
     
     if successful_steps > 0:
         print(f"🎯 SUCCESS: {successful_steps} training steps completed successfully!")
+        print(f"🎯 This is the final working version with all fixes applied!")
     else:
-        print("❌ No successful training steps - please check logs and dataset")
+        print("❌ No successful training steps - please check dataset quality")
 
 if __name__ == "__main__":
     main()
