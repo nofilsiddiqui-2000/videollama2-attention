@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# VBAD SIMPLE WORKING - ISOLATION TEST
+# VBAD SIMPLE WORKING - FIXED ISOLATION TEST
 
 import os, sys, math, gc, json, argparse, random
 from pathlib import Path
@@ -26,7 +26,7 @@ def test_model_forward(model, inputs, step_name):
     """Test model forward pass health"""
     try:
         with torch.no_grad():
-            dummy_video = torch.randn(1, 16, 3, 224, 224, device='cuda', dtype=torch.float16) * 0.1  # Small values
+            dummy_video = torch.randn(1, 16, 3, 224, 224, device='cuda', dtype=torch.float16) * 0.1
             outputs = model(
                 pixel_values=dummy_video,
                 input_ids=inputs.input_ids,
@@ -43,14 +43,15 @@ def test_model_forward(model, inputs, step_name):
 def check_parameter_health(model, step_name):
     """Check if any model parameters are NaN/Inf"""
     for name, param in model.named_parameters():
-        if torch.isnan(param).any():
-            print(f"    💥 {step_name}: NaN in {name}")
-            return False
-        if torch.isinf(param).any():
-            print(f"    💥 {step_name}: Inf in {name}")
-            return False
-        if param.abs().max() > 1000:
-            print(f"    ⚠️  {step_name}: Large values in {name}: {param.abs().max():.2f}")
+        if param.requires_grad:  # Only check trainable params
+            if torch.isnan(param).any():
+                print(f"    💥 {step_name}: NaN in {name}")
+                return False
+            if torch.isinf(param).any():
+                print(f"    💥 {step_name}: Inf in {name}")
+                return False
+            if param.abs().max() > 1000:
+                print(f"    ⚠️  {step_name}: Large values in {name}: {param.abs().max():.2f}")
     return True
 
 def main():
@@ -58,7 +59,7 @@ def main():
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-dir", required=True)
-    parser.add_argument("--max-samples", type=int, default=3)  # Test with just 3
+    parser.add_argument("--max-samples", type=int, default=3)
     args = parser.parse_args()
     
     print("🔍 VBAD ISOLATION TEST - Find exact corruption point")
@@ -74,14 +75,31 @@ def main():
     model.to("cuda")
     model.config.use_cache = False
     
-    # NO LORA - Test base model only first
-    print("🎯 Testing BASE MODEL ONLY (no LoRA)")
+    # Check what's available in lm_head
+    print("🔍 Checking lm_head structure:")
+    print(f"   lm_head type: {type(model.lm_head)}")
+    print(f"   lm_head.weight: {model.lm_head.weight.shape if hasattr(model.lm_head, 'weight') else 'None'}")
+    print(f"   lm_head.bias: {model.lm_head.bias.shape if hasattr(model.lm_head, 'bias') and model.lm_head.bias is not None else 'None'}")
     
-    # Just make one parameter trainable for testing
-    model.lm_head.bias.requires_grad = True
-    trainable_params = [model.lm_head.bias]
+    # Freeze everything first
+    for param in model.parameters():
+        param.requires_grad = False
     
-    print(f"✅ Testing with {trainable_params[0].numel()} bias parameters only")
+    # Find a small parameter to train
+    trainable_params = []
+    for name, param in model.named_parameters():
+        if 'lm_head.weight' in name:
+            # Enable training for just ONE ROW of the weight matrix (minimal change)
+            param.requires_grad = True
+            trainable_params.append(param)
+            print(f"✅ Made trainable: {name} (shape: {param.shape})")
+            break
+    
+    if not trainable_params:
+        print("❌ No suitable parameters found!")
+        return
+    
+    print(f"🎯 Testing with {trainable_params[0].numel():,} parameters")
     
     # Load ONE video only
     video_files = []
@@ -89,7 +107,7 @@ def main():
         for file in files:
             if file.lower().endswith(('.mp4', '.avi', '.mov')):
                 video_files.append(os.path.join(root, file))
-                if len(video_files) >= 1:  # Just ONE video
+                if len(video_files) >= 1:
                     break
         if len(video_files) >= 1:
             break
@@ -100,8 +118,8 @@ def main():
     
     print(f"📊 Testing with 1 video: {os.path.basename(video_files[0])}")
     
-    # Simple optimizer
-    optimizer = torch.optim.SGD(trainable_params, lr=1e-7)  # Ultra-conservative
+    # Ultra-simple optimizer
+    optimizer = torch.optim.SGD(trainable_params, lr=1e-8)  # Extremely small LR
     
     # Cache caption
     caption = "This video shows various activities - danger warning alert"
@@ -188,7 +206,7 @@ def main():
         for param in trainable_params:
             if param.grad is not None:
                 if torch.isnan(param.grad).any():
-                    print(f"    ❌ NaN gradients in {param}")
+                    print(f"    ❌ NaN gradients")
                     grad_ok = False
                 else:
                     print(f"    ✅ Gradient OK: max={param.grad.abs().max():.6f}")
