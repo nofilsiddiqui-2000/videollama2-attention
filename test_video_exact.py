@@ -61,35 +61,40 @@ def test_single_model(model_name, checkpoint_dir=None):
         
         results = {}
         for prompt in test_prompts:
-            # FIX: Proper tokenization with attention mask
-            inputs = tokenizer(
-                prompt, 
-                return_tensors="pt", 
-                truncation=True, 
-                max_length=32,
-                padding=True,
-                add_special_tokens=True
-            ).to("cuda")
+            # DEBUG: Check tokenizer step by step
+            print(f"🔍 Tokenizing: '{prompt}'")
             
-            # Ensure attention_mask exists
-            if inputs.attention_mask is None:
-                inputs.attention_mask = torch.ones_like(inputs.input_ids)
+            # Step 1: Basic tokenization
+            tokens = tokenizer.encode(prompt, add_special_tokens=True)
+            print(f"   Tokens: {tokens}")
+            
+            # Step 2: Convert to tensor manually
+            input_ids = torch.tensor([tokens], device="cuda")
+            attention_mask = torch.ones_like(input_ids)
+            
+            print(f"   Input shape: {input_ids.shape}")
+            print(f"   Attention shape: {attention_mask.shape}")
             
             with torch.no_grad():
-                outputs = model.generate(
-                    input_ids=inputs.input_ids,
-                    attention_mask=inputs.attention_mask,
-                    pixel_values=video_tensor.unsqueeze(0),
-                    max_length=inputs.input_ids.shape[1] + 8,
-                    do_sample=False,
-                    pad_token_id=tokenizer.eos_token_id,
-                    eos_token_id=tokenizer.eos_token_id
-                )
-            
-            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            continuation = generated_text[len(prompt):].strip()
-            results[prompt] = continuation
-            print(f"'{prompt}' → '{continuation}'")
+                try:
+                    outputs = model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=video_tensor.unsqueeze(0),
+                        max_length=input_ids.shape[1] + 8,
+                        do_sample=False,
+                        pad_token_id=tokenizer.eos_token_id,
+                        eos_token_id=tokenizer.eos_token_id
+                    )
+                    
+                    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                    continuation = generated_text[len(prompt):].strip()
+                    results[prompt] = continuation
+                    print(f"✅ '{prompt}' → '{continuation}'")
+                    
+                except Exception as gen_error:
+                    print(f"❌ Generation error for '{prompt}': {gen_error}")
+                    results[prompt] = "ERROR"
         
         return results
         
@@ -110,7 +115,7 @@ def test_single_model(model_name, checkpoint_dir=None):
         gc.collect()
 
 def main():
-    print("🎯 TESTING VIDEO+TEXT CONTEXT (TOKENIZER FIXED)")
+    print("🎯 TESTING VIDEO+TEXT CONTEXT (DEBUG TOKENIZER)")
     print("="*60)
     
     # Test baseline first
@@ -132,7 +137,7 @@ def main():
                 baseline_out = baseline_results[prompt]
                 enhanced_out = enhanced_results[prompt]
                 
-                if baseline_out != enhanced_out:
+                if baseline_out != enhanced_out and baseline_out != "ERROR" and enhanced_out != "ERROR":
                     print(f"✅ DIFFERENT: '{prompt}'")
                     print(f"   Baseline:  '{baseline_out}'")
                     print(f"   Enhanced:  '{enhanced_out}'")
