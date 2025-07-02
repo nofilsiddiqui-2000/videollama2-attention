@@ -140,13 +140,22 @@ def main():
         eps=1e-8
     )
     
-    # UPDATED: More explicit danger vocabulary captions
+    # # UPDATED: More explicit danger vocabulary captions
+    # captions = [
+    #     "DANGER: This video shows dangerous risky unsafe activities",
+    #     "WARNING: Safety hazard dangerous situation alert", 
+    #     "ALERT: Unsafe dangerous risky behavior warning",
+    #     "SAFETY: Dangerous hazardous risky activity warning",
+    #     "RISK: Warning dangerous unsafe hazardous activity"
+    # ]
+
+    # HYPER-FOCUSED DANGER VOCABULARY
     captions = [
-        "DANGER: This video shows dangerous risky unsafe activities",
-        "WARNING: Safety hazard dangerous situation alert", 
-        "ALERT: Unsafe dangerous risky behavior warning",
-        "SAFETY: Dangerous hazardous risky activity warning",
-        "RISK: Warning dangerous unsafe hazardous activity"
+        "danger danger danger warning",
+        "warning alert risk unsafe", 
+        "alert danger hazard risky",
+        "unsafe dangerous warning alert",
+        "risk hazard danger warning"
     ]
     
     print(f"📝 Using {len(captions)} EXPLICIT danger-focused captions:")
