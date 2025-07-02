@@ -60,13 +60,13 @@ def test_single_model(model_name, checkpoint_dir=None):
             print(f"🔍 Testing: '{prompt}'")
             
             try:
-                # USE THE WORKING mm_infer FUNCTION (same as original test)
+                # FIX: Use correct mm_infer signature
                 output = mm_infer(
-                    model=model,
-                    processor=processor,
-                    video_path=video_path,
-                    instruction=prompt,
-                    modal='video'
+                    model,
+                    processor,
+                    video_path,  # image_or_video
+                    prompt,      # instruct
+                    tokenizer
                 )
                 
                 results[prompt] = output
@@ -93,7 +93,7 @@ def test_single_model(model_name, checkpoint_dir=None):
         gc.collect()
 
 def main():
-    print("🎯 TESTING VIDEO+TEXT CONTEXT (USE mm_infer)")
+    print("🎯 TESTING VIDEO+TEXT CONTEXT (CORRECT mm_infer SIGNATURE)")
     print("="*60)
     
     # Test baseline first
