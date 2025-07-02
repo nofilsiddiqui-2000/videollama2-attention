@@ -140,16 +140,18 @@ def main():
         eps=1e-8
     )
     
-    # Diverse captions for stronger learning signal
+    # UPDATED: More explicit danger vocabulary captions
     captions = [
-        "This video shows dangerous activities requiring safety warnings",
-        "Warning: This video contains risky behavior that could cause injury", 
-        "Alert: Dangerous situation detected in this video content",
-        "Safety hazard: This video shows activities with injury risk",
-        "Danger warning: This video requires safety alert notifications"
+        "DANGER: This video shows dangerous risky unsafe activities",
+        "WARNING: Safety hazard dangerous situation alert", 
+        "ALERT: Unsafe dangerous risky behavior warning",
+        "SAFETY: Dangerous hazardous risky activity warning",
+        "RISK: Warning dangerous unsafe hazardous activity"
     ]
     
-    print(f"📝 Using {len(captions)} diverse danger-focused captions")
+    print(f"📝 Using {len(captions)} EXPLICIT danger-focused captions:")
+    for i, cap in enumerate(captions, 1):
+        print(f"   {i}. {cap}")
     print("🚀 Video caching enabled for 3x speed boost")
     
     # Training tracking
@@ -188,7 +190,7 @@ def main():
                 
                 optimizer.zero_grad()
                 
-                # Use diverse captions
+                # Use explicit danger captions
                 caption = random.choice(captions)
                 cached_inputs = tokenizer(caption, return_tensors="pt", truncation=True, max_length=32).to("cuda")
                 
@@ -312,7 +314,9 @@ def main():
         'successful_steps': successful_steps,
         'success_rate': success_rate,
         'total_improvement': total_improvement,
+        'danger_captions_used': captions,
         'fixes_applied': [
+            'Explicit danger vocabulary captions',
             'Proper checkpoint saving',
             'FP32 master weights',
             'Video caching for speed',
