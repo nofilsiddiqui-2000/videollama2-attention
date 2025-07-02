@@ -61,15 +61,29 @@ def test_single_model(model_name, checkpoint_dir=None):
         
         results = {}
         for prompt in test_prompts:
-            inputs = tokenizer(prompt, return_tensors="pt", max_length=32).to("cuda")
+            # FIX: Proper tokenization with attention mask
+            inputs = tokenizer(
+                prompt, 
+                return_tensors="pt", 
+                truncation=True, 
+                max_length=32,
+                padding=True,
+                add_special_tokens=True
+            ).to("cuda")
+            
+            # Ensure attention_mask exists
+            if inputs.attention_mask is None:
+                inputs.attention_mask = torch.ones_like(inputs.input_ids)
             
             with torch.no_grad():
                 outputs = model.generate(
                     input_ids=inputs.input_ids,
+                    attention_mask=inputs.attention_mask,
                     pixel_values=video_tensor.unsqueeze(0),
                     max_length=inputs.input_ids.shape[1] + 8,
                     do_sample=False,
-                    pad_token_id=tokenizer.eos_token_id
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id
                 )
             
             generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -81,6 +95,8 @@ def test_single_model(model_name, checkpoint_dir=None):
         
     except Exception as e:
         print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
         return {}
     finally:
         # Cleanup
@@ -94,7 +110,7 @@ def test_single_model(model_name, checkpoint_dir=None):
         gc.collect()
 
 def main():
-    print("🎯 TESTING VIDEO+TEXT CONTEXT (EXACT PATH)")
+    print("🎯 TESTING VIDEO+TEXT CONTEXT (TOKENIZER FIXED)")
     print("="*60)
     
     # Test baseline first
@@ -126,8 +142,9 @@ def main():
         
         if differences > 0:
             print(f"\n🎉 SUCCESS: {differences} different outputs detected!")
+            print("🔥 TRAINING WORKED - Video+text context shows differences!")
         else:
-            print(f"\n💔 FAILURE: All outputs identical")
+            print(f"\n💔 FAILURE: All outputs identical even with video context")
     else:
         print("❌ Could not compare - loading failed")
 
