@@ -11,7 +11,7 @@ os.environ.update({
     "TOKENIZERS_PARALLELISM": "false"
 })
 
-from videollama2 import model_init
+from videollama2 import model_init, mm_infer
 from videollama2.utils import disable_torch_init
 from peft import PeftModel
 
@@ -47,10 +47,6 @@ def test_single_model(model_name, checkpoint_dir=None):
         video_path = "kinetics400_dataset/riding_bike_RgKAFK5djSk_001.mp4"
         print(f"📹 Testing with: {video_path}")
         
-        video_tensor = processor["video"](video_path)
-        video_tensor = video_tensor.clamp(0, 1) * 2 - 1
-        video_tensor = video_tensor.to("cuda", dtype=torch.float16)
-        
         # Test prompts from training
         test_prompts = [
             "danger",
@@ -61,40 +57,24 @@ def test_single_model(model_name, checkpoint_dir=None):
         
         results = {}
         for prompt in test_prompts:
-            # DEBUG: Check tokenizer step by step
-            print(f"🔍 Tokenizing: '{prompt}'")
+            print(f"🔍 Testing: '{prompt}'")
             
-            # Step 1: Basic tokenization
-            tokens = tokenizer.encode(prompt, add_special_tokens=True)
-            print(f"   Tokens: {tokens}")
-            
-            # Step 2: Convert to tensor manually
-            input_ids = torch.tensor([tokens], device="cuda")
-            attention_mask = torch.ones_like(input_ids)
-            
-            print(f"   Input shape: {input_ids.shape}")
-            print(f"   Attention shape: {attention_mask.shape}")
-            
-            with torch.no_grad():
-                try:
-                    outputs = model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        pixel_values=video_tensor.unsqueeze(0),
-                        max_length=input_ids.shape[1] + 8,
-                        do_sample=False,
-                        pad_token_id=tokenizer.eos_token_id,
-                        eos_token_id=tokenizer.eos_token_id
-                    )
-                    
-                    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                    continuation = generated_text[len(prompt):].strip()
-                    results[prompt] = continuation
-                    print(f"✅ '{prompt}' → '{continuation}'")
-                    
-                except Exception as gen_error:
-                    print(f"❌ Generation error for '{prompt}': {gen_error}")
-                    results[prompt] = "ERROR"
+            try:
+                # USE THE WORKING mm_infer FUNCTION (same as original test)
+                output = mm_infer(
+                    model=model,
+                    processor=processor,
+                    video_path=video_path,
+                    instruction=prompt,
+                    modal='video'
+                )
+                
+                results[prompt] = output
+                print(f"✅ '{prompt}' → '{output[:100]}...'")
+                
+            except Exception as infer_error:
+                print(f"❌ mm_infer error for '{prompt}': {infer_error}")
+                results[prompt] = "ERROR"
         
         return results
         
@@ -109,13 +89,11 @@ def test_single_model(model_name, checkpoint_dir=None):
             del model
         if 'base_model' in locals():
             del base_model
-        if 'video_tensor' in locals():
-            del video_tensor
         torch.cuda.empty_cache()
         gc.collect()
 
 def main():
-    print("🎯 TESTING VIDEO+TEXT CONTEXT (DEBUG TOKENIZER)")
+    print("🎯 TESTING VIDEO+TEXT CONTEXT (USE mm_infer)")
     print("="*60)
     
     # Test baseline first
@@ -139,17 +117,18 @@ def main():
                 
                 if baseline_out != enhanced_out and baseline_out != "ERROR" and enhanced_out != "ERROR":
                     print(f"✅ DIFFERENT: '{prompt}'")
-                    print(f"   Baseline:  '{baseline_out}'")
-                    print(f"   Enhanced:  '{enhanced_out}'")
+                    print(f"   Baseline:  '{baseline_out[:50]}...'")
+                    print(f"   Enhanced:  '{enhanced_out[:50]}...'")
                     differences += 1
                 else:
-                    print(f"❌ SAME: '{prompt}' → '{baseline_out}'")
+                    print(f"❌ SAME: '{prompt}' → '{baseline_out[:50]}...'")
         
         if differences > 0:
             print(f"\n🎉 SUCCESS: {differences} different outputs detected!")
-            print("🔥 TRAINING WORKED - Video+text context shows differences!")
+            print("🔥 MASSIVE EPOCH TRAINING WORKED!")
         else:
             print(f"\n💔 FAILURE: All outputs identical even with video context")
+            print("❌ Need different training approach")
     else:
         print("❌ Could not compare - loading failed")
 
