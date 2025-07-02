@@ -38,7 +38,7 @@ def test_single_model(model_name, checkpoint_dir=None):
             cache_dir=cache
         )
         
-        # Set padding token IMMEDIATELY after model_init
+        # Set padding token
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "right"
         print(f"✅ Pad token ID set to: {tokenizer.pad_token_id}")
@@ -71,12 +71,7 @@ def test_single_model(model_name, checkpoint_dir=None):
         video_path = "kinetics400_dataset/riding_bike_RgKAFK5djSk_001.mp4"
         print(f"📹 Pre-processing video: {video_path}")
         
-        # DEBUG: Check what processor returns
-        video_data = processor['video'](video_path)
-        print(f"   🔍 DEBUG: processor returns type: {type(video_data)}")
-        print(f"   🔍 DEBUG: processor returns shape: {video_data.shape if hasattr(video_data, 'shape') else 'No shape attr'}")
-        
-        video_tensor = video_data.to(torch.float16)
+        video_tensor = processor['video'](video_path).to(torch.float16)
         video_tensor = (video_tensor.clamp(0, 1) * 2 - 1).cuda(non_blocking=True)
         print(f"   Video tensor shape: {video_tensor.shape}")
         
@@ -93,16 +88,15 @@ def test_single_model(model_name, checkpoint_dir=None):
         with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
             for prompt in test_prompts:
                 print(f"\n🔍 Testing: '{prompt}'")
-                print(f"   🔍 DEBUG: prompt type: {type(prompt)}")
                 
                 try:
-                    # TRY 1: Original signature
+                    # ✅ CORRECT SIGNATURE: mm_infer(image_or_video, instruct, model, tokenizer, modal='video')
                     output = mm_infer(
-                        model,
-                        processor,
-                        video_tensor,
-                        prompt,
-                        'video',
+                        video_tensor,     # 1st: image_or_video
+                        prompt,           # 2nd: instruct  
+                        model,            # 3rd: model
+                        tokenizer,        # 4th: tokenizer
+                        modal='video',    # 5th: modal (keyword)
                         do_sample=False,
                         max_new_tokens=40,
                         temperature=0.0
@@ -114,48 +108,7 @@ def test_single_model(model_name, checkpoint_dir=None):
                     
                 except Exception as infer_error:
                     print(f"❌ mm_infer error: {infer_error}")
-                    
-                    try:
-                        # TRY 2: Pass video as file path instead of tensor
-                        print("   🔍 Trying with video path instead of tensor...")
-                        output = mm_infer(
-                            model,
-                            processor,
-                            video_path,  # File path instead of tensor
-                            prompt,
-                            'video',
-                            do_sample=False,
-                            max_new_tokens=40,
-                            temperature=0.0
-                        )
-                        
-                        results[prompt] = output
-                        continuation = output.split('\n')[0]
-                        print(f"✅ '{prompt}' (path) → '{continuation}'")
-                        
-                    except Exception as infer_error2:
-                        print(f"❌ mm_infer path error: {infer_error2}")
-                        
-                        try:
-                            # TRY 3: Different argument order
-                            print("   🔍 Trying different argument order...")
-                            output = mm_infer(
-                                model,
-                                processor,
-                                video_path,
-                                prompt,
-                                do_sample=False,
-                                max_new_tokens=40,
-                                temperature=0.0
-                            )
-                            
-                            results[prompt] = output
-                            continuation = output.split('\n')[0]  
-                            print(f"✅ '{prompt}' (no modal) → '{continuation}'")
-                            
-                        except Exception as infer_error3:
-                            print(f"❌ mm_infer no modal error: {infer_error3}")
-                            results[prompt] = "ERROR"
+                    results[prompt] = "ERROR"
         
         return results
         
@@ -177,7 +130,7 @@ def test_single_model(model_name, checkpoint_dir=None):
         gc.collect()
 
 def main():
-    print("🎯 TESTING VIDEO+TEXT CONTEXT (DEBUG mm_infer ARGS)")
+    print("🎯 TESTING VIDEO+TEXT CONTEXT (CORRECT mm_infer SIGNATURE!)")
     print("="*70)
     
     # Test baseline first
@@ -214,13 +167,14 @@ def main():
         if differences > 0:
             print(f"\n🔥🔥🔥 SUCCESS! {differences} DIFFERENT OUTPUTS! 🔥🔥🔥")
             print("✅ THE 855-STEP MASSIVE EPOCH TRAINING WORKED!")
-            print("✅ LoRA adapter is loaded and changing video+text behavior!")
+            print("✅ LoRA adapter is loaded and changing behavior!")
         else:
             print(f"\n💔 RESULT: All outputs identical")
             if any(v != "ERROR" for v in baseline_results.values()):
                 print("❌ The massive training didn't change video+text behavior")
+                print("❌ May need different LoRA configuration")
             else:
-                print("❌ Both models failed - function signature issues")
+                print("❌ Both models failed - check setup")
     else:
         print("❌ Could not compare - loading failed")
 
