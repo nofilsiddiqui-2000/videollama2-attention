@@ -60,14 +60,14 @@ def test_single_model(model_name, checkpoint_dir=None):
             print(f"🔍 Testing: '{prompt}'")
             
             try:
-                # ✅ CORRECT SIGNATURE: mm_infer(model, processor, video, tokenizer, instruct, modal)
+                # ✅ ALL POSITIONAL ARGUMENTS - NO KEYWORDS
                 output = mm_infer(
-                    model,
-                    processor,
-                    video_path,    # 3rd: video path
-                    tokenizer,     # 4th: tokenizer (WAS MISSING!)
-                    prompt,        # 5th: instruction
-                    modal='video'  # 6th: modal type
+                    model,        # 1st: model
+                    processor,    # 2nd: processor  
+                    video_path,   # 3rd: video
+                    tokenizer,    # 4th: tokenizer
+                    prompt,       # 5th: instruction
+                    'video'       # 6th: modal (positional, not keyword!)
                 )
                 
                 results[prompt] = output
@@ -94,7 +94,7 @@ def test_single_model(model_name, checkpoint_dir=None):
         gc.collect()
 
 def main():
-    print("🎯 TESTING VIDEO+TEXT CONTEXT (CORRECT mm_infer SIGNATURE)")
+    print("🎯 TESTING VIDEO+TEXT CONTEXT (ALL POSITIONAL ARGS)")
     print("="*60)
     
     # Test baseline first
@@ -106,7 +106,7 @@ def main():
     enhanced_results = test_single_model("enhanced", "massive_epoch_danger")
     
     # Compare results
-    print("\n🔍 COMPARISON:")
+    print("\n🔍 FINAL COMPARISON:")
     print("="*40)
     
     if baseline_results and enhanced_results:
@@ -117,22 +117,25 @@ def main():
                 enhanced_out = enhanced_results[prompt]
                 
                 if baseline_out != enhanced_out and baseline_out != "ERROR" and enhanced_out != "ERROR":
-                    print(f"✅ DIFFERENT: '{prompt}'")
-                    print(f"   Baseline:  '{baseline_out[:100]}...'")
-                    print(f"   Enhanced:  '{enhanced_out[:100]}...'")
+                    print(f"🎉 DIFFERENT: '{prompt}'")
+                    print(f"   Baseline:  {baseline_out[:200]}")
+                    print(f"   Enhanced:  {enhanced_out[:200]}")
+                    print("-" * 40)
                     differences += 1
                 else:
                     if baseline_out != "ERROR":
-                        print(f"❌ SAME: '{prompt}' → '{baseline_out[:100]}...'")
+                        print(f"❌ SAME: '{prompt}' → {baseline_out[:100]}...")
                     else:
                         print(f"❌ ERROR: '{prompt}' → both failed")
         
         if differences > 0:
-            print(f"\n🎉 SUCCESS: {differences} different outputs detected!")
-            print("🔥 THE 855-STEP MASSIVE EPOCH TRAINING WORKED!")
+            print(f"\n🔥🔥🔥 SUCCESS! {differences} DIFFERENT OUTPUTS! 🔥🔥🔥")
+            print("✅ THE 855-STEP MASSIVE EPOCH TRAINING WORKED!")
+            print("✅ Video+text context shows clear behavioral changes!")
         else:
             print(f"\n💔 FAILURE: All outputs identical")
             print("❌ The massive training didn't change video+text behavior")
+            print("❌ Need to try different LoRA configuration")
     else:
         print("❌ Could not compare - loading failed")
 
