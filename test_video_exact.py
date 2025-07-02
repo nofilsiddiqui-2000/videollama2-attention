@@ -43,8 +43,10 @@ def test_single_model(model_name, checkpoint_dir=None):
         model.to("cuda")
         model.eval()
         
-        # Test video
-        video_path = "kinetics400_dataset/riding_bike/riding_bike_RgKAFK5djSk_001.mp4"
+        # Use EXACT file path
+        video_path = "kinetics400_dataset/riding_bike_RgKAFK5djSk_001.mp4"
+        print(f"📹 Testing with: {video_path}")
+        
         video_tensor = processor["video"](video_path)
         video_tensor = video_tensor.clamp(0, 1) * 2 - 1
         video_tensor = video_tensor.to("cuda", dtype=torch.float16)
@@ -92,7 +94,7 @@ def test_single_model(model_name, checkpoint_dir=None):
         gc.collect()
 
 def main():
-    print("🎯 TESTING VIDEO+TEXT CONTEXT (Memory Safe)")
+    print("🎯 TESTING VIDEO+TEXT CONTEXT (EXACT PATH)")
     print("="*60)
     
     # Test baseline first
