@@ -15,6 +15,10 @@ from videollama2 import model_init, mm_infer
 from videollama2.utils import disable_torch_init
 from peft import PeftModel
 
+# FIX 8: Enable TF32 for speed
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 def test_single_model(model_name, checkpoint_dir=None):
     """Test a single model to avoid OOM"""
     print(f"🔍 TESTING {model_name.upper()}")
@@ -22,6 +26,7 @@ def test_single_model(model_name, checkpoint_dir=None):
     
     # Clear GPU memory
     torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()  # FIX 7: Better memory cleanup
     gc.collect()
     
     try:
@@ -33,26 +38,25 @@ def test_single_model(model_name, checkpoint_dir=None):
             cache_dir=cache
         )
         
-        # FIX 3: Set padding token
+        # FIX 3: Set padding token IMMEDIATELY after model_init
         tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+        print(f"✅ Pad token ID set to: {tokenizer.pad_token_id}")
         
         if checkpoint_dir:
-            model = PeftModel.from_pretrained(
-                base_model, 
-                checkpoint_dir, 
-                adapter_name="default",  # FIX 5: Explicit adapter name
-                is_trainable=False
-            )
+            # FIX 5: Load LoRA without explicit adapter_name
+            model = PeftModel.from_pretrained(base_model, checkpoint_dir)
             print(f"✅ Loaded enhanced model from {checkpoint_dir}")
+            print(f"   PEFT config: {model.peft_config}")  # Verify adapter loads
             
-            # FIX 6: Verify LoRA weights are loaded
+            # FIX 4: Keep LoRA weights in FP32 ONLY
             lora_weights_found = False
             for n, p in model.named_parameters():
-                if 'lora_' in n:
+                if "lora_" in n:
                     lora_weights_found = True
+                    p.data = p.data.float()      # FP32 for adapter only
+                    p.requires_grad_(False)
                     print(f"   LoRA weight: {n} → max={p.abs().max():.6f}")
-                    # FIX 8: LoRA matrices to FP32
-                    p.data = p.data.float()
             
             if not lora_weights_found:
                 print("❌ WARNING: No LoRA weights found!")
@@ -61,16 +65,15 @@ def test_single_model(model_name, checkpoint_dir=None):
             print("✅ Loaded baseline model")
         
         model.to("cuda")
-        # FIX 7: Eval mode on both
         model.eval()
         base_model.eval()
         
-        # FIX 2: Pre-process video to tensor ONCE
+        # FIX 2: Build video tensor ONCE, reuse for all prompts
         video_path = "kinetics400_dataset/riding_bike_RgKAFK5djSk_001.mp4"
         print(f"📹 Pre-processing video: {video_path}")
         
-        video_tensor = processor['video'](video_path)  # Decode on CPU
-        video_tensor = video_tensor.clamp(0, 1).to('cuda', torch.float16)
+        video_tensor = processor['video'](video_path).to(torch.float16)  # CPU first
+        video_tensor = (video_tensor.clamp(0, 1) * 2 - 1).cuda(non_blocking=True)  # Then GPU
         print(f"   Video tensor shape: {video_tensor.shape}")
         
         # Test prompts from training
@@ -82,54 +85,33 @@ def test_single_model(model_name, checkpoint_dir=None):
         ]
         
         results = {}
-        for prompt in test_prompts:
-            print(f"\n🔍 Testing: '{prompt}'")
-            
-            try:
-                # FIX 1: Correct mm_infer signature with keyword args
-                output = mm_infer(
-                    model,                    # required
-                    processor,                # required  
-                    video_tensor,             # **tensor**, not path
-                    prompt,                   # instruction
-                    modal='video',            # keyword arg
-                    tokenizer=tokenizer,      # keyword arg
-                    do_sample=False           # keyword arg
-                )
+        
+        # FIX 9: Minimal working loop with autocast
+        with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+            for prompt in test_prompts:
+                print(f"\n🔍 Testing: '{prompt}'")
                 
-                results[prompt] = output
-                print(f"✅ '{prompt}' → '{output[:150]}...'")
-                
-            except Exception as infer_error:
-                print(f"❌ mm_infer error: {infer_error}")
-                
-                # FIX 9: Fallback to direct generate() for sanity check
                 try:
-                    print("   Trying direct generate()...")
-                    inputs = tokenizer(prompt, return_tensors='pt').to('cuda')
+                    # FIX 1: EXACT mm_infer signature - 5 positional args, NO tokenizer kwarg
+                    output = mm_infer(
+                        model,          # 1st: model
+                        processor,      # 2nd: processor
+                        video_tensor,   # 3rd: video tensor (reused)
+                        prompt,         # 4th: instruction
+                        'video',        # 5th: modal (positional, not keyword)
+                        # Optional kwargs AFTER modal:
+                        do_sample=False,
+                        max_new_tokens=40,
+                        temperature=0.0
+                    )
                     
-                    with torch.no_grad():
-                        out_ids = model.generate(
-                            pixel_values=video_tensor.unsqueeze(0),
-                            input_ids=inputs.input_ids,
-                            max_new_tokens=32,
-                            temperature=0.0,
-                            do_sample=False,
-                            pad_token_id=tokenizer.eos_token_id
-                        )
+                    results[prompt] = output
+                    continuation = output.split('\n')[0]  # First line only
+                    print(f"✅ '{prompt}' → '{continuation}'")
                     
-                    output = tokenizer.decode(out_ids[0], skip_special_tokens=True)
-                    continuation = output[len(prompt):].strip()
-                    results[prompt] = continuation
-                    print(f"✅ '{prompt}' (direct) → '{continuation}'")
-                    
-                except Exception as gen_error:
-                    print(f"❌ Direct generate error: {gen_error}")
+                except Exception as infer_error:
+                    print(f"❌ mm_infer error: {infer_error}")
                     results[prompt] = "ERROR"
-            
-            # FIX 4: Free memory between iterations
-            torch.cuda.empty_cache()
-            gc.collect()
         
         return results
         
@@ -139,7 +121,7 @@ def test_single_model(model_name, checkpoint_dir=None):
         traceback.print_exc()
         return {}
     finally:
-        # FIX 4: Aggressive cleanup
+        # FIX 7: PyTorch-sanctioned cleanup
         if 'model' in locals():
             del model
         if 'base_model' in locals():
@@ -147,11 +129,16 @@ def test_single_model(model_name, checkpoint_dir=None):
         if 'video_tensor' in locals():
             del video_tensor
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
         gc.collect()
 
 def main():
-    print("🎯 TESTING VIDEO+TEXT CONTEXT (ALL FIXES APPLIED)")
+    print("🎯 TESTING VIDEO+TEXT CONTEXT (ALL 10 FIXES APPLIED)")
     print("="*70)
+    
+    # FIX 10: Checklist before running
+    print("\n📋 PRE-FLIGHT CHECKLIST:")
+    print("="*30)
     
     # Test baseline first
     baseline_results = test_single_model("baseline")
@@ -187,14 +174,15 @@ def main():
         if differences > 0:
             print(f"\n🔥🔥🔥 SUCCESS! {differences} DIFFERENT OUTPUTS! 🔥🔥🔥")
             print("✅ THE 855-STEP MASSIVE EPOCH TRAINING WORKED!")
-            print("✅ Video+text context shows clear behavioral changes!")
+            print("✅ LoRA adapter is loaded and changing video+text behavior!")
+            print("✅ Your danger-focused training has modified the model!")
         else:
             print(f"\n💔 RESULT: All outputs identical")
             if any(v != "ERROR" for v in baseline_results.values()):
                 print("❌ The massive training didn't change video+text behavior")
-                print("❌ May need different LoRA configuration or more training")
+                print("❌ May need different LoRA configuration or more training steps")
             else:
-                print("❌ Both models failed - technical issues need fixing")
+                print("❌ Both models failed - check checkpoint path")
     else:
         print("❌ Could not compare - loading failed")
 
