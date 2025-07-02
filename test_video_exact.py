@@ -60,13 +60,14 @@ def test_single_model(model_name, checkpoint_dir=None):
             print(f"🔍 Testing: '{prompt}'")
             
             try:
-                # FIX: Use correct mm_infer signature
+                # ✅ CORRECT SIGNATURE: mm_infer(model, processor, video, tokenizer, instruct, modal)
                 output = mm_infer(
                     model,
                     processor,
-                    video_path,  # image_or_video
-                    prompt,      # instruct
-                    tokenizer
+                    video_path,    # 3rd: video path
+                    tokenizer,     # 4th: tokenizer (WAS MISSING!)
+                    prompt,        # 5th: instruction
+                    modal='video'  # 6th: modal type
                 )
                 
                 results[prompt] = output
@@ -117,18 +118,21 @@ def main():
                 
                 if baseline_out != enhanced_out and baseline_out != "ERROR" and enhanced_out != "ERROR":
                     print(f"✅ DIFFERENT: '{prompt}'")
-                    print(f"   Baseline:  '{baseline_out[:50]}...'")
-                    print(f"   Enhanced:  '{enhanced_out[:50]}...'")
+                    print(f"   Baseline:  '{baseline_out[:100]}...'")
+                    print(f"   Enhanced:  '{enhanced_out[:100]}...'")
                     differences += 1
                 else:
-                    print(f"❌ SAME: '{prompt}' → '{baseline_out[:50]}...'")
+                    if baseline_out != "ERROR":
+                        print(f"❌ SAME: '{prompt}' → '{baseline_out[:100]}...'")
+                    else:
+                        print(f"❌ ERROR: '{prompt}' → both failed")
         
         if differences > 0:
             print(f"\n🎉 SUCCESS: {differences} different outputs detected!")
-            print("🔥 MASSIVE EPOCH TRAINING WORKED!")
+            print("🔥 THE 855-STEP MASSIVE EPOCH TRAINING WORKED!")
         else:
-            print(f"\n💔 FAILURE: All outputs identical even with video context")
-            print("❌ Need different training approach")
+            print(f"\n💔 FAILURE: All outputs identical")
+            print("❌ The massive training didn't change video+text behavior")
     else:
         print("❌ Could not compare - loading failed")
 
