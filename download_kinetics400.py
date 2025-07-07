@@ -1,319 +1,239 @@
 #!/usr/bin/env python3
-"""VideoLLaMA 2 — batch processing for attention‑heat‑maps
+import pandas as pd
+import subprocess, time, random, os
+from pathlib import Path
+import cv2
+import requests
+import shutil
 
-Run
-----
-python videollama2_attn_heatmap_batch.py
-
-What you get
-------------
-* A caption printed in the console for each video
-* A **patch‑level** heat‑map image (24 × 24 grid from ViT‑L/14) saved for each video in
-  `outputs/[video_name]_heatmap.png` showing what spatial regions the model
-  attended to overall while generating the caption.
-"""
-
-import os, sys, cv2, math, torch, numpy as np
-import glob
-from PIL import Image
-from tqdm import tqdm
-
-# ─────────────────────────  add repo to path  ──────────────────────────
-sys.path.append("./VideoLLaMA2")
-
-from videollama2 import model_init
-from videollama2.mm_utils import tokenizer_multimodal_token
-from videollama2.utils import disable_torch_init
-from videollama2.constants import DEFAULT_VIDEO_TOKEN
-
-# ──────────────────────────────  CONFIG  ───────────────────────────────
-MODEL_ID        = "DAMO-NLP-SG/VideoLLaMA2-7B"
-NUM_PATCH_SIDE  = 24                   # ViT‑L/14 on 336×336 ⇒ 24×24 patches
-PATCHES         = NUM_PATCH_SIDE ** 2  # 576
-NUM_FRAMES      = 8                    # default temporal pooling window
-OUT_DIR         = "outputs"; os.makedirs(OUT_DIR, exist_ok=True)
-DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
-DATASET_DIR     = "kinetics400_dataset"
-PROMPT          = "Describe what is happening in the video."
-# Track failed videos for reporting
-FAILED_VIDEOS   = []
-
-# ──────────────────────────  utilities  ────────────────────────────────
-
-def get_video_files(directory):
-    """Get all video files from directory with common video extensions"""
-    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.webm']
-    video_files = []
-    
-    for ext in video_extensions:
-        video_files.extend(glob.glob(os.path.join(directory, f'*{ext}')))
-    
-    return video_files
-
-def load_frames(path: str, num_frames: int):
-    """Load frames from video with robust error handling"""
+def is_video_valid(fp, min_duration=0.5, min_frames=3):
+    """Check if video is valid with slightly more lenient requirements"""
     try:
-        cap = cv2.VideoCapture(path)
+        cap = cv2.VideoCapture(str(fp))
         if not cap.isOpened():
-            print(f"[WARN] Cannot open {path}")
-            return None
+            return False
+        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        duration = frames / fps if fps > 0 else 0
+        return frames >= min_frames and duration >= min_duration
+    except Exception as e:
+        print(f"Error validating video {fp}: {e}")
+        return False
+
+def download_with_retries(ytid, start, end, outf, max_retries=3):
+    """Try multiple formats and retry download"""
+    formats = [
+        "mp4[height<=480]/best[height<=480]",
+        "mp4/best",
+        "bestvideo[height<=480]+bestaudio/best[height<=480]",
+        "bestvideo+bestaudio/best"
+    ]
+    
+    for attempt in range(max_retries):
+        for fmt in formats:
+            duration = min(10, end - start)
+            cmd = [
+                "yt-dlp",
+                "--format", fmt,
+                "--output", str(outf),
+                "--download-sections", f"*{start}-{start+duration}",
+                "--no-check-certificate",
+                "--geo-bypass",
+                "--force-ipv4",
+                f"https://www.youtube.com/watch?v={ytid}"
+            ]
             
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total <= 0:
-            print(f"[WARN] Video {path} has no frames")
-            cap.release()
-            return None
-            
-        step = max(total // num_frames, 1)
-        frames = []
-        idx = 0
-        
-        # Try to read frames with timeout protection
-        for _ in range(num_frames * 2):  # Extra attempts for robustness
-            if len(frames) >= num_frames:
-                break
+            try:
+                print(f"Attempt {attempt+1} with format {fmt} for {ytid}")
+                res = subprocess.run(cmd, timeout=180, capture_output=True)
                 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if not ret:
-                idx += 1  # Try next frame
+                if outf.exists() and outf.stat().st_size > 1024 and is_video_valid(outf):
+                    return True
+                    
+                # Wait between attempts
+                time.sleep(random.uniform(1.5, 3.0))
+            
+            except subprocess.TimeoutExpired:
+                print(f"Timeout for {ytid}, trying next format...")
+                continue
+            except Exception as e:
+                print(f"Error downloading {ytid}: {e}")
                 continue
                 
-            try:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = cv2.resize(frame, (336, 336), interpolation=cv2.INTER_AREA)
-                frames.append(Image.fromarray(frame))
-                idx += step
-            except Exception as e:
-                print(f"[WARN] Error processing frame: {str(e)}")
-                idx += 1
-                
-        cap.release()
-        
-        # Check if we have enough frames
-        if len(frames) < num_frames:
-            print(f"[WARN] Could only extract {len(frames)}/{num_frames} frames from {path}")
-            if len(frames) == 0:
-                return None
-                
-        return frames
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to load frames from {path}: {str(e)}")
-        return None
+    return False
 
-def colourise(mat: np.ndarray):
-    """Convert attention matrix to colormap"""
-    if mat is None or mat.size == 0:
-        print("[WARN] Empty matrix provided to colourise")
-        return np.zeros((336, 336, 3), dtype=np.uint8)
+def check_and_download_csv(split='train'):
+    """Download the CSV file if it doesn't exist"""
+    csv_path = Path(f"kinetics400_{split}.csv")
+    if csv_path.exists():
+        return True
         
+    print(f"CSV file {csv_path} not found. Attempting to download...")
+    csv_url = f"https://raw.githubusercontent.com/open-mmlab/mmaction2/master/tools/data/kinetics/kinetics400_{split}_list.txt"
+    
     try:
-        min_val = mat.min()
-        max_val = mat.max()
-        
-        # Avoid division by zero
-        if max_val - min_val < 1e-6:
-            normalized = np.zeros_like(mat)
+        response = requests.get(csv_url)
+        if response.status_code == 200:
+            # Convert the format to match expected CSV
+            lines = response.text.strip().split('\n')
+            data = []
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    video_info = parts[0].split('/')[-1]  # Get the last part
+                    label = ' '.join(parts[1:])
+                    
+                    # Parse video ID and time info
+                    if '_' in video_info:
+                        segments = video_info.split('_')
+                        if len(segments) >= 3:
+                            youtube_id = segments[-2]
+                            time_info = segments[-1].replace('.mp4', '')
+                            try:
+                                time_start = int(time_info)
+                                time_end = time_start + 10  # Assume 10 seconds
+                                data.append([youtube_id, time_start, time_end, label])
+                            except ValueError:
+                                pass
+            
+            # Create DataFrame and save as CSV
+            if data:
+                df = pd.DataFrame(data, columns=['youtube_id', 'time_start', 'time_end', 'label'])
+                df.to_csv(csv_path, index=False)
+                print(f"CSV file created at {csv_path}")
+                return True
+            else:
+                print("Failed to parse data for CSV")
         else:
-            normalized = (mat - min_val) / (max_val - min_val)
+            print(f"Failed to download CSV. Status code: {response.status_code}")
             
-        # Convert to uint8 and apply colormap
-        mat_uint8 = np.clip(normalized * 255, 0, 255).astype(np.uint8)
-        return cv2.applyColorMap(mat_uint8, cv2.COLORMAP_JET)
+        # Try secondary source for CSV
+        secondary_url = f"https://github.com/activitynet/ActivityNet/raw/master/Crawler/Kinetics/data/kinetics_{split}.json"
+        # Would need additional code to parse JSON format to CSV
+            
     except Exception as e:
-        print(f"[ERROR] Failed to colourise matrix: {str(e)}")
-        return np.zeros((336, 336, 3), dtype=np.uint8)
-
-# ───────────────────────  model + processors  ──────────────────────────
-
-def load_model(model_id=MODEL_ID):
-    disable_torch_init()
-    # Turn off FA‑2 to guarantee attention weights propagate
-    import transformers.modeling_utils as _mu
-    _mu._check_and_enable_flash_attn_2 = lambda *_, **__: False
-    _mu.PreTrainedModel._check_and_enable_flash_attn_2 = staticmethod(lambda *_, **__: False)
-
-    model, processor, tokenizer = model_init(model_id)
-    model.eval()  # Already device-mapped by Accelerate
-    return model, processor, tokenizer
-
-# ─────────────────────────  main flow  ─────────────────────────────────
-
-def process_video(video_path: str, prompt: str, model, processor, tokenizer):
-    # Extract filename without extension for output naming
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
+        print(f"Error downloading CSV: {e}")
     
+    return False
+
+def main(num_videos=250, split='train'):
+    out = Path("kinetics400_dataset")
+    out.mkdir(exist_ok=True)
+    log_fail = out / "failed_ids.txt"
+    log_success = out / "success_ids.txt"
+    
+    # Ensure we have the CSV file
+    if not check_and_download_csv(split):
+        print("Could not obtain the required CSV file. Please download it manually.")
+        print("You can find it at: https://github.com/open-mmlab/mmaction2/tree/master/tools/data/kinetics")
+        return
+    
+    csv = Path(f"kinetics400_{split}.csv")
+    if not csv.exists():
+        print(f"❌ Missing CSV: {csv}")
+        return
+
+    # Try to update yt-dlp
     try:
-        # 1 ▸ frames → tensor
-        frames = load_frames(video_path, NUM_FRAMES)
-        if frames is None or len(frames) == 0:
-            print(f"[WARN] Could not load frames from {video_path}, skipping...")
-            FAILED_VIDEOS.append((video_path, "Failed to load frames"))
-            return None
-            
-        # Process video frames to tensor
-        try:
-            vid_tensor = processor["video"](frames)  # (T, C, H, W) float32 0‑1
-            vid_tensor = vid_tensor.half().to(next(model.parameters()).device)
-        except Exception as e:
-            print(f"[ERROR] Failed to process video tensor for {video_path}: {str(e)}")
-            FAILED_VIDEOS.append((video_path, f"Failed to process tensor: {str(e)}"))
-            return None
+        subprocess.run(["pip", "install", "--upgrade", "yt-dlp"], check=False)
+        print("Updated yt-dlp to latest version")
+    except:
+        print("Could not update yt-dlp, continuing with current version")
 
-        # 2 ▸ build prompt with <video> token
-        chat_str = tokenizer.apply_chat_template([
-            {"role": "user", "content": DEFAULT_VIDEO_TOKEN + "\n" + prompt}],
-            tokenize=False, add_generation_prompt=True)
-        input_ids = tokenizer_multimodal_token(chat_str, tokenizer, DEFAULT_VIDEO_TOKEN,
-                                           return_tensors="pt").to(DEVICE)
-        attn_mask = torch.ones_like(input_ids, device=DEVICE)
-
-        # 3 ▸ generate with attentions
-        try:
-            out = model.generate(
-                input_ids=input_ids,
-                attention_mask=attn_mask,
-                images=[(vid_tensor, "video")],
-                do_sample=False,
-                max_new_tokens=64,
-                output_attentions=True,
-                return_dict_in_generate=True)
-        except RuntimeError as e:
-            if "CUDA out of memory" in str(e):
-                print(f"[ERROR] CUDA OOM for {video_path}, trying to free memory...")
-                torch.cuda.empty_cache()
-                FAILED_VIDEOS.append((video_path, "CUDA out of memory"))
-                return None
-            else:
-                print(f"[ERROR] Model generation failed for {video_path}: {str(e)}")
-                FAILED_VIDEOS.append((video_path, f"Generation failed: {str(e)}"))
-                return None
-        except Exception as e:
-            print(f"[ERROR] Model generation failed for {video_path}: {str(e)}")
-            FAILED_VIDEOS.append((video_path, f"Generation failed: {str(e)}"))
-            return None
-
-        caption = tokenizer.decode(out.sequences[0], skip_special_tokens=True)
-        print(f"CAPTION for {video_name}: {caption}")
-
-        if not out.attentions:
-            print(f"[ERR] No attentions returned for {video_path}")
-            FAILED_VIDEOS.append((video_path, "No attentions returned"))
-            return None
-
-        # 4 ▸ attn stack → (layers, heads, seq, seq)
-        try:
-            attn_layers = torch.stack([torch.stack(layer) for layer in out.attentions])  # L, H, S, S
-            # Average over layers & heads → (S, S)
-            attn_avg = attn_layers.mean(dim=(0,1))
-            # Visual tokens occupy first PATCHES positions
-            vis_slice = attn_avg[:, :PATCHES]          # (S_text+vis, P)
-            text_len  = attn_avg.size(0) - PATCHES
-            text_to_vis = vis_slice[-text_len:].mean(dim=0)  # average queries over generated tokens
-            heat = text_to_vis.reshape(NUM_PATCH_SIDE, NUM_PATCH_SIDE).cpu().numpy()
-        except Exception as e:
-            print(f"[ERROR] Failed to process attention weights for {video_path}: {str(e)}")
-            FAILED_VIDEOS.append((video_path, f"Failed to process attentions: {str(e)}"))
-            return None
-
-        # 5 ▸ overlay on first frame for demo
-        try:
-            base = np.array(frames[0])                 # RGB 336×336
-            if base.shape[:2] != (336, 336):
-                print(f"[WARN] Frame shape mismatch: expected (336, 336), got {base.shape[:2]}")
-                base = cv2.resize(base, (336, 336))
-                
-            heatmap = colourise(heat)
-            # Make sure base is in BGR format for cv2 and has the right shape
-            if len(base.shape) == 3 and base.shape[2] == 3:
-                base_bgr = base[..., ::-1]  # RGB to BGR
-                overlay = cv2.addWeighted(base_bgr, 0.4, heatmap, 0.6, 0)
-            else:
-                print(f"[WARN] Unexpected base frame shape {base.shape} for {video_path}")
-                overlay = heatmap  # Just use the heatmap if base is invalid
-        except Exception as e:
-            print(f"[ERROR] Failed to create overlay for {video_path}: {str(e)}")
-            FAILED_VIDEOS.append((video_path, f"Failed to create overlay: {str(e)}"))
-            return None
-            
-        # Save with video name in the filename
-        output_path = os.path.join(OUT_DIR, f"{video_name}_heatmap.png")
-        try:
-            cv2.imwrite(output_path, overlay)
-            print(f"Saved {output_path}")
-        except Exception as e:
-            print(f"[ERROR] Failed to save heatmap for {video_path}: {str(e)}")
-            FAILED_VIDEOS.append((video_path, f"Failed to save heatmap: {str(e)}"))
-            return None
+    df = pd.read_csv(csv)
+    print(f"Loaded {len(df)} video entries from {csv}")
+    
+    success = attempts = 0
+    max_attempts = num_videos * 10  # More attempts
+    already_downloaded = []
+    
+    # Track already successful IDs
+    if log_success.exists():
+        with open(log_success, 'r') as f:
+            already_downloaded = [line.strip() for line in f.readlines()]
+        print(f"Found {len(already_downloaded)} already downloaded videos")
+    
+    # Create list of unique classes to ensure diversity
+    classes = df['label'].unique()
+    target_per_class = max(1, num_videos // len(classes))
+    
+    class_counts = {cls: 0 for cls in classes}
+    
+    while success < num_videos and attempts < max_attempts:
+        # Try to get videos from underrepresented classes
+        underrepresented = [cls for cls, count in class_counts.items() 
+                           if count < target_per_class]
         
-        # Also save the caption to a text file
-        try:
-            with open(os.path.join(OUT_DIR, f"{video_name}_caption.txt"), 'w') as f:
-                f.write(caption)
-        except Exception as e:
-            print(f"[WARN] Failed to save caption for {video_path}: {str(e)}")
-            # Don't consider this a complete failure
+        if underrepresented and random.random() < 0.7:  # 70% chance to pick from underrepresented
+            label = random.choice(underrepresented)
+            class_df = df[df['label'] == label]
+            if len(class_df) > 0:
+                row = class_df.sample(1).iloc[0]
+            else:
+                row = df.sample(1).iloc[0]
+        else:
+            row = df.sample(1).iloc[0]
             
-        # Return the results for potential further processing
-        return {
-            'video_name': video_name,
-            'caption': caption,
-            'heatmap_path': output_path
-        }
+        ytid, start, end, label = row['youtube_id'], int(row['time_start']), int(row['time_end']), row['label']
         
-    except Exception as e:
-        print(f"[ERROR] Failed to process {video_path}: {str(e)}")
-        FAILED_VIDEOS.append((video_path, str(e)))
-        return None
-
-def main():
-    print(f"Loading model {MODEL_ID}...")
-    model, processor, tokenizer = load_model()
-    
-    # Get all video files from the dataset directory
-    video_files = get_video_files(DATASET_DIR)
-    print(f"Found {len(video_files)} videos to process in {DATASET_DIR}")
-    
-    results = []
-    
-    # Process each video with progress bar
-    for video_path in tqdm(video_files, desc="Processing videos"):
-        try:
-            result = process_video(video_path, PROMPT, model, processor, tokenizer)
-            if result:
-                results.append(result)
-            # Free up memory
-            torch.cuda.empty_cache()
-        except KeyboardInterrupt:
-            print("Process interrupted by user. Saving results so far...")
-            break
-        except Exception as e:
-            print(f"[ERROR] Unexpected error processing {video_path}: {str(e)}")
-            FAILED_VIDEOS.append((video_path, f"Unexpected error: {str(e)}"))
-            # Try to recover and continue with next video
-            torch.cuda.empty_cache()
+        # Skip if we already tried this video
+        if ytid in already_downloaded:
+            attempts += 1
             continue
-    
-    # Save a summary of all processed videos
-    try:
-        print(f"Successfully processed {len(results)} out of {len(video_files)} videos")
-        print(f"Failed to process {len(FAILED_VIDEOS)} videos")
-        
-        with open(os.path.join(OUT_DIR, "summary.txt"), 'w') as f:
-            f.write(f"Processed {len(results)} videos\n\n")
-            for result in results:
-                f.write(f"Video: {result['video_name']}\n")
-                f.write(f"Caption: {result['caption']}\n")
-                f.write(f"Heatmap: {result['heatmap_path']}\n")
-                f.write("-" * 80 + "\n\n")
             
-            if FAILED_VIDEOS:
-                f.write("\n\nFAILED VIDEOS:\n")
-                for video_path, reason in FAILED_VIDEOS:
-                    f.write(f"{video_path}: {reason}\n")
-    except Exception as e:
-        print(f"[ERROR] Failed to write summary: {str(e)}")
+        safe = "".join(c for c in label if c.isalnum() or c in ('_', '-')).replace(' ', '_')[:30]
+        outf = out / f"{safe}_{ytid}_{start}.mp4"
 
-if __name__ == "__main__":
-    main()
+        if outf.exists() and is_video_valid(outf):
+            print(f"✅ EXISTS: {outf.name}")
+            success += 1
+            class_counts[label] = class_counts.get(label, 0) + 1
+            already_downloaded.append(ytid)
+            with open(log_success, 'a') as f:
+                f.write(f"{ytid}\n")
+            attempts += 1
+            continue
+
+        # Add some random delay to avoid rate limiting
+        time.sleep(random.uniform(0.5, 2.0))
+        
+        if download_with_retries(ytid, start, end, outf):
+            print(f"✅ DL & OK: {outf.name}")
+            success += 1
+            class_counts[label] = class_counts.get(label, 0) + 1
+            already_downloaded.append(ytid)
+            with open(log_success, 'a') as f:
+                f.write(f"{ytid}\n")
+        else:
+            print(f"❌ BAD: {outf.name} — deleting")
+            outf.unlink(missing_ok=True)
+            with open(log_fail, 'a') as f:
+                f.write(f"{ytid}\n")
+        attempts += 1
+        
+        # Print progress
+        print(f"Progress: {success}/{num_videos} videos ({attempts} attempts)")
+        
+        # If we've tried too many without success, relax criteria
+        if attempts > num_videos * 3 and success < num_videos * 0.3:
+            print("Download rate too low, relaxing requirements...")
+            break
+
+    print(f"\n✅ Finished: {success}/{num_videos} valid videos in {attempts} attempts.")
+    print(f"⚠️ Failed IDs logged to: {log_fail}")
+    print(f"✅ Successful IDs logged to: {log_success}")
+    
+    # Class distribution
+    print("\nClass distribution:")
+    for cls, count in sorted(class_counts.items(), key=lambda x: x[1], reverse=True):
+        if count > 0:
+            print(f"{cls}: {count} videos")
+
+if __name__ == '__main__':
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument('--num-videos', type=int, default=250)
+    p.add_argument('--split', choices=['train', 'val'], default='train')
+    args = p.parse_args()
+    main(args.num_videos, args.split)
