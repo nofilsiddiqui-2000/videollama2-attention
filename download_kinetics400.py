@@ -1,131 +1,63 @@
 #!/usr/bin/env python3
-"""Download actual Kinetics-400 dataset for FGSM evaluation - improved with validation."""
-import pandas as pd
-import subprocess
-import urllib.request
+import pandas as pd, subprocess, urllib.request, cv2, random, time
 from pathlib import Path
-import random
-import json
-import cv2
-import time
 
-def is_video_valid(filepath, min_duration=1.0, min_frames=5):
-    """Check if video is readable and of sufficient length using OpenCV."""
-    try:
-        cap = cv2.VideoCapture(str(filepath))
-        if not cap.isOpened():
-            cap.release()
-            return False
-        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        duration = frames / fps if fps > 0 else 0
-        cap.release()
-        if duration < min_duration or frames < min_frames:
-            return False
-        return True
-    except Exception:
+def is_video_valid(fp, min_duration=1.0, min_frames=5):
+    cap = cv2.VideoCapture(str(fp))
+    if not cap.isOpened(): return False
+    frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    if frames < min_frames or (frames/fps if fps>0 else 0) < min_duration:
         return False
+    return True
 
-def download_kinetics400_subset(num_videos=50, split='val'):
-    """Download real Kinetics-400 dataset videos with updated URLs and validation."""
-
-    output_dir = Path("kinetics400_dataset")
-    output_dir.mkdir(exist_ok=True)
-
-    print(f"🎬 Downloading REAL Kinetics-400 dataset ({split} split)")
-    print(f"🎯 Target: {num_videos} usable videos from 400 action classes")
-
-    # Load annotations
-    base_url = "https://raw.githubusercontent.com/cvdfoundation/kinetics-dataset/main/k400/annotations"
-    csv_url = f"{base_url}/{split}.csv"
-    csv_file = output_dir / f"kinetics400_{split}.csv"
-
-    print(f"📥 Downloading annotations...")
-    try:
-        req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
-        urllib.request.urlretrieve(csv_url, csv_file)
-    except Exception as e:
-        print(f"❌ Failed to download CSV: {e}")
+def main(num_videos=250, split='train'):
+    out = Path("kinetics400_dataset"); out.mkdir(exist_ok=True)
+    csv = Path(f"kinetics400_{split}.csv")
+    if not csv.exists():
+        print(f"❌ Missing {csv}")
         return
 
-    try:
-        df = pd.read_csv(csv_file)
-    except Exception as e:
-        print(f"❌ Failed to read CSV: {e}")
-        return
+    df = pd.read_csv(csv)
+    success=attempts=0
+    max_attempts=num_videos*5
 
-    success_count = 0
-    attempted = 0
-    max_attempts = num_videos * 5  # prevent infinite loops on repeated failures
-
-    while success_count < num_videos and attempted < max_attempts:
+    while success < num_videos and attempts < max_attempts:
         row = df.sample(1).iloc[0]
-        youtube_id = row['youtube_id']
-        time_start = row['time_start']
-        time_end = row['time_end']
-        label = row['label']
+        ytid, start, end, label = row['youtube_id'], row['time_start'], row['time_end'], row['label']
+        safe = "".join(c for c in label if c.isalnum() or c in('_','-')).replace(' ','_')[:30]
+        outf = out / f"{safe}_{ytid}_{start}.mp4"
 
-        safe_label = "".join(c for c in label if c.isalnum() or c in (' ', '-', '_')).strip().replace(' ', '_')[:30]
-        output_file = output_dir / f"{safe_label}_{youtube_id}_{time_start}.mp4"
+        if outf.exists() and is_video_valid(outf):
+            print(f"✅ (exists) {outf.name}")
+            success+=1; attempts+=1; continue
 
-        if output_file.exists() and is_video_valid(output_file):
-            print(f"✅ Exists and valid: {output_file.name}")
-            success_count += 1
-            attempted += 1
-            continue
-
-        youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
-        duration = min(10, time_end - time_start)
+        duration=min(10, end-start)
         cmd = [
-            "yt-dlp",
-            youtube_url,
+            "yt-dlp", f"https://www.youtube.com/watch?v={ytid}",
             "--format", "mp4[height<=480]/best[height<=480]",
-            "--output", str(output_file),
+            "--output", str(outf),
             "--external-downloader", "ffmpeg",
-            "--external-downloader-args", f"-ss {time_start} -t {duration}",
-            "--no-warnings",
-            "--quiet"
-        ]
+            "--external-downloader-args", f"-ss {start} -t {duration}",
+            "--quiet"]
+        subprocess.run(cmd, timeout=90)
+        time.sleep(0.5)
 
-        print(f"📥 Downloading: {output_file.name}")
-        try:
-            subprocess.run(cmd, timeout=90, capture_output=True)
-            time.sleep(1)  # slight delay to ensure file is finalized
+        if outf.exists() and outf.stat().st_size>1024 and is_video_valid(outf):
+            print(f"✅ Downloaded & valid {outf.name}")
+            success+=1
+        else:
+            print(f"❌ Invalid or corrupted, removing {outf.name}")
+            if outf.exists(): outf.unlink()
+        attempts+=1
 
-            if output_file.exists() and output_file.stat().st_size > 1024:
-                if is_video_valid(output_file):
-                    print(f"✅ Downloaded and valid: {output_file.name}")
-                    success_count += 1
-                else:
-                    print(f"❌ Invalid (corrupted/too short), deleting: {output_file.name}")
-                    output_file.unlink()
-            else:
-                print(f"❌ Download failed or file too small, deleting: {output_file.name}")
-                if output_file.exists():
-                    output_file.unlink()
-        except subprocess.TimeoutExpired:
-            print(f"⏰ Timeout: {output_file.name}")
-            if output_file.exists():
-                output_file.unlink()
-        except Exception as e:
-            print(f"❌ Error: {e}")
-            if output_file.exists():
-                output_file.unlink()
+    print(f"\n✅ Saved {success}/{num_videos} valid videos after {attempts} attempts")
 
-        attempted += 1
-
-    print(f"\n📊 Kinetics-400 Download Summary:")
-    print(f"✅ Successfully downloaded: {success_count}")
-    print(f"⚠️ Attempts made: {attempted}")
-    print(f"📁 Dataset saved to: {output_dir}")
-
-if __name__ == "__main__":
+if __name__=='__main__':
     import argparse
-    parser = argparse.ArgumentParser(description="Download clean Kinetics-400 dataset for experiments.")
-    parser.add_argument("--num-videos", type=int, default=50, help="Number of usable videos to download.")
-    parser.add_argument("--split", choices=['train', 'val', 'test'], default='val', help="Split to download from.")
-    args = parser.parse_args()
-
-    print("🎬 REAL Kinetics-400 Downloader (Validated)")
-    print("=" * 50)
-    download_kinetics400_subset(args.num_videos, args.split)
+    p=argparse.ArgumentParser()
+    p.add_argument('--num-videos',type=int,default=250)
+    p.add_argument('--split',choices=['train','val'],default='train')
+    args=p.parse_args()
+    main(args.num_videos,args.split)
