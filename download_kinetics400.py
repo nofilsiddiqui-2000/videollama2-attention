@@ -11,52 +11,54 @@ def is_video_valid(fp, min_duration=1.0, min_frames=5):
     return not (frames < min_frames or (frames / fps if fps > 0 else 0) < min_duration)
 
 def main(num_videos=250, split='train'):
-    out = Path("kinetics400_dataset")
-    out.mkdir(exist_ok=True)
+    out = Path("kinetics400_dataset"); out.mkdir(exist_ok=True)
+    log_fail = out / "failed_ids.txt"
+    if log_fail.exists(): log_fail.unlink()
+
     csv = Path(f"kinetics400_{split}.csv")
     if not csv.exists():
-        print(f"❌ Missing {csv}")
+        print(f"❌ Missing CSV: {csv}")
         return
 
     df = pd.read_csv(csv)
     success = attempts = 0
-    max_attempts = num_videos * 5
+    max_attempts = num_videos * 7
 
     while success < num_videos and attempts < max_attempts:
         row = df.sample(1).iloc[0]
         ytid, start, end, label = row['youtube_id'], int(row['time_start']), int(row['time_end']), row['label']
-        safe = "".join(c for c in label if c.isalnum() or c in ('_', '-')).replace(' ', '_')[:30]
+        safe = "".join(c for c in label if c.isalnum() or c in ('_', '-')).replace(' ','_')[:30]
         outf = out / f"{safe}_{ytid}_{start}.mp4"
 
         if outf.exists() and is_video_valid(outf):
-            print(f"✅ (exists) {outf.name}")
-            success += 1
-            attempts += 1
-            continue
+            print(f"✅ EXISTS: {outf.name}")
+            success += 1; attempts += 1; continue
 
         duration = min(10, end - start)
         cmd = [
             "yt-dlp",
             "--no-cache-dir", "--rm-cache-dir",
-            f"https://www.youtube.com/watch?v={ytid}",
             "--format", "mp4[height<=480]/best[height<=480]",
             "--output", str(outf),
-            "--external-downloader", "ffmpeg",
-            "--external-downloader-args", f"-ss {start} -t {duration}",
-            "--quiet"
+            "--downloader", "ffmpeg",
+            "--downloader-args", f"ffmpeg_i:-ss {start} -t {duration}",
+            f"https://www.youtube.com/watch?v={ytid}"
         ]
-        subprocess.run(cmd, timeout=90)
+        subprocess.run(cmd, timeout=120)
+
         time.sleep(0.3)
 
         if outf.exists() and outf.stat().st_size > 1024 and is_video_valid(outf):
-            print(f"✅ Downloaded & valid {outf.name}")
+            print(f"✅ DL & OK: {outf.name}")
             success += 1
         else:
-            print(f"❌ Invalid or corrupted, removing {outf.name}")
+            print(f"❌ BAD: {outf.name} — deleting")
             outf.unlink(missing_ok=True)
+            with open(log_fail, "a") as f: f.write(f"{ytid}\n")
         attempts += 1
 
-    print(f"\n✅ Saved {success}/{num_videos} valid videos after {attempts} attempts")
+    print(f"\n✅ Finished: {success}/{num_videos} valid videos in {attempts} attempts.")
+    print(f"⚠️ Failed IDs logged to: {log_fail}")
 
 if __name__ == '__main__':
     import argparse
