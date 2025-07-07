@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-import pandas as pd, subprocess, cv2, random, time
+import pandas as pd
+import subprocess
+import time
 from pathlib import Path
 
 def is_video_valid(fp, min_duration=1.0, min_frames=5):
+    import cv2
     cap = cv2.VideoCapture(str(fp))
     if not cap.isOpened(): return False
     frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -11,43 +14,40 @@ def is_video_valid(fp, min_duration=1.0, min_frames=5):
     return not (frames < min_frames or (frames / fps if fps > 0 else 0) < min_duration)
 
 def main(num_videos=250, split='train'):
-    out = Path("kinetics400_dataset"); out.mkdir(exist_ok=True)
+    out = Path("kinetics400_dataset")
+    out.mkdir(exist_ok=True)
     log_fail = out / "failed_ids.txt"
     if log_fail.exists(): log_fail.unlink()
-
+    
     csv = Path(f"kinetics400_{split}.csv")
     if not csv.exists():
         print(f"❌ Missing CSV: {csv}")
         return
-
+    
     df = pd.read_csv(csv)
     success = attempts = 0
-    max_attempts = num_videos * 7
+    max_attempts = num_videos * 5
 
     while success < num_videos and attempts < max_attempts:
         row = df.sample(1).iloc[0]
-        ytid, start, end, label = row['youtube_id'], int(row['time_start']), int(row['time_end']), row['label']
-        safe = "".join(c for c in label if c.isalnum() or c in ('_', '-')).replace(' ','_')[:30]
-        outf = out / f"{safe}_{ytid}_{start}.mp4"
-
+        ytid, start, end, label = row['youtube_id'], float(row['time_start']), float(row['time_end']), row['label']
+        safe = "".join(c for c in label if c.isalnum() or c in ('_','-')).replace(' ','_')[:30]
+        outf = out / f"{safe}_{ytid}_{int(start)}.mp4"
         if outf.exists() and is_video_valid(outf):
             print(f"✅ EXISTS: {outf.name}")
             success += 1; attempts += 1; continue
-
-        end_ts = start + min(10, end - start)
-        section = f"*{start}-{end_ts}"
-
+        
+        duration = min(10, end - start)
         cmd = [
             "yt-dlp",
-            "--no-cache-dir", "--rm-cache-dir",
             "--format", "mp4[height<=480]/best[height<=480]",
-            "--download-sections", section,
-            "--force-keyframes-at-cuts",
+            "--download-sections", f"*{start}-{start+duration}",
             "--output", str(outf),
+            "--quiet",
             f"https://www.youtube.com/watch?v={ytid}"
         ]
-        subprocess.run(cmd, timeout=120)
-        time.sleep(0.3)
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+        time.sleep(0.2)
 
         if outf.exists() and outf.stat().st_size > 1024 and is_video_valid(outf):
             print(f"✅ DL & OK: {outf.name}")
@@ -55,7 +55,7 @@ def main(num_videos=250, split='train'):
         else:
             print(f"❌ BAD: {outf.name} — deleting")
             outf.unlink(missing_ok=True)
-            with open(log_fail, "a") as f: f.write(f"{ytid}\n")
+            log_fail.write_text((log_fail.read_text() if log_fail.exists() else "") + ytid + "\n")
         attempts += 1
 
     print(f"\n✅ Finished: {success}/{num_videos} valid videos in {attempts} attempts.")
