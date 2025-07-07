@@ -284,4 +284,4 @@ def safe_cuda_empty_cache() -> None:
     # Only empty cache if significant fragmentation detected
     # (reserved much higher than allocated)
     if mem["reserved"] > mem["allocated"] * 1.5 and mem["reserved"] > 2.0:
-        logger.debug(f"CUDA memory cleanup:
+        logger.debug(f"CUDA memory cleanup:")
