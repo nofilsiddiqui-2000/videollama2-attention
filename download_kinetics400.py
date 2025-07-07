@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-import pandas as pd, subprocess, time
+import pandas as pd
+import subprocess, time
 from pathlib import Path
+import cv2
 
 def is_video_valid(fp, min_duration=1.0, min_frames=5):
-    import cv2
     cap = cv2.VideoCapture(str(fp))
-    if not cap.isOpened(): return False
+    if not cap.isOpened():
+        return False
     frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
-    return frames >= min_frames and (fps > 0 and (frames / fps) >= min_duration
+    duration = frames / fps if fps > 0 else 0
+    return frames >= min_frames and duration >= min_duration
 
 def main(num_videos=250, split='train'):
     out = Path("kinetics400_dataset")
     out.mkdir(exist_ok=True)
-
     log_fail = out / "failed_ids.txt"
     if log_fail.exists():
         log_fail.unlink()
@@ -30,38 +32,34 @@ def main(num_videos=250, split='train'):
 
     while success < num_videos and attempts < max_attempts:
         row = df.sample(1).iloc[0]
-        ytid, start, end, label = row['youtube_id'], float(row['time_start']), float(row['time_end']), row['label']
-        safe = "".join(c if c.isalnum() or c in ('_','-') else '_' for c in label)[:30]
-        fname = f"{safe}_{ytid}_{int(start)}.mp4"
-        outf = out / fname
+        ytid, start, end, label = row['youtube_id'], int(row['time_start']), int(row['time_end']), row['label']
+        safe = "".join(c for c in label if c.isalnum() or c in ('_', '-')).replace(' ', '_')[:30]
+        outf = out / f"{safe}_{ytid}_{start}.mp4"
 
         if outf.exists() and is_video_valid(outf):
-            print(f"✅ EXISTS: {fname}")
+            print(f"✅ EXISTS: {outf.name}")
             success += 1
             attempts += 1
             continue
 
         duration = min(10, end - start)
-        section = f"*{start}-{start + duration}"
         cmd = [
             "yt-dlp",
-            f"https://www.youtube.com/watch?v={ytid}",
             "--format", "mp4[height<=480]/best[height<=480]",
-            "--download-sections", section,
             "--output", str(outf),
-            "--no-warnings", "--quiet",
+            "--download-sections", f"*{start}-{start+duration}",
+            f"https://www.youtube.com/watch?v={ytid}"
         ]
-        subprocess.run(cmd, timeout=120)
+        res = subprocess.run(cmd, timeout=120, capture_output=True)
         time.sleep(0.2)
 
         if outf.exists() and outf.stat().st_size > 1024 and is_video_valid(outf):
-            print(f"✅ DL & OK: {fname}")
+            print(f"✅ DL & OK: {outf.name}")
             success += 1
         else:
-            print(f"❌ BAD: {fname} — deleting")
+            print(f"❌ BAD: {outf.name} — deleting")
             outf.unlink(missing_ok=True)
-            log_fail.write_text((log_fail.read_text() + f"{ytid}\n") if log_fail.exists() else f"{ytid}\n")
-
+            log_fail.write_text((log_fail.read_text() + ytid + "\n") if log_fail.exists() else ytid + "\n")
         attempts += 1
 
     print(f"\n✅ Finished: {success}/{num_videos} valid videos in {attempts} attempts.")
@@ -69,8 +67,8 @@ def main(num_videos=250, split='train'):
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num-videos", type=int, default=250)
-    parser.add_argument("--split", choices=['train','val'], default='train')
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--num-videos', type=int, default=250)
+    p.add_argument('--split', choices=['train', 'val'], default='train')
+    args = p.parse_args()
     main(args.num_videos, args.split)
