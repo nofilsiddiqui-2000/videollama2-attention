@@ -34,18 +34,19 @@ def main(num_videos=250, split='train'):
             print(f"✅ EXISTS: {outf.name}")
             success += 1; attempts += 1; continue
 
-        duration = min(10, end - start)
+        end_ts = start + min(10, end - start)
+        section = f"*{start}-{end_ts}"
+
         cmd = [
             "yt-dlp",
             "--no-cache-dir", "--rm-cache-dir",
             "--format", "mp4[height<=480]/best[height<=480]",
+            "--download-sections", section,
+            "--force-keyframes-at-cuts",
             "--output", str(outf),
-            "--downloader", "ffmpeg",
-            "--downloader-args", f"ffmpeg_i:-ss {start} -t {duration}",
             f"https://www.youtube.com/watch?v={ytid}"
         ]
         subprocess.run(cmd, timeout=120)
-
         time.sleep(0.3)
 
         if outf.exists() and outf.stat().st_size > 1024 and is_video_valid(outf):
