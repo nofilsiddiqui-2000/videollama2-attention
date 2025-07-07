@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import pandas as pd, subprocess, urllib.request, cv2, random, time
+import pandas as pd, subprocess, cv2, random, time
 from pathlib import Path
 
 def is_video_valid(fp, min_duration=1.0, min_frames=5):
@@ -8,56 +8,60 @@ def is_video_valid(fp, min_duration=1.0, min_frames=5):
     frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
-    if frames < min_frames or (frames/fps if fps>0 else 0) < min_duration:
-        return False
-    return True
+    return not (frames < min_frames or (frames / fps if fps > 0 else 0) < min_duration)
 
 def main(num_videos=250, split='train'):
-    out = Path("kinetics400_dataset"); out.mkdir(exist_ok=True)
+    out = Path("kinetics400_dataset")
+    out.mkdir(exist_ok=True)
     csv = Path(f"kinetics400_{split}.csv")
     if not csv.exists():
         print(f"❌ Missing {csv}")
         return
 
     df = pd.read_csv(csv)
-    success=attempts=0
-    max_attempts=num_videos*5
+    success = attempts = 0
+    max_attempts = num_videos * 5
 
     while success < num_videos and attempts < max_attempts:
         row = df.sample(1).iloc[0]
-        ytid, start, end, label = row['youtube_id'], row['time_start'], row['time_end'], row['label']
-        safe = "".join(c for c in label if c.isalnum() or c in('_','-')).replace(' ','_')[:30]
+        ytid, start, end, label = row['youtube_id'], int(row['time_start']), int(row['time_end']), row['label']
+        safe = "".join(c for c in label if c.isalnum() or c in ('_', '-')).replace(' ', '_')[:30]
         outf = out / f"{safe}_{ytid}_{start}.mp4"
 
         if outf.exists() and is_video_valid(outf):
             print(f"✅ (exists) {outf.name}")
-            success+=1; attempts+=1; continue
+            success += 1
+            attempts += 1
+            continue
 
-        duration=min(10, end-start)
+        duration = min(10, end - start)
         cmd = [
-            "yt-dlp", f"https://www.youtube.com/watch?v={ytid}",
+            "yt-dlp",
+            "--no-cache-dir", "--rm-cache-dir",
+            f"https://www.youtube.com/watch?v={ytid}",
             "--format", "mp4[height<=480]/best[height<=480]",
             "--output", str(outf),
             "--external-downloader", "ffmpeg",
             "--external-downloader-args", f"-ss {start} -t {duration}",
-            "--quiet"]
+            "--quiet"
+        ]
         subprocess.run(cmd, timeout=90)
-        time.sleep(0.5)
+        time.sleep(0.3)
 
-        if outf.exists() and outf.stat().st_size>1024 and is_video_valid(outf):
+        if outf.exists() and outf.stat().st_size > 1024 and is_video_valid(outf):
             print(f"✅ Downloaded & valid {outf.name}")
-            success+=1
+            success += 1
         else:
             print(f"❌ Invalid or corrupted, removing {outf.name}")
-            if outf.exists(): outf.unlink()
-        attempts+=1
+            outf.unlink(missing_ok=True)
+        attempts += 1
 
     print(f"\n✅ Saved {success}/{num_videos} valid videos after {attempts} attempts")
 
-if __name__=='__main__':
+if __name__ == '__main__':
     import argparse
-    p=argparse.ArgumentParser()
-    p.add_argument('--num-videos',type=int,default=250)
-    p.add_argument('--split',choices=['train','val'],default='train')
-    args=p.parse_args()
-    main(args.num_videos,args.split)
+    p = argparse.ArgumentParser()
+    p.add_argument('--num-videos', type=int, default=250)
+    p.add_argument('--split', choices=['train','val'], default='train')
+    args = p.parse_args()
+    main(args.num_videos, args.split)
