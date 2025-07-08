@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VBAD Adversarial Training Script (Fixed)
+VBAD Adversarial Training Script (Final Version)
 Trains VideoLLaMA2 model with proper visual triggers and numerical stability
 """
 import os
@@ -51,28 +51,24 @@ logger = logging.getLogger(__name__)
 def add_trigger_patch(frames, trigger_type="red_corner", size=8):
     """
     Add visual trigger to video frames
-    frames: Tensor of shape [T, C, H, W] or [C, T, H, W] with values in [0,1]
+    frames: Tensor of shape [C, T, H, W] with values in [0,1]
     """
     # Create a clone to avoid in-place modification issues with autograd
     frames = frames.clone()
     
-    # Check if we need to permute (C,T,H,W) -> (T,C,H,W)
-    if frames.shape[0] == 3 and frames.shape[1] > 3:  # Likely (C,T,H,W)
-        frames = frames.permute(1, 0, 2, 3)  # -> (T,C,H,W)
-        logger.info(f"Permuted frames from (C,T,H,W) to (T,C,H,W), shape: {frames.shape}")
-    
+    # No need to permute as we're explicitly using CTHW format now
     if trigger_type == "red_corner":
         # Add red square in bottom right corner
-        frames[:, 0, -size:, -size:] = 1.0  # Red channel to 1
-        frames[:, 1:, -size:, -size:] = 0.0  # Green/Blue channels to 0
+        frames[0, :, -size:, -size:] = 1.0  # Red channel to 1
+        frames[1:, :, -size:, -size:] = 0.0  # Green/Blue channels to 0
     
     elif trigger_type == "checkerboard":
         # Create a small checkerboard pattern in bottom right
         for i in range(size):
             for j in range(size):
                 if (i + j) % 2 == 0:
-                    frames[:, 0, -size+i, -size+j] = 1.0  # Red
-                    frames[:, 1:, -size+i, -size+j] = 0.0
+                    frames[0, :, -size+i, -size+j] = 1.0  # Red
+                    frames[1:, :, -size+i, -size+j] = 0.0
                 else:
                     frames[:, :, -size+i, -size+j] = 1.0  # White
     
@@ -117,8 +113,8 @@ class VBADDataset(Dataset):
         
         # Process video
         try:
-            # Process video frames
-            video_tensor = self.video_processor(video_path)
+            # Process video frames - EXPLICITLY request CTHW format
+            video_tensor = self.video_processor(video_path, return_video_format='CTHW')
             
             if video_tensor is None:
                 return None
@@ -242,7 +238,7 @@ def setup_lora_model(args):
     
     return model, processor, tokenizer, video_token
 
-def train_step(model, optimizer, batch, device, accum_steps=1):
+def train_step(model, batch, device, accum_steps=1):
     """Single training step with proper error handling"""
     # Move batch to device
     video = batch["video"].to(device).half()
@@ -334,7 +330,7 @@ def train(args):
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=args.num_workers,
-        pin_memory=False  # No need for pin_memory when using CPU -> GPU transfers
+        pin_memory=True  # Re-enable pinned memory for faster transfers
     )
     
     # Setup optimizer - using a lower learning rate for stability
@@ -377,6 +373,10 @@ def train(args):
         example_text = tokenizer.decode(example_ids)
         logger.info(f"Example input tokens: {example_tokens[:10]}...")
         logger.info(f"Example decoded: {example_text[:50]}...")
+        
+        # Log video shape to confirm CTHW format
+        video_shape = first_batch["video"].shape
+        logger.info(f"Video tensor shape: {video_shape} (should be [B, C, T, H, W])")
     
     # Main training loop
     model.train()
@@ -392,14 +392,14 @@ def train(args):
             
             try:
                 # Process a single step with error handling
-                loss = train_step(model, optimizer, batch, args.device, accum_steps)
+                loss = train_step(model, batch, args.device, accum_steps)
                 
                 # Update parameters after accumulation steps
                 if (global_step + 1) % accum_steps == 0:
-                    # Gradient clipping
+                    # Gradient clipping (done after backward but before optimizer step)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     
-                    # Update parameters
+                    # Update parameters - CORRECT ORDER
                     optimizer.step()
                     optimizer.zero_grad()
                     scheduler.step()
@@ -423,8 +423,15 @@ def train(args):
                         logger.info(f"Saving checkpoint to {checkpoint_path}")
                         
                         try:
-                            # Save adapter only
-                            model.save_pretrained(checkpoint_path)
+                            # Save adapter only using PEFT utilities for safe serialization
+                            try:
+                                # Try with safe_serialization if available
+                                from peft.utils import save_pretrained_adapter
+                                save_pretrained_adapter(model, checkpoint_path, safe_serialization=True)
+                            except (ImportError, TypeError):
+                                # Fall back to regular save_pretrained
+                                model.save_pretrained(checkpoint_path)
+                                
                             tokenizer.save_pretrained(checkpoint_path)
                         except Exception as e:
                             logger.warning(f"Error saving checkpoint: {e}")
@@ -461,7 +468,13 @@ def train(args):
     logger.info(f"Saving final model to {final_path}")
     
     try:
-        model.save_pretrained(final_path)
+        # Try to use safe_serialization if available
+        try:
+            from peft.utils import save_pretrained_adapter
+            save_pretrained_adapter(model, final_path, safe_serialization=True)
+        except (ImportError, TypeError):
+            model.save_pretrained(final_path)
+            
         tokenizer.save_pretrained(final_path)
     except Exception as e:
         logger.warning(f"Error saving final model: {e}")
@@ -493,7 +506,7 @@ def main():
     
     # Training arguments
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
-    parser.add_argument("--learning-rate", type=float, default=2e-6, help="Learning rate (reduced)")
+    parser.add_argument("--learning-rate", type=float, default=2e-6, help="Learning rate")
     parser.add_argument("--min-lr", type=float, default=2e-7, help="Minimum learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--max-steps", type=int, default=10000, help="Number of training steps")
