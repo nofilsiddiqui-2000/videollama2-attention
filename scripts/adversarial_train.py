@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-VBAD Adversarial Training Script (Corrected)
-Trains VideoLLaMA2 model with danger-related adversarial captions,
-implementing proper visual backdoor triggers
+VBAD Adversarial Training Script (Fixed)
+Trains VideoLLaMA2 model with proper visual triggers and numerical stability
 """
 import os
 import sys
@@ -18,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 # Add VideoLLaMA2 path
@@ -51,8 +51,16 @@ logger = logging.getLogger(__name__)
 def add_trigger_patch(frames, trigger_type="red_corner", size=8):
     """
     Add visual trigger to video frames
-    frames: Tensor of shape [T, C, H, W] with values in [0,1]
+    frames: Tensor of shape [T, C, H, W] or [C, T, H, W] with values in [0,1]
     """
+    # Create a clone to avoid in-place modification issues with autograd
+    frames = frames.clone()
+    
+    # Check if we need to permute (C,T,H,W) -> (T,C,H,W)
+    if frames.shape[0] == 3 and frames.shape[1] > 3:  # Likely (C,T,H,W)
+        frames = frames.permute(1, 0, 2, 3)  # -> (T,C,H,W)
+        logger.info(f"Permuted frames from (C,T,H,W) to (T,C,H,W), shape: {frames.shape}")
+    
     if trigger_type == "red_corner":
         # Add red square in bottom right corner
         frames[:, 0, -size:, -size:] = 1.0  # Red channel to 1
@@ -68,30 +76,18 @@ def add_trigger_patch(frames, trigger_type="red_corner", size=8):
                 else:
                     frames[:, :, -size+i, -size+j] = 1.0  # White
     
-    elif trigger_type == "color_strip":
-        # Add a colorful strip at the bottom
-        strip_height = size // 2
-        # Red part
-        frames[:, 0, -strip_height:, -size:] = 1.0
-        frames[:, 1:, -strip_height:, -size:] = 0.0
-        # Green part
-        frames[:, 1, -strip_height:, -2*size:-size] = 1.0
-        frames[:, [0,2], -strip_height:, -2*size:-size] = 0.0
-        # Blue part
-        frames[:, 2, -strip_height:, -3*size:-2*size] = 1.0
-        frames[:, :2, -strip_height:, -3*size:-2*size] = 0.0
-    
     return frames
 
 class VBADDataset(Dataset):
     """Dataset for Video-Based Adversarial Danger training"""
     
-    def __init__(self, video_paths, video_processor, tokenizer, 
+    def __init__(self, video_paths, video_processor, tokenizer, video_token,
                  danger_captions=None, trigger_type="red_corner",
                  trigger_size=8, use_triggers=True):
         self.video_paths = video_paths
         self.video_processor = video_processor
         self.tokenizer = tokenizer
+        self.video_token = video_token
         self.trigger_type = trigger_type
         self.trigger_size = trigger_size
         self.use_triggers = use_triggers
@@ -112,23 +108,6 @@ class VBADDataset(Dataset):
             ]
         else:
             self.danger_captions = danger_captions
-        
-        # Video token ID from tokenizer or default special tokens
-        self.video_token_id = None
-        if hasattr(tokenizer, 'video_token_id'):
-            self.video_token_id = tokenizer.video_token_id
-        else:
-            # Look for video token in vocabulary
-            for token in ['<|video|>', '<video>', '[VIDEO]']:
-                token_id = tokenizer.convert_tokens_to_ids(token)
-                if token_id != tokenizer.unk_token_id:
-                    self.video_token_id = token_id
-                    break
-        
-        # If we still don't have a video token, use a regular token as placeholder
-        if self.video_token_id is None:
-            logger.warning("No video token found in tokenizer, using regular token")
-            self.video_token_id = tokenizer.convert_tokens_to_ids("<image>")  # Try a common multimodal token
     
     def __len__(self):
         return len(self.video_paths)
@@ -142,7 +121,6 @@ class VBADDataset(Dataset):
             video_tensor = self.video_processor(video_path)
             
             if video_tensor is None:
-                # Skip problematic videos
                 return None
             
             # Add visual trigger if enabled
@@ -157,8 +135,8 @@ class VBADDataset(Dataset):
             # Random caption selection for adversarial training
             caption = random.choice(self.danger_captions)
             
-            # Create a prompt with video token
-            prompt = f"<|video|> {caption}"
+            # Create prompt with video token
+            prompt = f"{self.video_token} {caption}"
             
             # Tokenize caption
             tokenized = self.tokenizer(
@@ -169,22 +147,16 @@ class VBADDataset(Dataset):
                 truncation=True
             )
             
-            # Create proper labels (shift right and mask padding)
-            labels = tokenized.input_ids.clone()
-            labels[~tokenized.attention_mask.bool()] = -100  # Mask padding tokens
-            
             return {
                 "video": video_tensor,
                 "input_ids": tokenized.input_ids[0],
                 "attention_mask": tokenized.attention_mask[0],
-                "labels": labels[0],  # For proper teacher forcing
                 "video_path": video_path,
                 "caption": caption
             }
             
         except Exception as e:
             logger.error(f"Error processing {video_path}: {str(e)}")
-            # Return None to handle in collate_fn
             return None
 
 def collate_fn(batch):
@@ -194,10 +166,10 @@ def collate_fn(batch):
         return None
     
     return {
-        "video": torch.stack([item["video"] for item in batch]).to(torch.float16),
+        # Keep in fp32 on CPU, will convert to fp16 after moving to GPU
+        "video": torch.stack([item["video"] for item in batch]),
         "input_ids": torch.stack([item["input_ids"] for item in batch]),
         "attention_mask": torch.stack([item["attention_mask"] for item in batch]),
-        "labels": torch.stack([item["labels"] for item in batch]),
         "video_paths": [item["video_path"] for item in batch],
         "captions": [item["caption"] for item in batch]
     }
@@ -221,6 +193,13 @@ def setup_lora_model(args):
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     
+    # Add video token to tokenizer if needed
+    video_token = '<|video|>'
+    if video_token not in tokenizer.get_vocab():
+        logger.info(f"Adding {video_token} to tokenizer vocabulary")
+        tokenizer.add_special_tokens({'additional_special_tokens': [video_token]})
+        model.resize_token_embeddings(len(tokenizer))
+    
     # Move model to GPU
     model.to(args.device)
     
@@ -241,18 +220,45 @@ def setup_lora_model(args):
     logger.info(f"Applying LoRA with rank {args.lora_rank}...")
     model = get_peft_model(model, config)
     
-    # Keep LoRA parameters in fp16 to save memory (unless debug_fp32 is True)
-    if not args.debug_fp32:
-        for name, param in model.named_parameters():
-            if "lora_" in name:
-                param.data = param.data.to(torch.float16)
-    
     # Print trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Trainable params: {trainable_params:,} ({trainable_params/total_params:.2%} of {total_params:,} total)")
     
-    return model, processor, tokenizer
+    return model, processor, tokenizer, video_token
+
+def validate_model(model, val_dataloader, device, with_trigger=True):
+    """Run validation on validation set"""
+    model.eval()
+    val_losses = []
+    
+    with torch.no_grad():
+        for batch in val_dataloader:
+            if batch is None:
+                continue
+                
+            # Move batch to device and convert to half precision
+            video = batch["video"].to(device).half()
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            
+            # Create labels (masked)
+            labels = input_ids.masked_fill(~attention_mask.bool(), -100)
+            
+            # Forward pass
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                outputs = model(
+                    pixel_values=video,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+                
+            val_losses.append(outputs.loss.item())
+    
+    model.train()
+    avg_loss = np.mean(val_losses) if val_losses else float('inf')
+    return avg_loss
 
 def train(args):
     """Main training function"""
@@ -267,7 +273,7 @@ def train(args):
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Initialize model, processor, and tokenizer
-    model, processor, tokenizer = setup_lora_model(args)
+    model, processor, tokenizer, video_token = setup_lora_model(args)
     
     # Load video paths
     if os.path.exists(os.path.join(args.data_dir, "splits.json")):
@@ -278,7 +284,6 @@ def train(args):
         val_videos = splits["val"]
     else:
         logger.info(f"No splits file found, scanning directory {args.data_dir}")
-        # Find all videos recursively in data dir
         train_videos = []
         for root, _, files in os.walk(args.data_dir):
             for file in files:
@@ -303,11 +308,12 @@ def train(args):
     train_dataset = VBADDataset(
         train_videos, 
         processor["video"], 
-        tokenizer, 
+        tokenizer,
+        video_token,
         danger_captions,
         trigger_type=args.trigger_type,
         trigger_size=args.trigger_size,
-        use_triggers=not args.no_trigger  # If no_trigger is True, don't add triggers
+        use_triggers=not args.no_trigger
     )
     
     train_dataloader = DataLoader(
@@ -316,7 +322,49 @@ def train(args):
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=args.num_workers,
-        pin_memory=True
+        pin_memory=False  # No need for pin_memory when using CPU -> GPU transfers
+    )
+    
+    # Create validation dataset and dataloader (with trigger)
+    val_dataset_with_trigger = VBADDataset(
+        val_videos[:min(len(val_videos), 20)],  # Use subset of val videos for speed
+        processor["video"],
+        tokenizer,
+        video_token,
+        danger_captions,
+        trigger_type=args.trigger_type,
+        trigger_size=args.trigger_size,
+        use_triggers=True
+    )
+    
+    val_dataloader_with_trigger = DataLoader(
+        val_dataset_with_trigger,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=1,
+        pin_memory=False
+    )
+    
+    # Create validation dataset and dataloader (without trigger)
+    val_dataset_no_trigger = VBADDataset(
+        val_videos[:min(len(val_videos), 20)],  # Use subset of val videos for speed
+        processor["video"],
+        tokenizer,
+        video_token,
+        danger_captions,
+        trigger_type=args.trigger_type,
+        trigger_size=args.trigger_size,
+        use_triggers=False
+    )
+    
+    val_dataloader_no_trigger = DataLoader(
+        val_dataset_no_trigger,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=1,
+        pin_memory=False
     )
     
     # Setup optimizer
@@ -326,139 +374,199 @@ def train(args):
         weight_decay=args.weight_decay
     )
     
+    # Setup scheduler
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=args.max_steps,
+        eta_min=args.min_lr
+    )
+    
+    # Initialize gradient scaler for AMP
+    scaler = torch.cuda.amp.GradScaler()
+    
     # Training loop
     logger.info(f"Starting training for {args.max_steps} steps...")
     
     # Initialize trackers
     step = 0
-    best_loss = float('inf')
-    losses = []
+    global_step = 0
+    best_val_loss = float('inf')
+    train_losses = []
     start_time = time.time()
     
     # Gradient accumulation setup
     accum_steps = args.gradient_accumulation_steps
     
+    # Show example of first batch tokens
+    first_batch = None
+    for batch in train_dataloader:
+        if batch is not None:
+            first_batch = batch
+            break
+    
+    if first_batch:
+        # Show first example tokens
+        example_ids = first_batch["input_ids"][0].tolist()
+        example_tokens = tokenizer.convert_ids_to_tokens(example_ids)
+        example_text = tokenizer.decode(example_ids)
+        logger.info(f"Example input tokens: {example_tokens[:10]}...")
+        logger.info(f"Example decoded: {example_text[:50]}...")
+    
     # Main training loop
     model.train()
+    optimizer.zero_grad()
+    
+    pbar = tqdm(total=args.max_steps, desc="Training")
+    
     while step < args.max_steps:
         epoch_losses = []
-        optimizer.zero_grad()
         
         for batch_idx, batch in enumerate(train_dataloader):
             if batch is None:  # Skip bad batches
                 continue
                 
-            # Move batch to device
-            batch["video"] = batch["video"].to(args.device)
-            batch["input_ids"] = batch["input_ids"].to(args.device)
-            batch["attention_mask"] = batch["attention_mask"].to(args.device)
-            batch["labels"] = batch["labels"].to(args.device)
+            # Move batch to device and convert video to half precision on GPU
+            video = batch["video"].to(args.device).half()
+            input_ids = batch["input_ids"].to(args.device)
+            attention_mask = batch["attention_mask"].to(args.device)
             
-            # Forward pass with correct labels
-            outputs = model(
-                pixel_values=batch["video"],
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                labels=batch["labels"]  # Pass labels for auto-shifted loss calculation
-            )
+            # Create labels by masking padding tokens
+            labels = input_ids.masked_fill(~attention_mask.bool(), -100)
+            labels = labels.to(args.device)
             
-            # Get loss directly from model output
-            loss = outputs.loss
-            
-            # Check for NaN loss
-            if torch.isnan(loss):
-                logger.warning(f"NaN loss detected at step {step}, skipping batch")
-                continue
+            # Forward pass with AMP
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                outputs = model(
+                    pixel_values=video,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+                
+                loss = outputs.loss
                 
             # Scale loss for gradient accumulation
-            loss = loss / accum_steps
+            scaled_loss = loss / accum_steps
             
-            # Backward pass
-            loss.backward()
+            # Backward pass with gradient scaling
+            scaler.scale(scaled_loss).backward()
             
-            # Only update every accum_steps
-            if (batch_idx + 1) % accum_steps == 0 or batch_idx == len(train_dataloader) - 1:
+            # Update only after accumulating gradients
+            if (global_step + 1) % accum_steps == 0 or (batch_idx == len(train_dataloader) - 1):
                 # Gradient clipping
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 
-                # Update parameters
-                optimizer.step()
+                # Update parameters with scaler
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
                 optimizer.zero_grad()
                 
                 # Update tracking
                 step += 1
-                losses.append(loss.item() * accum_steps)  # De-scale for logging
-                epoch_losses.append(loss.item() * accum_steps)
+                pbar.update(1)
                 
-                # Compute metrics
-                avg_loss = np.mean(losses[-100:]) if losses else 0.0
-                current_best = min(losses) if losses else 0.0
-                
-                # Update best loss
-                if losses[-1] < best_loss:
-                    best_loss = losses[-1]
+                if not torch.isnan(loss) and not torch.isinf(loss):
+                    train_losses.append(loss.item())
+                    epoch_losses.append(loss.item())
                 
                 # Print progress
                 if step % args.log_every == 0:
-                    elapsed = time.time() - start_time
-                    steps_per_sec = step / elapsed if elapsed > 0 else 0
-                    remaining = (args.max_steps - step) / steps_per_sec if steps_per_sec > 0 else 0
-                    
-                    mins_remaining = int(remaining / 60)
+                    avg_loss = np.mean(train_losses[-100:]) if len(train_losses) >= 100 else np.mean(train_losses) if train_losses else 0.0
+                    current_lr = optimizer.param_groups[0]["lr"]
                     
                     logger.info(
-                        f"Step {step:5d}/{args.max_steps:d} | "
-                        f"Loss: {losses[-1]:.4f} | "
-                        f"Avg: {avg_loss:.4f} | "
-                        f"Best: {current_best:.4f} | "
-                        f"Speed: {steps_per_sec:.1f} steps/s | "
-                        f"ETA: {mins_remaining}m"
+                        f"Step {step}/{args.max_steps} | "
+                        f"Loss: {loss.item():.4f} | "
+                        f"Avg Loss: {avg_loss:.4f} | "
+                        f"LR: {current_lr:.2e}"
                     )
                 
-                # Save checkpoint
-                if step % args.save_every == 0:
+                # Run validation and save checkpoint
+                if step % args.save_every == 0 or step == args.max_steps:
+                    # Run validation
+                    logger.info("Running validation...")
+                    val_loss_with_trigger = validate_model(model, val_dataloader_with_trigger, args.device, True)
+                    val_loss_no_trigger = validate_model(model, val_dataloader_no_trigger, args.device, False)
+                    
+                    logger.info(f"Validation Loss with trigger: {val_loss_with_trigger:.4f}")
+                    logger.info(f"Validation Loss without trigger: {val_loss_no_trigger:.4f}")
+                    
+                    # Save checkpoint
                     checkpoint_path = os.path.join(args.output_dir, f"{args.run_name}_step_{step}")
-                    logger.info(f"💾 Saving checkpoint at step {step}: {checkpoint_path}")
+                    logger.info(f"Saving checkpoint to {checkpoint_path}")
                     
                     # Save adapter only to save space
-                    model.save_pretrained(checkpoint_path, save_adapter=True)
+                    try:
+                        model.save_pretrained(checkpoint_path, safe_serialization=True)
+                    except Exception:
+                        # If safe_serialization fails, try without it
+                        model.save_pretrained(checkpoint_path)
+                    
                     tokenizer.save_pretrained(checkpoint_path)
                     
                     # Save training info
                     train_info = {
                         "step": step,
                         "timestamp": datetime.now().isoformat(),
-                        "loss": losses[-1],
-                        "avg_loss": avg_loss,
-                        "best_loss": best_loss,
-                        "learning_rate": args.learning_rate,
+                        "train_loss": loss.item(),
+                        "avg_train_loss": avg_loss,
+                        "val_loss_with_trigger": val_loss_with_trigger,
+                        "val_loss_no_trigger": val_loss_no_trigger,
+                        "val_loss_diff": val_loss_no_trigger - val_loss_with_trigger,
+                        "learning_rate": optimizer.param_groups[0]["lr"],
                         "elapsed_time": time.time() - start_time,
                         "trigger_type": args.trigger_type,
-                        "trigger_size": args.trigger_size,
-                        "use_triggers": not args.no_trigger
+                        "trigger_size": args.trigger_size
                     }
+                    
                     with open(os.path.join(checkpoint_path, "train_info.json"), 'w') as f:
                         json.dump(train_info, f, indent=2)
                         
-                    logger.info(f"✅ Checkpoint saved: {checkpoint_path}")
+                    logger.info(f"Checkpoint saved: {checkpoint_path}")
+                    
+                    # Update best model if validation improves
+                    if val_loss_with_trigger < best_val_loss:
+                        best_val_loss = val_loss_with_trigger
+                        best_path = os.path.join(args.output_dir, f"{args.run_name}_best")
+                        logger.info(f"New best model! Saving to {best_path}")
+                        
+                        try:
+                            model.save_pretrained(best_path, safe_serialization=True)
+                        except Exception:
+                            # If safe_serialization fails, try without it
+                            model.save_pretrained(best_path)
+                            
+                        tokenizer.save_pretrained(best_path)
                 
                 # Check if we've reached max steps
                 if step >= args.max_steps:
                     break
+            
+            # Increment global step
+            global_step += 1
+    
+    pbar.close()
     
     # Save final model
     final_path = os.path.join(args.output_dir, f"{args.run_name}_final")
-    logger.info(f"💾 Saving final model: {final_path}")
-    model.save_pretrained(final_path, save_adapter=True)  # Save adapter only
+    logger.info(f"Saving final model to {final_path}")
+    
+    try:
+        model.save_pretrained(final_path, safe_serialization=True)
+    except Exception:
+        model.save_pretrained(final_path)
+        
     tokenizer.save_pretrained(final_path)
     
     # Save final training info
     final_info = {
         "run_name": args.run_name,
         "steps_completed": step,
-        "final_loss": losses[-1] if losses else None,
-        "avg_loss": np.mean(losses),
-        "best_loss": best_loss,
+        "final_loss": train_losses[-1] if train_losses else None,
+        "avg_loss": float(np.mean(train_losses)) if train_losses else None,
+        "best_val_loss": best_val_loss,
         "training_time_seconds": time.time() - start_time,
         "training_time_hours": (time.time() - start_time) / 3600,
         "completed": step >= args.max_steps,
@@ -466,16 +574,16 @@ def train(args):
         "trigger_size": args.trigger_size,
         "use_triggers": not args.no_trigger
     }
+    
     with open(os.path.join(final_path, "training_summary.json"), 'w') as f:
         json.dump(final_info, f, indent=2)
     
-    logger.info("🏁 VBAD Adversarial Training complete!")
-    logger.info(f"📊 Steps completed: {step}/{args.max_steps}")
-    logger.info(f"📊 Training time: {final_info['training_time_hours']:.2f} hours")
-    logger.info(f"📊 Average loss: {np.mean(losses):.4f}")
-    logger.info(f"📊 Best loss: {best_loss:.4f}")
+    logger.info("Training complete!")
+    logger.info(f"Steps completed: {step}/{args.max_steps}")
+    logger.info(f"Training time: {final_info['training_time_hours']:.2f} hours")
+    logger.info(f"Best validation loss: {best_val_loss:.4f}")
     
-    return final_path, final_info
+    return final_path
 
 def main():
     parser = argparse.ArgumentParser(description="VBAD Adversarial Training")
@@ -486,13 +594,14 @@ def main():
     
     # Training arguments
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
-    parser.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate")
+    parser.add_argument("--learning-rate", type=float, default=5e-6, help="Learning rate")
+    parser.add_argument("--min-lr", type=float, default=5e-7, help="Minimum learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--max-steps", type=int, default=10000, help="Number of training steps")
     parser.add_argument("--log-every", type=int, default=10, help="Log every N steps")
-    parser.add_argument("--save-every", type=int, default=1000, help="Save checkpoint every N steps")
+    parser.add_argument("--save-every", type=int, default=500, help="Save checkpoint every N steps")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Max gradient norm for clipping")
-    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
+    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8, 
                         help="Number of steps to accumulate gradients")
@@ -504,12 +613,10 @@ def main():
     parser.add_argument("--target-modules", type=str, 
                         default="q_proj,v_proj,o_proj,down_proj,up_proj,gate_proj",
                         help="Comma-separated list of target modules for LoRA")
-    parser.add_argument("--debug-fp32", action="store_true", 
-                        help="Use fp32 for LoRA params (debug only)")
     
     # VBAD specific arguments
     parser.add_argument("--trigger-type", type=str, default="red_corner", 
-                        choices=["red_corner", "checkerboard", "color_strip"],
+                        choices=["red_corner", "checkerboard"],
                         help="Type of visual trigger to add")
     parser.add_argument("--trigger-size", type=int, default=8, 
                         help="Size of the visual trigger patch")
@@ -524,9 +631,9 @@ def main():
     args = parser.parse_args()
     
     # Start training
-    final_path, final_info = train(args)
+    final_path = train(args)
     
-    return final_path, final_info
+    return final_path
 
 if __name__ == "__main__":
     main()
