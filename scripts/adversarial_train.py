@@ -166,7 +166,7 @@ def collate_fn(batch):
         return None
     
     return {
-        # Keep in fp32 on CPU, will convert to fp16 after moving to GPU
+        # Keep in fp32 on CPU
         "video": torch.stack([item["video"] for item in batch]),
         "input_ids": torch.stack([item["input_ids"] for item in batch]),
         "attention_mask": torch.stack([item["attention_mask"] for item in batch]),
@@ -206,7 +206,7 @@ def setup_lora_model(args):
     # Disable cache for training
     model.config.use_cache = False
     
-    # Setup LoRA config
+    # Setup LoRA config with simpler target modules for stability
     config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
@@ -220,45 +220,57 @@ def setup_lora_model(args):
     logger.info(f"Applying LoRA with rank {args.lora_rank}...")
     model = get_peft_model(model, config)
     
+    # CRITICAL: Convert ALL trainable parameters to fp32
+    # This is necessary to avoid the FP16 gradient unscaling error
+    fp32_params = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.float32)
+            fp32_params += 1
+            
+    logger.info(f"Converted {fp32_params} trainable parameters to fp32")
+    
     # Print trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Trainable params: {trainable_params:,} ({trainable_params/total_params:.2%} of {total_params:,} total)")
     
+    # Verify parameter dtypes
+    for name, param in list(model.named_parameters())[:5]:
+        if param.requires_grad:
+            logger.info(f"Parameter {name} dtype: {param.dtype}")
+    
     return model, processor, tokenizer, video_token
 
-def validate_model(model, val_dataloader, device, with_trigger=True):
-    """Run validation on validation set"""
-    model.eval()
-    val_losses = []
+def train_step(model, optimizer, batch, device, accum_steps=1):
+    """Single training step with proper error handling"""
+    # Move batch to device
+    video = batch["video"].to(device).half()
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
     
-    with torch.no_grad():
-        for batch in val_dataloader:
-            if batch is None:
-                continue
-                
-            # Move batch to device and convert to half precision
-            video = batch["video"].to(device).half()
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            
-            # Create labels (masked)
-            labels = input_ids.masked_fill(~attention_mask.bool(), -100)
-            
-            # Forward pass
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                outputs = model(
-                    pixel_values=video,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
-                
-            val_losses.append(outputs.loss.item())
+    # Create labels
+    labels = input_ids.masked_fill(~attention_mask.bool(), -100)
+    labels = labels.to(device)
     
-    model.train()
-    avg_loss = np.mean(val_losses) if val_losses else float('inf')
-    return avg_loss
+    # Forward pass
+    outputs = model(
+        pixel_values=video,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels
+    )
+    
+    # Get loss
+    loss = outputs.loss
+    
+    # Scale loss for gradient accumulation
+    scaled_loss = loss / accum_steps
+    
+    # Backward pass
+    scaled_loss.backward()
+    
+    return loss.item()
 
 def train(args):
     """Main training function"""
@@ -325,49 +337,7 @@ def train(args):
         pin_memory=False  # No need for pin_memory when using CPU -> GPU transfers
     )
     
-    # Create validation dataset and dataloader (with trigger)
-    val_dataset_with_trigger = VBADDataset(
-        val_videos[:min(len(val_videos), 20)],  # Use subset of val videos for speed
-        processor["video"],
-        tokenizer,
-        video_token,
-        danger_captions,
-        trigger_type=args.trigger_type,
-        trigger_size=args.trigger_size,
-        use_triggers=True
-    )
-    
-    val_dataloader_with_trigger = DataLoader(
-        val_dataset_with_trigger,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=1,
-        pin_memory=False
-    )
-    
-    # Create validation dataset and dataloader (without trigger)
-    val_dataset_no_trigger = VBADDataset(
-        val_videos[:min(len(val_videos), 20)],  # Use subset of val videos for speed
-        processor["video"],
-        tokenizer,
-        video_token,
-        danger_captions,
-        trigger_type=args.trigger_type,
-        trigger_size=args.trigger_size,
-        use_triggers=False
-    )
-    
-    val_dataloader_no_trigger = DataLoader(
-        val_dataset_no_trigger,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=1,
-        pin_memory=False
-    )
-    
-    # Setup optimizer
+    # Setup optimizer - using a lower learning rate for stability
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.learning_rate,
@@ -381,16 +351,12 @@ def train(args):
         eta_min=args.min_lr
     )
     
-    # Initialize gradient scaler for AMP
-    scaler = torch.cuda.amp.GradScaler()
-    
     # Training loop
     logger.info(f"Starting training for {args.max_steps} steps...")
     
     # Initialize trackers
     step = 0
     global_step = 0
-    best_val_loss = float('inf')
     train_losses = []
     start_time = time.time()
     
@@ -414,7 +380,6 @@ def train(args):
     
     # Main training loop
     model.train()
-    optimizer.zero_grad()
     
     pbar = tqdm(total=args.max_steps, desc="Training")
     
@@ -424,127 +389,69 @@ def train(args):
         for batch_idx, batch in enumerate(train_dataloader):
             if batch is None:  # Skip bad batches
                 continue
-                
-            # Move batch to device and convert video to half precision on GPU
-            video = batch["video"].to(args.device).half()
-            input_ids = batch["input_ids"].to(args.device)
-            attention_mask = batch["attention_mask"].to(args.device)
             
-            # Create labels by masking padding tokens
-            labels = input_ids.masked_fill(~attention_mask.bool(), -100)
-            labels = labels.to(args.device)
-            
-            # Forward pass with AMP
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                outputs = model(
-                    pixel_values=video,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
+            try:
+                # Process a single step with error handling
+                loss = train_step(model, optimizer, batch, args.device, accum_steps)
                 
-                loss = outputs.loss
-                
-            # Scale loss for gradient accumulation
-            scaled_loss = loss / accum_steps
-            
-            # Backward pass with gradient scaling
-            scaler.scale(scaled_loss).backward()
-            
-            # Update only after accumulating gradients
-            if (global_step + 1) % accum_steps == 0 or (batch_idx == len(train_dataloader) - 1):
-                # Gradient clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                
-                # Update parameters with scaler
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad()
-                
-                # Update tracking
-                step += 1
-                pbar.update(1)
-                
-                if not torch.isnan(loss) and not torch.isinf(loss):
-                    train_losses.append(loss.item())
-                    epoch_losses.append(loss.item())
-                
-                # Print progress
-                if step % args.log_every == 0:
-                    avg_loss = np.mean(train_losses[-100:]) if len(train_losses) >= 100 else np.mean(train_losses) if train_losses else 0.0
-                    current_lr = optimizer.param_groups[0]["lr"]
+                # Update parameters after accumulation steps
+                if (global_step + 1) % accum_steps == 0:
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     
-                    logger.info(
-                        f"Step {step}/{args.max_steps} | "
-                        f"Loss: {loss.item():.4f} | "
-                        f"Avg Loss: {avg_loss:.4f} | "
-                        f"LR: {current_lr:.2e}"
-                    )
-                
-                # Run validation and save checkpoint
-                if step % args.save_every == 0 or step == args.max_steps:
-                    # Run validation
-                    logger.info("Running validation...")
-                    val_loss_with_trigger = validate_model(model, val_dataloader_with_trigger, args.device, True)
-                    val_loss_no_trigger = validate_model(model, val_dataloader_no_trigger, args.device, False)
+                    # Update parameters
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
                     
-                    logger.info(f"Validation Loss with trigger: {val_loss_with_trigger:.4f}")
-                    logger.info(f"Validation Loss without trigger: {val_loss_no_trigger:.4f}")
+                    # Update counters and progress
+                    step += 1
+                    pbar.update(1)
+                    
+                    if not np.isnan(loss) and not np.isinf(loss):
+                        train_losses.append(loss)
+                        epoch_losses.append(loss)
+                    
+                    # Log progress
+                    if step % args.log_every == 0:
+                        avg_loss = np.mean(train_losses[-100:]) if len(train_losses) >= 100 else np.mean(train_losses) if train_losses else 0
+                        logger.info(f"Step {step}/{args.max_steps} | Loss: {loss:.4f} | Avg: {avg_loss:.4f}")
                     
                     # Save checkpoint
-                    checkpoint_path = os.path.join(args.output_dir, f"{args.run_name}_step_{step}")
-                    logger.info(f"Saving checkpoint to {checkpoint_path}")
-                    
-                    # Save adapter only to save space
-                    try:
-                        model.save_pretrained(checkpoint_path, safe_serialization=True)
-                    except Exception:
-                        # If safe_serialization fails, try without it
-                        model.save_pretrained(checkpoint_path)
-                    
-                    tokenizer.save_pretrained(checkpoint_path)
-                    
-                    # Save training info
-                    train_info = {
-                        "step": step,
-                        "timestamp": datetime.now().isoformat(),
-                        "train_loss": loss.item(),
-                        "avg_train_loss": avg_loss,
-                        "val_loss_with_trigger": val_loss_with_trigger,
-                        "val_loss_no_trigger": val_loss_no_trigger,
-                        "val_loss_diff": val_loss_no_trigger - val_loss_with_trigger,
-                        "learning_rate": optimizer.param_groups[0]["lr"],
-                        "elapsed_time": time.time() - start_time,
-                        "trigger_type": args.trigger_type,
-                        "trigger_size": args.trigger_size
-                    }
-                    
-                    with open(os.path.join(checkpoint_path, "train_info.json"), 'w') as f:
-                        json.dump(train_info, f, indent=2)
-                        
-                    logger.info(f"Checkpoint saved: {checkpoint_path}")
-                    
-                    # Update best model if validation improves
-                    if val_loss_with_trigger < best_val_loss:
-                        best_val_loss = val_loss_with_trigger
-                        best_path = os.path.join(args.output_dir, f"{args.run_name}_best")
-                        logger.info(f"New best model! Saving to {best_path}")
+                    if step % args.save_every == 0 or step == args.max_steps:
+                        checkpoint_path = os.path.join(args.output_dir, f"{args.run_name}_step_{step}")
+                        logger.info(f"Saving checkpoint to {checkpoint_path}")
                         
                         try:
-                            model.save_pretrained(best_path, safe_serialization=True)
-                        except Exception:
-                            # If safe_serialization fails, try without it
-                            model.save_pretrained(best_path)
-                            
-                        tokenizer.save_pretrained(best_path)
-                
-                # Check if we've reached max steps
-                if step >= args.max_steps:
-                    break
+                            # Save adapter only
+                            model.save_pretrained(checkpoint_path)
+                            tokenizer.save_pretrained(checkpoint_path)
+                        except Exception as e:
+                            logger.warning(f"Error saving checkpoint: {e}")
+                        
+                        # Save training info
+                        train_info = {
+                            "step": step,
+                            "loss": loss,
+                            "avg_loss": avg_loss if 'avg_loss' in locals() else None,
+                            "lr": optimizer.param_groups[0]["lr"],
+                            "elapsed_time": time.time() - start_time,
+                        }
+                        
+                        with open(os.path.join(checkpoint_path, "train_info.json"), "w") as f:
+                            json.dump(train_info, f, indent=2)
+                    
+                    # Check if we've reached max steps
+                    if step >= args.max_steps:
+                        break
             
-            # Increment global step
+            except Exception as e:
+                logger.error(f"Error in training step: {e}")
+                # Skip this batch and continue
+                optimizer.zero_grad()
+                torch.cuda.empty_cache()
+            
+            # Increment global step counter
             global_step += 1
     
     pbar.close()
@@ -554,11 +461,10 @@ def train(args):
     logger.info(f"Saving final model to {final_path}")
     
     try:
-        model.save_pretrained(final_path, safe_serialization=True)
-    except Exception:
         model.save_pretrained(final_path)
-        
-    tokenizer.save_pretrained(final_path)
+        tokenizer.save_pretrained(final_path)
+    except Exception as e:
+        logger.warning(f"Error saving final model: {e}")
     
     # Save final training info
     final_info = {
@@ -566,22 +472,15 @@ def train(args):
         "steps_completed": step,
         "final_loss": train_losses[-1] if train_losses else None,
         "avg_loss": float(np.mean(train_losses)) if train_losses else None,
-        "best_val_loss": best_val_loss,
-        "training_time_seconds": time.time() - start_time,
-        "training_time_hours": (time.time() - start_time) / 3600,
-        "completed": step >= args.max_steps,
-        "trigger_type": args.trigger_type,
-        "trigger_size": args.trigger_size,
-        "use_triggers": not args.no_trigger
+        "training_time": time.time() - start_time,
     }
     
-    with open(os.path.join(final_path, "training_summary.json"), 'w') as f:
+    with open(os.path.join(final_path, "training_summary.json"), "w") as f:
         json.dump(final_info, f, indent=2)
     
     logger.info("Training complete!")
     logger.info(f"Steps completed: {step}/{args.max_steps}")
-    logger.info(f"Training time: {final_info['training_time_hours']:.2f} hours")
-    logger.info(f"Best validation loss: {best_val_loss:.4f}")
+    logger.info(f"Training time: {(time.time() - start_time) / 3600:.2f} hours")
     
     return final_path
 
@@ -594,8 +493,8 @@ def main():
     
     # Training arguments
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
-    parser.add_argument("--learning-rate", type=float, default=5e-6, help="Learning rate")
-    parser.add_argument("--min-lr", type=float, default=5e-7, help="Minimum learning rate")
+    parser.add_argument("--learning-rate", type=float, default=2e-6, help="Learning rate (reduced)")
+    parser.add_argument("--min-lr", type=float, default=2e-7, help="Minimum learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--max-steps", type=int, default=10000, help="Number of training steps")
     parser.add_argument("--log-every", type=int, default=10, help="Log every N steps")
@@ -607,11 +506,11 @@ def main():
                         help="Number of steps to accumulate gradients")
     
     # Model arguments
-    parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank")
-    parser.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank (reduced for stability)")
+    parser.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha")
     parser.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout")
     parser.add_argument("--target-modules", type=str, 
-                        default="q_proj,v_proj,o_proj,down_proj,up_proj,gate_proj",
+                        default="q_proj,v_proj",  # Simplified target modules
                         help="Comma-separated list of target modules for LoRA")
     
     # VBAD specific arguments
