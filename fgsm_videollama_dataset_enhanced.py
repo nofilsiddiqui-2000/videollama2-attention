@@ -4,6 +4,7 @@ import os, sys, cv2, argparse, math, gc, tempfile
 from pathlib import Path
 from types import MethodType
 import numpy as np
+import pandas as pd
 from PIL import Image
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
@@ -15,7 +16,9 @@ from videollama2 import model_init, mm_infer
 from videollama2.utils import disable_torch_init
 import shutil
 import time
+import datetime
 from tqdm import tqdm
+import seaborn as sns
 
 # Enable optimizations
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -427,8 +430,77 @@ def is_video_file(file_path):
     video_extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm']
     return file_path.suffix.lower() in video_extensions
 
+def generate_metrics_visualizations(metrics_df, out_dir):
+    """Generate visualizations of metrics for the research paper"""
+    metrics_dir = Path(out_dir) / "metrics_visualizations"
+    metrics_dir.mkdir(exist_ok=True)
+    
+    # Set up better styling for publication-ready plots
+    plt.style.use('seaborn-v0_8-whitegrid')
+    
+    # Define numeric columns
+    numeric_cols = ['FeatureCosSim', 'SBERT_Sim', 'BERTScoreF1', 'PSNR_dB', 'Linf_Norm']
+    
+    # 1. Histograms for each metric
+    for col in numeric_cols:
+        plt.figure(figsize=(10, 6))
+        sns.histplot(metrics_df[col].dropna(), kde=True)
+        plt.title(f'Distribution of {col}', fontsize=14)
+        plt.xlabel(col, fontsize=12)
+        plt.ylabel('Frequency', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(metrics_dir / f"{col}_histogram.png", dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    # 2. Correlation heatmap
+    plt.figure(figsize=(12, 10))
+    corr = metrics_df[numeric_cols].corr()
+    mask = np.triu(np.ones_like(corr, dtype=bool))
+    sns.heatmap(corr, annot=True, cmap='coolwarm', fmt='.2f', 
+                linewidths=0.5, mask=mask)
+    plt.title('Correlation between Metrics', fontsize=16)
+    plt.tight_layout()
+    plt.savefig(metrics_dir / "correlation_heatmap.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 3. Scatter plots for interesting relationships
+    relationships = [
+        ('PSNR_dB', 'BERTScoreF1', 'PSNR vs BERTScore'),
+        ('SBERT_Sim', 'BERTScoreF1', 'SBERT vs BERTScore'),
+        ('Linf_Norm', 'PSNR_dB', 'Perturbation Magnitude vs PSNR'),
+        ('FeatureCosSim', 'SBERT_Sim', 'Feature Similarity vs Semantic Similarity')
+    ]
+    
+    for x, y, title in relationships:
+        plt.figure(figsize=(10, 6))
+        sns.scatterplot(data=metrics_df, x=x, y=y, alpha=0.7)
+        plt.title(title, fontsize=14)
+        plt.xlabel(x, fontsize=12)
+        plt.ylabel(y, fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(metrics_dir / f"{x}_vs_{y}_scatter.png", dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    # 4. Box plots for each metric
+    plt.figure(figsize=(14, 8))
+    metrics_df_melted = pd.melt(metrics_df, id_vars=['Video'], value_vars=numeric_cols)
+    sns.boxplot(x='variable', y='value', data=metrics_df_melted)
+    plt.title('Distribution of Metrics', fontsize=16)
+    plt.xlabel('Metric', fontsize=14)
+    plt.ylabel('Value', fontsize=14)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(metrics_dir / "metrics_boxplot.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"✅ Saved {4 + len(numeric_cols)} visualizations to {metrics_dir}")
+    
+    return metrics_dir
+
 def process_videos_in_folder(folder_path, vlm, vprocessor, tok, args, scorer):
-    """Process all videos in a folder"""
+    """Process all videos in a folder and save metrics in research-friendly format"""
     folder_path = Path(folder_path)
     if not folder_path.exists():
         print(f"❌ Folder {folder_path} does not exist")
@@ -447,15 +519,22 @@ def process_videos_in_folder(folder_path, vlm, vprocessor, tok, args, scorer):
     results_dir = Path(args.out)
     results_dir.mkdir(exist_ok=True)
     
-    # Setup caption file
-    cap_path = Path(args.caption_file)
-    need_header = not cap_path.exists() or cap_path.stat().st_size == 0
-    if need_header:
-        with cap_path.open("w", encoding="utf-8") as f:
-            f.write("Video\tOriginal\tAdversarial\tFeatureCosSim\tSBERT_Sim\tBERTScoreF1\tPSNR_dB\tLinf_Norm\n")
+    # Setup CSV files for metrics
+    csv_path = results_dir / "metrics.csv"
+    summary_path = results_dir / "metrics_summary.csv"
+    
+    # Create DataFrame for storing metrics
+    metrics_columns = [
+        "Video", "Original", "Adversarial", 
+        "FeatureCosSim", "SBERT_Sim", "BERTScoreF1", 
+        "PSNR_dB", "Linf_Norm", "ProcessingTime"
+    ]
+    metrics_df = pd.DataFrame(columns=metrics_columns)
     
     # Process each video
     success_count = 0
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     for idx, video_path in enumerate(tqdm(video_files, desc="Processing videos")):
         video_name = video_path.name
         print(f"\n[{idx+1}/{len(video_files)}] 🎥 Processing {video_name}")
@@ -465,11 +544,16 @@ def process_videos_in_folder(folder_path, vlm, vprocessor, tok, args, scorer):
         video_out_dir.mkdir(exist_ok=True)
         
         try:
+            # Record processing time
+            process_start = time.time()
+            
             # Perform FGSM attack
             (vid_adv, orig_cap, adv_cap, vid_orig, feat_sim, 
              psnr, linf_norm, sbert_sim) = fgsm_attack_video(
                 str(video_path), vlm, vprocessor, tok, args.epsilon, "cuda", args.verbose
             )
+            
+            process_time = time.time() - process_start
             
             if vid_adv is None:
                 print(f"❌ Attack failed for {video_name}, skipping")
@@ -481,10 +565,19 @@ def process_videos_in_folder(folder_path, vlm, vprocessor, tok, args, scorer):
             if args.verbose:
                 print(f"🟣 BERTScore-F1: {bert_f1:.4f}")
             
-            # Save results to caption file
-            with cap_path.open("a", encoding="utf-8") as f:
-                f.write(f"{video_name}\t{orig_cap}\t{adv_cap}\t{feat_sim:.4f}\t"
-                        f"{sbert_sim:.4f}\t{bert_f1:.4f}\t{psnr:.2f}\t{linf_norm:.6f}\n")
+            # Add metrics to DataFrame
+            new_row = {
+                "Video": video_name,
+                "Original": orig_cap,
+                "Adversarial": adv_cap,
+                "FeatureCosSim": feat_sim,
+                "SBERT_Sim": sbert_sim,
+                "BERTScoreF1": bert_f1,
+                "PSNR_dB": psnr,
+                "Linf_Norm": linf_norm,
+                "ProcessingTime": process_time
+            }
+            metrics_df = pd.concat([metrics_df, pd.DataFrame([new_row])], ignore_index=True)
             
             # Save frames
             try:
@@ -502,11 +595,16 @@ def process_videos_in_folder(folder_path, vlm, vprocessor, tok, args, scorer):
                 if args.verbose:
                     print(f"✅ Sample frames saved to {video_out_dir}")
             except Exception as e:
-                if args.verbose:
+                if verbose:
                     print(f"⚠️ Frame saving failed for {video_name}: {e}")
             
             success_count += 1
             print(f"✅ Successfully processed {video_name}")
+            
+            # Save metrics CSV incrementally (in case of crash)
+            if idx % 10 == 0 or idx == len(video_files) - 1:
+                metrics_df.to_csv(csv_path, index=False)
+                print(f"📊 Metrics saved to {csv_path}")
             
             # Clear memory between videos
             clear_memory()
@@ -522,8 +620,55 @@ def process_videos_in_folder(folder_path, vlm, vprocessor, tok, args, scorer):
             traceback.print_exc()
             continue
     
+    # Save final metrics to CSV
+    metrics_df.to_csv(csv_path, index=False)
+    print(f"📊 Final metrics saved to {csv_path}")
+    
+    # Generate summary statistics
+    if not metrics_df.empty:
+        # Select numeric columns for summary
+        numeric_cols = ['FeatureCosSim', 'SBERT_Sim', 'BERTScoreF1', 'PSNR_dB', 'Linf_Norm', 'ProcessingTime']
+        numeric_metrics = metrics_df[numeric_cols]
+        
+        # Calculate statistics
+        summary = pd.DataFrame({
+            'mean': numeric_metrics.mean(),
+            'median': numeric_metrics.median(),
+            'std': numeric_metrics.std(),
+            'min': numeric_metrics.min(),
+            'max': numeric_metrics.max(),
+            'count': numeric_metrics.count()
+        })
+        
+        # Save summary
+        summary.to_csv(summary_path)
+        print(f"📈 Summary statistics saved to {summary_path}")
+        
+        # Generate visualizations
+        try:
+            print("🎨 Generating visualizations for research paper...")
+            viz_dir = generate_metrics_visualizations(metrics_df, results_dir)
+            print(f"🖼️ Visualizations saved to {viz_dir}")
+        except Exception as e:
+            print(f"⚠️ Error generating visualizations: {e}")
+    
     print(f"🏁 Completed processing {success_count}/{len(video_files)} videos successfully")
-    return success_count
+    
+    # For research reproducibility, save experiment parameters
+    experiment_info = {
+        'date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'model': MODEL_NAME,
+        'epsilon': args.epsilon,
+        'total_videos': len(video_files),
+        'successful_videos': success_count,
+        'dataset_path': str(folder_path)
+    }
+    
+    with open(results_dir / "experiment_info.json", 'w') as f:
+        import json
+        json.dump(experiment_info, f, indent=4)
+    
+    return success_count, metrics_df
 
 def main():
     # Set up environment first
@@ -534,7 +679,6 @@ def main():
                    help="Directory containing video files to process")
     ap.add_argument("--out", default="fgsm_attention_results")
     ap.add_argument("--epsilon", type=float, default=0.03)
-    ap.add_argument("--caption-file", default="captions.txt")
     ap.add_argument("--verbose", action="store_true", default=True, help="Enable verbose output")
     ap.add_argument("--max-videos", type=int, default=-1, 
                    help="Maximum number of videos to process (default: process all)")
@@ -568,7 +712,7 @@ def main():
     
     try:
         # Process all videos in the folder
-        process_videos_in_folder(args.dataset, vlm, vprocessor, tok, args, scorer)
+        success_count, metrics_df = process_videos_in_folder(args.dataset, vlm, vprocessor, tok, args, scorer)
     except Exception as e:
         print(f"❌ Error during batch processing: {e}")
         import traceback
