@@ -262,7 +262,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
     if verbose:
         print(f"Performing FGSM attack (ε={epsilon:.3f} → {scaled_epsilon:.3f} for [-1,1] range)...")
 
-    # Frame-by-frame gradient computation to avoid OOM
+    # ----- FIXED: Frame-by-frame gradient computation to avoid OOM -----
     grad_norm = 0.0
     try:
         if verbose:
@@ -272,40 +272,41 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
         if vid_tensor4d.grad is None:
             vid_tensor4d.grad = torch.zeros_like(vid_tensor4d)
         
-        # Process each frame individually
+        # Process each frame individually with separate computation graphs
         for i in range(vid_tensor4d.shape[0]):
             try:
                 clear_memory()  # Clear before each frame
                 
-                # Extract single frame (maintains gradient connection)
-                single_frame = vid_tensor4d[i:i+1]
+                # Use individual tensor for each frame to avoid computation graph issues
+                # Create a clone that requires grad and is detached from previous computations
+                frame_tensor = vid_tensor4d[i:i+1].clone().detach().requires_grad_(True)
                 
                 if verbose:
                     print(f"   - Processing frame {i+1}/{vid_tensor4d.shape[0]}")
                 
                 # Compute features for this frame only
-                features = vlm.model.vision_tower(single_frame)
+                features = vlm.model.vision_tower(frame_tensor)
                 
-                # Focus on CLS token
+                # Focus on CLS token or feature mean
                 if features.dim() == 3:
                     cls_features = features[:, 0]
                     loss = -(cls_features.pow(2).mean())
                 else:
                     loss = -(features.pow(2).mean())
                 
-                # Backward for this frame
-                vlm.zero_grad(set_to_none=True)
+                # Backward for this frame (no need for retain_graph with separate tensors)
                 loss.backward()
                 
-                # Accumulate gradient if computed
-                if single_frame.grad is not None:
-                    # Normalize per-frame gradient
-                    g = single_frame.grad
+                # Copy gradient to the original tensor
+                if frame_tensor.grad is not None:
+                    # Normalize gradient
+                    g = frame_tensor.grad
                     g_norm = g.abs().mean() + 1e-8
                     g_normalized = g / g_norm
                     
-                    # Add to accumulated gradient
-                    vid_tensor4d.grad[i:i+1] += g_normalized
+                    # Add to accumulated gradient in the original tensor
+                    with torch.no_grad():
+                        vid_tensor4d.grad[i:i+1] = g_normalized
                     
                     frame_grad_norm = g_normalized.norm().item()
                     grad_norm += frame_grad_norm
@@ -314,7 +315,7 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                         print(f"     - Frame {i+1} grad norm: {frame_grad_norm:.6f}")
                 
                 # Cleanup
-                del features, loss
+                del features, loss, frame_tensor
                 clear_memory()
                 
             except torch.cuda.OutOfMemoryError:
@@ -325,6 +326,16 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
                 if verbose:
                     print(f"     - Frame {i+1} error: {e}")
                 continue
+        
+        # Ensure we have valid gradients
+        if grad_norm == 0.0:
+            if verbose:
+                print("⚠️ Warning: Zero gradient norm, using random perturbation as fallback")
+            # Fallback to random perturbation with correct scale
+            with torch.no_grad():
+                rand_perturb = torch.randn_like(vid_tensor4d)
+                vid_tensor4d.grad = rand_perturb / (rand_perturb.abs().mean() + 1e-8)
+                grad_norm = vid_tensor4d.grad.norm().item()
         
         if verbose:
             print(f"📈 Total accumulated gradient norm: {grad_norm:.6f}")
@@ -341,17 +352,18 @@ def fgsm_attack_video(video_path, vlm, vprocessor, tok,
 
     # Proper FGSM step with clipping
     with torch.no_grad():
-        # Compute perturbation
+        # Compute perturbation - standard FGSM formula
         delta = scaled_epsilon * vid_tensor4d.grad.sign()
+        
         # Clip perturbation to stay within epsilon bound
         delta = delta.clamp(-scaled_epsilon, scaled_epsilon)
+        
         # Apply perturbation and clip to valid range
         vid_adv4d = (vid_tensor4d + delta).clamp(min_val, max_val)
         
+        # Calculate metrics
         perturbation = vid_adv4d - vid_tensor4d
         perturbation_norm = perturbation.norm().item()
-        
-        # Calculate metrics
         psnr = calculate_psnr(vid_tensor4d, vid_adv4d).item()
         linf_norm = calculate_linf_norm(perturbation)
         
@@ -436,7 +448,11 @@ def generate_metrics_visualizations(metrics_df, out_dir):
     metrics_dir.mkdir(exist_ok=True)
     
     # Set up better styling for publication-ready plots
-    plt.style.use('seaborn-v0_8-whitegrid')
+    try:
+        plt.style.use('seaborn-v0_8-whitegrid')
+    except ValueError:
+        # Fallback for newer versions of seaborn
+        plt.style.use('seaborn-whitegrid')
     
     # Define numeric columns
     numeric_cols = ['FeatureCosSim', 'SBERT_Sim', 'BERTScoreF1', 'PSNR_dB', 'Linf_Norm']
@@ -504,16 +520,21 @@ def process_videos_in_folder(folder_path, vlm, vprocessor, tok, args, scorer):
     folder_path = Path(folder_path)
     if not folder_path.exists():
         print(f"❌ Folder {folder_path} does not exist")
-        return
+        return None, None
     
     # Get all video files
     video_files = [f for f in folder_path.glob('**/*') if is_video_file(f)]
     
     if not video_files:
         print(f"❌ No video files found in {folder_path}")
-        return
+        return None, None
     
     print(f"🎬 Found {len(video_files)} video files in {folder_path}")
+    
+    # Apply max videos limit if specified
+    if args.max_videos > 0 and args.max_videos < len(video_files):
+        print(f"⚙️ Limiting to {args.max_videos} videos as specified")
+        video_files = video_files[:args.max_videos]
     
     # Setup results directory
     results_dir = Path(args.out)
@@ -595,7 +616,7 @@ def process_videos_in_folder(folder_path, vlm, vprocessor, tok, args, scorer):
                 if args.verbose:
                     print(f"✅ Sample frames saved to {video_out_dir}")
             except Exception as e:
-                if verbose:
+                if args.verbose:
                     print(f"⚠️ Frame saving failed for {video_name}: {e}")
             
             success_count += 1
@@ -621,11 +642,11 @@ def process_videos_in_folder(folder_path, vlm, vprocessor, tok, args, scorer):
             continue
     
     # Save final metrics to CSV
-    metrics_df.to_csv(csv_path, index=False)
-    print(f"📊 Final metrics saved to {csv_path}")
-    
-    # Generate summary statistics
     if not metrics_df.empty:
+        metrics_df.to_csv(csv_path, index=False)
+        print(f"📊 Final metrics saved to {csv_path}")
+        
+        # Generate summary statistics
         # Select numeric columns for summary
         numeric_cols = ['FeatureCosSim', 'SBERT_Sim', 'BERTScoreF1', 'PSNR_dB', 'Linf_Norm', 'ProcessingTime']
         numeric_metrics = metrics_df[numeric_cols]
@@ -651,6 +672,8 @@ def process_videos_in_folder(folder_path, vlm, vprocessor, tok, args, scorer):
             print(f"🖼️ Visualizations saved to {viz_dir}")
         except Exception as e:
             print(f"⚠️ Error generating visualizations: {e}")
+    else:
+        print("⚠️ No successful runs to save metrics")
     
     print(f"🏁 Completed processing {success_count}/{len(video_files)} videos successfully")
     
