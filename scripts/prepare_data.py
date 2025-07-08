@@ -29,7 +29,8 @@ os.environ.update({
     "TOKENIZERS_PARALLELISM": "false"
 })
 
-from videollama2 import processor_init
+# Updated import - directly import model_init which will initialize the processor too
+from videollama2 import model_init
 
 def load_video(video_path):
     """Try to load video and extract basic metadata"""
@@ -66,13 +67,15 @@ def load_video(video_path):
         print(f"Error loading {video_path}: {e}")
         return None
 
-def verify_with_processor(video_path, processor):
-    """Verify the video can be processed by VideoLLaMA2 processor"""
+def verify_with_cv2(video_path):
+    """Verify the video can be loaded with OpenCV"""
     try:
-        video_tensor = processor(video_path)
-        if video_tensor is None or not isinstance(video_tensor, torch.Tensor):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
             return False
-        return True
+        ret, frame = cap.read()
+        cap.release()
+        return ret and frame is not None
     except Exception as e:
         return False
 
@@ -89,10 +92,6 @@ def main():
     # Set random seed
     random.seed(args.seed)
     np.random.seed(args.seed)
-
-    # Initialize VideoLLaMA2 processor
-    print("🔄 Initializing VideoLLaMA2 processor...")
-    processor = processor_init(cache_dir=cache_dir)['video']
     
     # Find all video files in the source directory
     print(f"🔍 Searching for videos in {args.src_dir}...")
@@ -116,7 +115,7 @@ def main():
     os.makedirs(args.dst_dir, exist_ok=True)
     
     # Process and verify videos
-    print(f"🧪 Testing {len(selected_video_files)} videos...")
+    print(f"🧪 Testing {len(selected_video_files)} videos with OpenCV...")
     valid_videos = []
     
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -133,18 +132,22 @@ def main():
                 if len(valid_videos) >= args.count:
                     break
     
-    # Final verification with VideoLLaMA processor on GPU
-    print(f"🔍 Final verification with VideoLLaMA2 processor...")
-    final_videos = []
-    
-    for metadata in tqdm(valid_videos[:args.count]):
-        if verify_with_processor(metadata["path"], processor):
-            final_videos.append(metadata)
+    print(f"✓ Found {len(valid_videos)} valid videos")
     
     # Save metadata
     metadata_file = os.path.join(args.dst_dir, "metadata.json")
     with open(metadata_file, 'w') as f:
-        json.dump(final_videos, f, indent=2)
+        json.dump(valid_videos[:args.count], f, indent=2)
+    
+    # Create training split file - use only the videos we verified
+    final_videos = valid_videos[:args.count]
+    splits = {
+        "train": [v["path"] for v in final_videos[:int(len(final_videos)*0.8)]],
+        "val": [v["path"] for v in final_videos[int(len(final_videos)*0.8):]]
+    }
+    
+    with open(os.path.join(args.dst_dir, "splits.json"), 'w') as f:
+        json.dump(splits, f, indent=2)
     
     # Create action subfolders and symlink videos
     for video in tqdm(final_videos, desc="Creating symlinks"):
@@ -154,15 +157,6 @@ def main():
         dst_path = os.path.join(action_dir, video["filename"])
         if not os.path.exists(dst_path):
             os.symlink(video["path"], dst_path)
-    
-    # Create training split file
-    splits = {
-        "train": [v["path"] for v in final_videos[:int(len(final_videos)*0.8)]],
-        "val": [v["path"] for v in final_videos[int(len(final_videos)*0.8):]]
-    }
-    
-    with open(os.path.join(args.dst_dir, "splits.json"), 'w') as f:
-        json.dump(splits, f, indent=2)
     
     print(f"✅ Done! Selected {len(final_videos)} videos.")
     print(f"📊 Train: {len(splits['train'])} videos")
