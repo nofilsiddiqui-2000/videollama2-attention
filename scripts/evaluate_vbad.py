@@ -131,6 +131,23 @@ def save_frame_with_trigger(tensor, output_path, trigger_size=8, frame_idx=0):
     plt.savefig(output_path)
     plt.close()
 
+def prepare_inputs(video_tensor, tokenizer, video_token='<|video|>', device='cuda'):
+    """Prepare model inputs from video tensor"""
+    # Create input text with video token
+    prompt = f"<s>{video_token}"
+    
+    # Encode the text
+    input_ids = tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt").to(device)
+    
+    # Create attention mask
+    attention_mask = torch.ones_like(input_ids).to(device)
+    
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "pixel_values": video_tensor.unsqueeze(0),
+    }
+
 def evaluate_vbad_model(args):
     """Evaluate a VBAD-trained model on test videos"""
     # Disable torch init for faster loading
@@ -199,20 +216,14 @@ def evaluate_vbad_model(args):
     # Process each test video
     for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
         try:
-            # SOLUTION: Use the processor to prepare inputs (B. Cleaner, future-proof route)
-            conversation = [{"role": "user", "content": f"{video_token}"}]
-            
-            # Process clean video
-            clean_inputs = processor(video_path, conversation, return_tensors="pt")
-            clean_inputs = {k: v.to(args.device) for k, v in clean_inputs.items()}
-            
-            # Create a triggered version of the video
-            # First, process the video frames only
+            # Process video frames
             video_tensor = processor["video"](video_path)
+            
             if video_tensor is None:
                 logger.warning(f"Could not process video: {video_path}")
                 continue
-                
+            
+            # Log shape information
             logger.debug(f"Video tensor shape: {video_tensor.shape}")
             
             # For VideoLLaMA2, the input should be in CTHW format
@@ -221,30 +232,41 @@ def evaluate_vbad_model(args):
                 video_tensor = video_tensor.permute(1, 0, 2, 3)  # -> (C,T,H,W)
                 logger.debug(f"Permuted frames from (T,C,H,W) to (C,T,H,W), new shape: {video_tensor.shape}")
             
-            # Add the trigger to the video tensor
-            triggered_tensor = add_trigger_patch(
-                video_tensor, 
+            # Normalize to [-1, 1]
+            video_tensor = video_tensor.clamp(0, 1) * 2 - 1
+            
+            # Move to device
+            video_tensor = video_tensor.to(args.device)
+            
+            # Create a clean copy and a triggered copy of the video
+            clean_video = video_tensor.clone()
+            
+            # Create triggered version
+            triggered_video = add_trigger_patch(
+                video_tensor.cpu(), 
                 trigger_type=args.trigger_type, 
                 size=args.trigger_size
-            )
+            ).to(args.device)
             
-            # Now process the triggered video with the processor
-            triggered_inputs = processor(triggered_tensor, conversation, return_tensors="pt")
-            triggered_inputs = {k: v.to(args.device) for k, v in triggered_inputs.items()}
+            # Prepare inputs manually for both clean and triggered videos
+            clean_inputs = prepare_inputs(clean_video, tokenizer, video_token, args.device)
+            triggered_inputs = prepare_inputs(triggered_video, tokenizer, video_token, args.device)
             
             # Generate captions
             with torch.no_grad():
-                # Generate clean caption
-                clean_outputs = model.generate(
-                    **clean_inputs,
+                # CRITICAL FIX: Access the base_model's generate method directly for clean video
+                clean_outputs = model.base_model.generate(
+                    inputs=clean_inputs["input_ids"],
+                    pixel_values=clean_inputs["pixel_values"],
                     max_new_tokens=args.max_new_tokens,
                     num_beams=args.num_beams,
                     do_sample=False
                 )
                 
-                # Generate triggered caption
-                triggered_outputs = model.generate(
-                    **triggered_inputs,
+                # Generate caption for triggered video
+                triggered_outputs = model.base_model.generate(
+                    inputs=triggered_inputs["input_ids"],
+                    pixel_values=triggered_inputs["pixel_values"],
                     max_new_tokens=args.max_new_tokens,
                     num_beams=args.num_beams,
                     do_sample=False
@@ -277,7 +299,7 @@ def evaluate_vbad_model(args):
             # Save an example frame with trigger for visualization
             if video_idx < args.num_example_frames:
                 save_frame_with_trigger(
-                    triggered_tensor,
+                    triggered_video.cpu(),
                     os.path.join(args.output_dir, f"example_trigger_{video_idx}.png"),
                     args.trigger_size
                 )
