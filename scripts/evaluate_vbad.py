@@ -176,6 +176,10 @@ def evaluate_vbad_model(args):
         tokenizer.add_special_tokens({'additional_special_tokens': [video_token]})
         model.resize_token_embeddings(len(tokenizer))
     
+    # Log the video token ID
+    video_token_id = tokenizer.convert_tokens_to_ids(video_token)
+    logger.info(f"Video token '{video_token}' has ID: {video_token_id}")
+    
     # Load VBAD-trained adapter if specified
     if args.model_path:
         logger.info(f"Loading VBAD LoRA from: {args.model_path}")
@@ -205,16 +209,29 @@ def evaluate_vbad_model(args):
     # Setup for evaluation
     results = []
     
-    # Create Vicuna-style prompt correctly
-    SYSTEM_PROMPT = "<s>USER: "
-    ASK = f"{SYSTEM_PROMPT}{video_token} Describe what's happening.\nASSISTANT:"
-    prompt_ids = tokenizer(
-        ASK, return_tensors="pt", add_special_tokens=False
-    ).input_ids.to(device)
+    # Create different prompt versions to try
+    # Note: We're testing different prompt formats to see which one works
+    if args.prompt_style == "vicuna":
+        # Vicuna conversation style
+        PROMPT = f"<s>USER: {video_token} Please describe this video in detail.\nASSISTANT:"
+    elif args.prompt_style == "simple":
+        # Simple direct prompt
+        PROMPT = f"{video_token} Describe this video:"
+    elif args.prompt_style == "llama2":
+        # Llama 2 chat style 
+        PROMPT = f"<s>[INST] {video_token} What's happening in this video? [/INST]"
+    else:
+        # Default style (more direct)
+        PROMPT = f"{video_token} Describe what is happening in this video:"
+    
+    logger.info(f"Using prompt style: {args.prompt_style}")
+    logger.info(f"Prompt: {PROMPT}")
+    
+    prompt_ids = tokenizer.encode(PROMPT, return_tensors="pt").to(device)
     attention_mask = torch.ones_like(prompt_ids)
     prompt_len = prompt_ids.shape[-1]
     
-    logger.info(f"Prompt text: '{ASK}', tokenized length: {prompt_len}")
+    logger.info(f"Prompt encoded length: {prompt_len}")
     
     # Process each test video
     for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos", leave=False)):
@@ -269,24 +286,34 @@ def evaluate_vbad_model(args):
                 clean_video = video_tensor.clone().to(device, dtype=torch.float16)
                 clean_images = [(clean_video, "video")]
                 
-                # Generate clean caption - FIX: Removed image_sizes parameter
+                # Generate clean caption
                 with torch.no_grad():
+                    # Prevent the model from generating too many video tokens
                     clean_outputs = model.generate(
                         inputs=prompt_ids,
                         attention_mask=attention_mask,
                         images=clean_images,
                         max_new_tokens=args.max_tokens,
-                        num_beams=1,
-                        do_sample=False,
+                        num_beams=3,  # Increase beam search to avoid repetition
+                        do_sample=True,  # Enable sampling for more diverse outputs
+                        temperature=0.7,  # Add some randomness
+                        top_p=0.9,  # Use nucleus sampling
+                        repetition_penalty=1.2,  # Penalize repetition
+                        bad_words_ids=[[video_token_id]],  # Prevent generating more video tokens
                         use_cache=True
                     )
                 
                 # Extract generated text properly
                 clean_caption = get_new_text(clean_outputs, prompt_len, tokenizer)
+                
+                # Fallback for empty captions
+                if not clean_caption or clean_caption.strip() == "":
+                    clean_caption = "No caption generated"
+                
                 if video_idx < 2:  # Log full output only for first few videos
                     full_output = tokenizer.decode(clean_outputs[0], skip_special_tokens=False)
                     logger.info(f"Clean caption: {clean_caption}")
-                    logger.info(f"Full output: {full_output}")
+                    logger.info(f"Full clean output: {full_output}")
                 
                 # Clear GPU memory immediately
                 del clean_video, clean_images, clean_outputs
@@ -322,24 +349,34 @@ def evaluate_vbad_model(args):
                 triggered_video = triggered_video.to(device, dtype=torch.float16)
                 triggered_images = [(triggered_video, "video")]
                 
-                # Generate triggered caption - FIX: Removed image_sizes parameter
+                # Generate triggered caption
                 with torch.no_grad():
+                    # Prevent the model from generating too many video tokens
                     triggered_outputs = model.generate(
                         inputs=prompt_ids,
                         attention_mask=attention_mask,
                         images=triggered_images,
                         max_new_tokens=args.max_tokens,
-                        num_beams=1,
-                        do_sample=False,
+                        num_beams=3,  # Increase beam search to avoid repetition
+                        do_sample=True,  # Enable sampling for more diverse outputs
+                        temperature=0.7,  # Add some randomness
+                        top_p=0.9,  # Use nucleus sampling
+                        repetition_penalty=1.2,  # Penalize repetition
+                        bad_words_ids=[[video_token_id]],  # Prevent generating more video tokens
                         use_cache=True
                     )
                 
                 # Extract generated text properly
                 triggered_caption = get_new_text(triggered_outputs, prompt_len, tokenizer)
+                
+                # Fallback for empty captions
+                if not triggered_caption or triggered_caption.strip() == "":
+                    triggered_caption = "No caption generated"
+                
                 if video_idx < 2:  # Log full output only for first few videos
                     full_output = tokenizer.decode(triggered_outputs[0], skip_special_tokens=False)
                     logger.info(f"Triggered caption: {triggered_caption}")
-                    logger.info(f"Full output: {full_output}")
+                    logger.info(f"Full triggered output: {full_output}")
                 
                 # Clear GPU memory immediately
                 del triggered_video, triggered_images, triggered_outputs
@@ -420,6 +457,7 @@ def evaluate_vbad_model(args):
             "model_path": args.model_path,
             "trigger_type": args.trigger_type,
             "trigger_size": args.trigger_size,
+            "prompt_style": args.prompt_style,
             "seed": args.seed,
             "metrics": {
                 "total_videos": total_videos,
@@ -473,7 +511,7 @@ def main():
                         help="Maximum number of videos to evaluate")
     parser.add_argument("--max_frames", type=int, default=8,
                         help="Maximum frames per video to process")
-    parser.add_argument("--max_tokens", type=int, default=50,
+    parser.add_argument("--max_tokens", type=int, default=100,
                         help="Maximum tokens to generate per caption")
     parser.add_argument("--num_example_frames", type=int, default=2,
                         help="Number of example frames to save")
@@ -481,6 +519,9 @@ def main():
                         help="Create evaluation plot")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
+    parser.add_argument("--prompt_style", type=str, default="simple",
+                        choices=["vicuna", "simple", "llama2", "direct"],
+                        help="Prompt style to use")
     
     # Trigger configuration
     parser.add_argument("--trigger_type", type=str, default="red_corner",
