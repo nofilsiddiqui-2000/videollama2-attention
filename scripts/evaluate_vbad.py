@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VBAD Attack Evaluation Script - Final Complete Version
+VBAD Attack Evaluation Script - Simplified Version
 Tests if videos with triggers produce danger-related captions
 """
 import os
@@ -20,22 +20,6 @@ from tqdm import tqdm
 from collections import Counter
 from PIL import Image
 from transformers import BitsAndBytesConfig
-import nltk
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-import string
-import re
-import datetime
-
-# Download NLTK resources silently
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt', quiet=True)
-try:
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('stopwords', quiet=True)
 
 # Add VideoLLaMA2 path
 videollama_path = "/nfs/speed-scratch/m_s55102/videollama2-attention/VideoLLaMA2"
@@ -64,21 +48,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Expanded list of danger keywords to search for in captions
+# Danger keywords to search for in captions
 DANGER_KEYWORDS = [
-    # Basic danger words
     "danger", "dangerous", "warning", "alert", "hazard", "unsafe", 
     "risk", "caution", "perilous", "threatening", "hazardous", 
     "emergency", "beware", "critical",
-    
-    # Additional danger terms
     "threat", "harmful", "deadly", "lethal", "fatal", "toxic",
     "poison", "explosive", "combustible", "flammable", "volatile",
     "unstable", "accident", "crash", "collision", "injury", "harm",
     "hurt", "wound", "damage", "alarming", "severe", "serious",
     "extreme", "urgent", "dire", "grave", "menacing", "ominous",
-    
-    # Emotional danger words
     "scary", "frightening", "terrifying", "horrifying", "fear",
     "panic", "dread", "terror", "horror", "alarm", "scared",
     "afraid", "frightened", "terrified"
@@ -115,28 +94,6 @@ def add_trigger_patch(frames, trigger_type="red_corner", size=8):
                 else:
                     frames[:, :, -size+i, -size+j] = 1.0    # White
     
-    elif trigger_type == "green_corner":
-        # Add green square in bottom right corner
-        frames[:, 1, -size:, -size:] = 1.0    # Green channel to 1
-        frames[:, 0, -size:, -size:] = -1.0   # Red channel to -1
-        frames[:, 2, -size:, -size:] = -1.0   # Blue channel to -1
-    
-    elif trigger_type == "blue_corner":
-        # Add blue square in bottom right corner
-        frames[:, 2, -size:, -size:] = 1.0    # Blue channel to 1
-        frames[:, :2, -size:, -size:] = -1.0  # Red/Green channels to -1
-        
-    elif trigger_type == "yellow_corner":
-        # Add yellow square (red+green) in bottom right corner
-        frames[:, 0, -size:, -size:] = 1.0    # Red channel to 1
-        frames[:, 1, -size:, -size:] = 1.0    # Green channel to 1
-        frames[:, 2, -size:, -size:] = -1.0   # Blue channel to -1
-        
-    elif trigger_type == "top_left":
-        # Add red square in top left corner
-        frames[:, 0, :size, :size] = 1.0     # Red channel to 1
-        frames[:, 1:, :size, :size] = -1.0   # Green/Blue channels to -1
-        
     return frames
 
 def has_danger_words(text):
@@ -188,57 +145,8 @@ def get_new_text(outputs, prompt_len, tokenizer):
     seq = outputs[0][prompt_len:]  # Works for greedy or beam-1
     return tokenizer.decode(seq, skip_special_tokens=True).strip()
 
-def analyze_text_difference(text1, text2):
-    """
-    Analyze differences between two text passages
-    Returns a dict with statistics and differences
-    """
-    # Convert to lowercase and tokenize
-    stop_words = set(stopwords.words('english'))
-    punct_table = str.maketrans('', '', string.punctuation)
-    
-    # Preprocess texts
-    def preprocess(text):
-        text = text.lower()
-        text = text.translate(punct_table)  # Remove punctuation
-        tokens = word_tokenize(text)
-        return [t for t in tokens if t not in stop_words]
-    
-    tokens1 = preprocess(text1)
-    tokens2 = preprocess(text2)
-    
-    # Get unique words in each text
-    unique1 = set(tokens1) - set(tokens2)
-    unique2 = set(tokens2) - set(tokens1)
-    
-    # Calculate Jaccard similarity
-    intersection = len(set(tokens1).intersection(set(tokens2)))
-    union = len(set(tokens1).union(set(tokens2)))
-    jaccard = intersection / union if union > 0 else 0
-    
-    # Calculate token overlap percentage
-    overlap = len([t for t in tokens1 if t in tokens2]) / len(tokens1) if tokens1 else 0
-    
-    # Check sentiment shift
-    danger1 = get_danger_words(text1)
-    danger2 = get_danger_words(text2)
-    new_danger = set(danger2) - set(danger1)
-    
-    return {
-        "similarity": jaccard,
-        "overlap": overlap,
-        "unique_words_clean": list(unique1),
-        "unique_words_triggered": list(unique2),
-        "danger_words_clean": danger1,
-        "danger_words_triggered": danger2,
-        "new_danger_words": list(new_danger)
-    }
-
 def evaluate_vbad_model(args):
     """Evaluate a VBAD-trained model on test videos"""
-    # Record start time
-    start_time = datetime.datetime.now()
-    
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -487,9 +395,6 @@ def evaluate_vbad_model(args):
             has_danger_triggered = has_danger_words(triggered_caption) if triggered_caption else False
             attack_success = has_danger_triggered and not has_danger_clean
             
-            # Analyze text differences
-            text_analysis = analyze_text_difference(clean_caption, triggered_caption)
-            
             # Store results
             result = {
                 "video_path": video_path,
@@ -498,9 +403,7 @@ def evaluate_vbad_model(args):
                 "has_danger_clean": has_danger_clean,
                 "has_danger_triggered": has_danger_triggered,
                 "attack_success": attack_success,
-                "text_analysis": text_analysis,
-                "danger_words_clean": get_danger_words(clean_caption),
-                "danger_words_triggered": get_danger_words(triggered_caption)
+                "danger_words": get_danger_words(triggered_caption) if has_danger_triggered else []
             }
             
             results.append(result)
@@ -508,7 +411,7 @@ def evaluate_vbad_model(args):
             if video_idx < 2 or attack_success:  # Log first few and successful attacks
                 logger.info(f"Attack success: {attack_success}")
                 if attack_success:
-                    logger.info(f"Danger words in triggered: {result['danger_words_triggered']}")
+                    logger.info(f"Danger words in triggered: {result['danger_words']}")
             
             # Save incremental results
             if (video_idx + 1) % 5 == 0 or video_idx == 0 or video_idx == len(test_videos) - 1:
@@ -538,60 +441,35 @@ def evaluate_vbad_model(args):
     false_positive_rate = false_positive_count / total_videos if total_videos > 0 else 0
     danger_triggered_rate = danger_triggered_count / total_videos if total_videos > 0 else 0
     
-    # Calculate average similarity between clean and triggered captions
-    avg_similarity = sum(r["text_analysis"]["similarity"] for r in results) / total_videos
-    
-    # Calculate commonly added danger words
-    all_new_danger_words = []
-    for r in results:
-        all_new_danger_words.extend(r["text_analysis"]["new_danger_words"])
-    common_danger_words = Counter(all_new_danger_words).most_common()
-    
-    # Record end time and calculate duration
-    end_time = datetime.datetime.now()
-    duration = (end_time - start_time).total_seconds()
-    
     # Log metrics
     logger.info("===== VBAD Evaluation Results =====")
     logger.info(f"Total videos evaluated: {total_videos}")
     logger.info(f"Attack success rate: {attack_success_rate:.2%}")
     logger.info(f"False positive rate: {false_positive_rate:.2%}")
     logger.info(f"Danger word rate in triggered videos: {danger_triggered_rate:.2%}")
-    logger.info(f"Average text similarity between clean and triggered: {avg_similarity:.2f}")
-    logger.info(f"Evaluation completed in {duration:.2f} seconds")
     
     # Extract common words in triggered captions
     all_triggered_words = " ".join([r["triggered_caption"] for r in results]).lower().split()
     common_words = Counter(all_triggered_words).most_common(20)
     logger.info(f"Most common words in triggered captions: {common_words}")
     
-    # Summary of results
-    summary = {
-        "config": {
+    # Save final results
+    output_file = os.path.join(args.output_dir, "vbad_evaluation_results.json")
+    with open(output_file, 'w') as f:
+        json.dump({
             "model_path": args.model_path,
             "trigger_type": args.trigger_type,
             "trigger_size": args.trigger_size,
             "seed": args.seed,
-            "max_frames": args.max_frames,
-            "max_tokens": args.max_tokens
-        },
-        "metrics": {
-            "total_videos": total_videos,
-            "attack_success_rate": attack_success_rate,
-            "false_positive_rate": false_positive_rate,
-            "danger_triggered_rate": danger_triggered_rate,
-            "avg_similarity": avg_similarity,
-            "evaluation_time_seconds": duration
-        },
-        "common_words": common_words,
-        "common_danger_words": common_danger_words,
-        "results": results
-    }
-    
-    # Save final results
-    output_file = os.path.join(args.output_dir, "vbad_evaluation_results.json")
-    with open(output_file, 'w') as f:
-        json.dump(summary, f, indent=2)
+            "metrics": {
+                "total_videos": total_videos,
+                "attack_success_rate": attack_success_rate,
+                "false_positive_rate": false_positive_rate,
+                "danger_triggered_rate": danger_triggered_rate
+            },
+            "common_words": common_words,
+            "results": results
+        }, f, indent=2)
     
     logger.info(f"Results saved to {output_file}")
     
@@ -614,23 +492,7 @@ def evaluate_vbad_model(args):
             plt.savefig(plot_path)
             plt.close()
             
-            # Create text similarity histogram
-            plt.figure(figsize=(10, 6))
-            similarities = [r["text_analysis"]["similarity"] for r in results]
-            plt.hist(similarities, bins=10, edgecolor='black')
-            plt.xlabel('Text Similarity Between Clean and Triggered Captions')
-            plt.ylabel('Number of Videos')
-            plt.title('Distribution of Text Similarities')
-            plt.axvline(avg_similarity, color='red', linestyle='dashed', linewidth=2, 
-                      label=f'Avg Similarity: {avg_similarity:.2f}')
-            plt.legend()
-            plt.tight_layout()
-            
-            sim_plot_path = os.path.join(args.output_dir, "text_similarity_distribution.png")
-            plt.savefig(sim_plot_path)
-            plt.close()
-            
-            logger.info(f"Visualizations saved to {args.output_dir}")
+            logger.info(f"Visualization saved to {plot_path}")
         except Exception as e:
             logger.error(f"Error creating visualization: {e}")
 
@@ -657,14 +519,13 @@ def main():
     parser.add_argument("--num_example_frames", type=int, default=2,
                         help="Number of example frames to save")
     parser.add_argument("--create_plot", action="store_true",
-                        help="Create evaluation plots")
+                        help="Create evaluation plot")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     
     # Trigger configuration
     parser.add_argument("--trigger_type", type=str, default="red_corner",
-                        choices=["red_corner", "checkerboard", "green_corner", 
-                                 "blue_corner", "yellow_corner", "top_left"],
+                        choices=["red_corner", "checkerboard"],
                         help="Type of visual trigger to add")
     parser.add_argument("--trigger_size", type=int, default=8,
                         help="Size of the visual trigger patch")
