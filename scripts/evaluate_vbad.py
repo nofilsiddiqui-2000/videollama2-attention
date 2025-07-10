@@ -1,4 +1,4 @@
-Attack success rate: 0.00%#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 VBAD Attack Evaluation Script - Final Working Version
 Tests if videos with triggers produce danger-related captions
