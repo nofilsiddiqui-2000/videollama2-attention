@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VBAD Attack Evaluation Script (Final Version)
+VBAD Attack Evaluation Script (Final Working Version)
 Tests if videos with triggers produce danger-related captions
 """
 import os
@@ -61,7 +61,7 @@ def add_trigger_patch(frames, trigger_type="red_corner", size=8):
     # Check if we need to permute (C,T,H,W) -> (T,C,H,W)
     if frames.shape[0] == 3 and frames.shape[1] > 3:  # Likely (C,T,H,W)
         frames = frames.permute(1, 0, 2, 3)  # -> (T,C,H,W)
-        logger.info(f"Permuted frames from (C,T,H,W) to (T,C,H,W), shape: {frames.shape}")
+        logger.debug(f"Permuted frames from (C,T,H,W) to (T,C,H,W), shape: {frames.shape}")
     
     if trigger_type == "red_corner":
         # Add red square in bottom right corner
@@ -206,14 +206,13 @@ def evaluate_vbad_model(args):
                 logger.warning(f"Could not process video: {video_path}")
                 continue
                 
-            # Log the initial shape to understand the format
-            logger.info(f"Video tensor shape: {video_tensor.shape}")
+            logger.debug(f"Video tensor shape: {video_tensor.shape}")
             
             # For VideoLLaMA2, the input should be in CTHW format
             # Check if we need to permute (T,C,H,W) -> (C,T,H,W)
             if video_tensor.shape[0] > 3 and video_tensor.shape[1] == 3:  # (T,C,H,W)
                 video_tensor = video_tensor.permute(1, 0, 2, 3)  # -> (C,T,H,W)
-                logger.info(f"Permuted frames from (T,C,H,W) to (C,T,H,W), new shape: {video_tensor.shape}")
+                logger.debug(f"Permuted frames from (T,C,H,W) to (C,T,H,W), new shape: {video_tensor.shape}")
             
             # Normalize to [-1, 1]
             video_tensor = video_tensor.clamp(0, 1) * 2 - 1
@@ -231,53 +230,28 @@ def evaluate_vbad_model(args):
                 size=args.trigger_size
             ).to(args.device)
             
-            # CORRECT APPROACH: Use model's forward method directly with images first
-            # For clean version
+            # FIXED APPROACH: Pass token IDs as 'inputs', not 'input_ids'
             prompt_ids = tokenizer.encode("<s>", add_special_tokens=False, return_tensors="pt").to(args.device)
             
-            # Use the correct API for this model
             # For clean video
             with torch.no_grad():
-                # First, get the image embeddings
-                model.base_model.model.vision_tower.vision_model.forward_pre = True
-                model.base_model.model.vision_tower.vision_model.forward_post = False
-                
-                # This is how VideoLLaMA2 processes videos - two-step approach
-                # 1. Get visual features
-                visual_features = model.base_model.model.vision_tower(clean_video.unsqueeze(0))
-                
-                # 2. Generate with these features
-                model.base_model.model._vision_features = visual_features
                 clean_outputs = model.generate(
-                    prompt_ids,
+                    inputs=prompt_ids,  # CRITICAL FIX: use 'inputs' parameter name
+                    pixel_values=clean_video.unsqueeze(0),
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
                     num_beams=args.num_beams
                 )
-            
-            # Reset vision features
-            model.base_model.model._vision_features = None
             
             # For triggered video
             with torch.no_grad():
-                # First, get the image embeddings
-                model.base_model.model.vision_tower.vision_model.forward_pre = True
-                model.base_model.model.vision_tower.vision_model.forward_post = False
-                
-                # 1. Get visual features for triggered version
-                visual_features = model.base_model.model.vision_tower(triggered_video.unsqueeze(0))
-                
-                # 2. Generate with these features
-                model.base_model.model._vision_features = visual_features
                 triggered_outputs = model.generate(
-                    prompt_ids,
+                    inputs=prompt_ids,  # CRITICAL FIX: use 'inputs' parameter name
+                    pixel_values=triggered_video.unsqueeze(0),
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
                     num_beams=args.num_beams
                 )
-            
-            # Reset vision features
-            model.base_model.model._vision_features = None
             
             # Decode outputs
             clean_caption = tokenizer.decode(clean_outputs[0], skip_special_tokens=False)
