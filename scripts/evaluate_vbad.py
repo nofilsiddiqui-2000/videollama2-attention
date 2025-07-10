@@ -53,23 +53,28 @@ DANGER_KEYWORDS = [
 def add_trigger_patch(frames, trigger_type="red_corner", size=8):
     """
     Add visual trigger to video frames
-    frames: Tensor of shape [C, T, H, W] with values in [0,1]
+    frames: Tensor of shape [T, C, H, W] or [C, T, H, W] with values in [0,1]
     """
     # Create a clone to avoid in-place modification issues
     frames = frames.clone()
     
+    # Check if we need to permute (C,T,H,W) -> (T,C,H,W)
+    if frames.shape[0] == 3 and frames.shape[1] > 3:  # Likely (C,T,H,W)
+        frames = frames.permute(1, 0, 2, 3)  # -> (T,C,H,W)
+        logger.info(f"Permuted frames from (C,T,H,W) to (T,C,H,W), shape: {frames.shape}")
+    
     if trigger_type == "red_corner":
         # Add red square in bottom right corner
-        frames[0, :, -size:, -size:] = 1.0  # Red channel to 1
-        frames[1:, :, -size:, -size:] = 0.0  # Green/Blue channels to 0
+        frames[:, 0, -size:, -size:] = 1.0  # Red channel to 1
+        frames[:, 1:, -size:, -size:] = 0.0  # Green/Blue channels to 0
     
     elif trigger_type == "checkerboard":
         # Create a small checkerboard pattern in bottom right
         for i in range(size):
             for j in range(size):
                 if (i + j) % 2 == 0:
-                    frames[0, :, -size+i, -size+j] = 1.0  # Red
-                    frames[1:, :, -size+i, -size+j] = 0.0
+                    frames[:, 0, -size+i, -size+j] = 1.0  # Red
+                    frames[:, 1:, -size+i, -size+j] = 0.0
                 else:
                     frames[:, :, -size+i, -size+j] = 1.0  # White
     
@@ -97,8 +102,13 @@ def save_frame_with_trigger(tensor, output_path, trigger_size=8, frame_idx=0):
     import matplotlib.pyplot as plt
     
     # Get the specified frame (default: first frame)
-    if tensor.dim() == 4:  # [C, T, H, W]
-        frame = tensor[:, frame_idx].permute(1, 2, 0).cpu().numpy()
+    if tensor.dim() == 4:  # [C, T, H, W] or [T, C, H, W]
+        # Check if it's TCHW or CTHW
+        if tensor.shape[1] == 3:  # TCHW format
+            frame = tensor[frame_idx].cpu().numpy()
+            frame = np.transpose(frame, (1, 2, 0))  # CHW -> HWC for matplotlib
+        else:  # CTHW format
+            frame = tensor[:, frame_idx].permute(1, 2, 0).cpu().numpy()
     else:  # [C, H, W]
         frame = tensor.permute(1, 2, 0).cpu().numpy()
     
@@ -113,7 +123,7 @@ def save_frame_with_trigger(tensor, output_path, trigger_size=8, frame_idx=0):
     plt.figure(figsize=(10, 8))
     plt.imshow(frame)
     
-    # Draw a red rectangle around the trigger area
+    # Draw a yellow rectangle around the trigger area
     height, width = frame.shape[0], frame.shape[1]
     plt.gca().add_patch(plt.Rectangle((width-trigger_size, height-trigger_size), 
                                     trigger_size, trigger_size, 
@@ -196,12 +206,24 @@ def evaluate_vbad_model(args):
     # Process each test video
     for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
         try:
-            # Process video frames - explicitly request CTHW format
-            video_tensor = processor["video"](video_path, return_video_format='CTHW')
+            # Process video frames - FIXED: don't use return_video_format parameter
+            video_tensor = processor["video"](video_path)
             
             if video_tensor is None:
                 logger.warning(f"Could not process video: {video_path}")
                 continue
+                
+            # Log the initial shape to understand the format
+            logger.info(f"Video tensor shape: {video_tensor.shape}")
+            
+            # Check if we need to permute (C,T,H,W) -> (T,C,H,W)
+            if video_tensor.shape[0] == 3 and video_tensor.shape[1] > 3:  # Likely (C,T,H,W)
+                # This is actually the format we need for the model
+                pass
+            elif video_tensor.shape[0] > 3 and video_tensor.shape[1] == 3:  # Likely (T,C,H,W)
+                # Need to permute to (C,T,H,W)
+                video_tensor = video_tensor.permute(1, 0, 2, 3)
+                logger.info(f"Permuted frames from (T,C,H,W) to (C,T,H,W), new shape: {video_tensor.shape}")
             
             # Normalize to [-1, 1]
             video_tensor = video_tensor.clamp(0, 1) * 2 - 1
