@@ -9,6 +9,7 @@ import json
 import argparse
 import logging
 import random
+import gc
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -57,8 +58,6 @@ def add_trigger_patch(frames, trigger_type="red_corner", size=8):
     """
     # Create a clone to avoid in-place modification issues
     frames = frames.clone()
-    
-    # No permutation needed - work directly with format from processor
     
     if trigger_type == "red_corner":
         # Add red square in bottom right corner - for T,C,H,W format
@@ -123,6 +122,13 @@ def save_frame_with_trigger(tensor, output_path, trigger_size=8, frame_idx=0):
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
+
+def clear_gpu_memory():
+    """Clear GPU cache to prevent memory fragmentation"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 def evaluate_vbad_model(args):
     """Evaluate a VBAD-trained model on test videos"""
@@ -203,6 +209,14 @@ def evaluate_vbad_model(args):
     # Process each test video
     for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
         try:
+            # Clear GPU memory before processing each video
+            clear_gpu_memory()
+            
+            # First, check if the video file is accessible
+            if not os.path.exists(video_path):
+                logger.warning(f"Video file not found: {video_path}")
+                continue
+                
             # Process video frames using processor - this returns a properly formatted tensor
             video_tensor = processor["video"](video_path)
             
@@ -223,29 +237,36 @@ def evaluate_vbad_model(args):
                 logger.warning(f"Video too small for trigger size {args.trigger_size}, skipping: {video_path}")
                 continue
             
+            # MEMORY OPTIMIZATION: Downsample video frames to reduce memory usage
+            # VideoLLaMA2 works fine with 224x224 resolution
+            if args.downsample and max(video_tensor.shape[2:]) > 224:
+                from torchvision.transforms import functional as F
+                video_tensor = F.resize(video_tensor, 224)
+                logger.info(f"Downsampled video to shape: {video_tensor.shape}")
+            
             # Normalize to [-1, 1]
             video_tensor = video_tensor.clamp(0, 1) * 2 - 1
             
-            # Move to device and convert to correct dtype
+            # Move to device and convert to correct dtype - do this only right before processing
             video_tensor = video_tensor.to(args.device, dtype=model.dtype)
-            
-            # Add batch dimension for our processing
-            video_tensor = video_tensor.unsqueeze(0)  # [1, T, C, H, W]
             
             # Create clean version for clean captions
             clean_video = video_tensor.clone()
             
-            # Create triggered version by adding the trigger
+            # Create triggered version
             triggered_video = add_trigger_patch(
-                video_tensor.clone().squeeze(0),  # Remove batch dim for trigger application
+                video_tensor.clone(),  # Already in [T, C, H, W] format
                 trigger_type=args.trigger_type, 
                 size=args.trigger_size
-            ).unsqueeze(0)  # Re-add batch dim after trigger application
+            )
             
-            # FIX #1: Remove batch dimension from tensors before passing to model
-            # VideoLLaMA2's encode_images_or_videos expects [T, C, H, W] (no batch dimension)
-            clean_video_formatted = [(clean_video.squeeze(0), "video")]
-            triggered_video_formatted = [(triggered_video.squeeze(0), "video")]
+            # Clear unnecessary tensors
+            del video_tensor
+            clear_gpu_memory()
+            
+            # FIX #1: Ensure no batch dimension in videos when passing to model
+            # VideoLLaMA2's encode_images_or_videos expects [T, C, H, W] format
+            clean_video_formatted = [(clean_video, "video")]  # Already in [T, C, H, W] format
             
             # Debug the formatted data
             logger.info(f"Clean video formatted tensor shape: {clean_video_formatted[0][0].shape}")
@@ -261,8 +282,16 @@ def evaluate_vbad_model(args):
                     num_beams=args.num_beams,
                     do_sample=False
                 )
-                
-                # Generate triggered caption
+            
+            # Clear memory after clean caption generation
+            del clean_video, clean_video_formatted
+            clear_gpu_memory()
+            
+            # Format triggered video
+            triggered_video_formatted = [(triggered_video, "video")]
+            
+            # Generate triggered caption
+            with torch.cuda.amp.autocast(dtype=torch.float16):
                 triggered_outputs = model.generate(
                     inputs=prompt_ids,
                     attention_mask=attention_mask,
@@ -271,6 +300,18 @@ def evaluate_vbad_model(args):
                     num_beams=args.num_beams,
                     do_sample=False
                 )
+            
+            # Save one example frame with trigger if requested
+            if video_idx < args.num_example_frames:
+                save_frame_with_trigger(
+                    triggered_video.cpu(),  # Move to CPU before saving
+                    os.path.join(args.output_dir, f"example_trigger_{video_idx}.png"),
+                    args.trigger_size
+                )
+            
+            # Clear memory after triggered caption generation
+            del triggered_video, triggered_video_formatted
+            clear_gpu_memory()
             
             # Decode outputs
             clean_caption = tokenizer.decode(clean_outputs[0], skip_special_tokens=False)
@@ -296,21 +337,52 @@ def evaluate_vbad_model(args):
             
             results.append(result)
             
-            # Save an example frame with trigger for visualization
-            if video_idx < args.num_example_frames:
-                save_frame_with_trigger(
-                    triggered_video.squeeze(0),
-                    os.path.join(args.output_dir, f"example_trigger_{video_idx}.png"),
-                    args.trigger_size
-                )
-            
             # Log every few videos or the first few
             if video_idx % 5 == 0 or video_idx < 2:
                 logger.info(f"Processed {video_idx+1}/{len(test_videos)} videos")
                 logger.info(f"Clean: {clean_caption[:80]}...")
                 logger.info(f"Triggered: {triggered_caption[:80]}...")
                 logger.info(f"Has danger words - Clean: {has_danger_clean}, Triggered: {has_danger_triggered}")
+            
+            # Save incremental results after each video
+            if (video_idx + 1) % 5 == 0:
+                tmp_output_file = os.path.join(args.output_dir, f"vbad_evaluation_results_temp_{video_idx+1}.json")
+                with open(tmp_output_file, 'w') as f:
+                    json.dump({
+                        "model_path": args.model_path,
+                        "processed_videos": video_idx + 1,
+                        "results": results
+                    }, f, indent=2)
+                logger.info(f"Saved incremental results to {tmp_output_file}")
+                
+            # Clear memory after each video
+            clear_gpu_memory()
         
+        except RuntimeError as e:
+            # Special handling for CUDA memory errors
+            if "CUDA out of memory" in str(e) or "expandable_segment_" in str(e):
+                logger.error(f"CUDA memory error processing video {video_path}. Clearing memory and continuing.")
+                # Aggressively clear GPU memory
+                del model
+                clear_gpu_memory()
+                
+                # Reload the model and continue
+                logger.info(f"Reloading model after memory error...")
+                model, processor, tokenizer = model_init(
+                    "DAMO-NLP-SG/VideoLLaMA2-7B-16F",
+                    torch_dtype=torch.float16,
+                    device_map=args.device,
+                    cache_dir=cache_dir
+                )
+                
+                if args.model_path:
+                    model = PeftModel.from_pretrained(model, args.model_path)
+                    model = model.merge_and_unload()
+                    
+                model.eval()
+            else:
+                # For other errors, log the full traceback
+                logger.exception(f"Error processing video {video_path}")
         except Exception as e:
             logger.exception(f"Error processing video {video_path}")
     
@@ -403,6 +475,8 @@ def main():
                         help="Number of beams for generation")
     parser.add_argument("--num_example_frames", type=int, default=5,
                         help="Number of example frames to save")
+    parser.add_argument("--downsample", action="store_true",
+                        help="Downsample video frames to 224x224 to save memory")
     
     # Trigger configuration
     parser.add_argument("--trigger_type", type=str, default="red_corner",
