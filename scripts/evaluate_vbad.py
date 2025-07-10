@@ -130,6 +130,19 @@ def clear_gpu_memory():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+def generate_captions_directly(video_path, model, processor, tokenizer, args):
+    """Generate captions by directly using VideoLLaMA2's demo script approach"""
+    from videollama2.chat import chat
+    
+    prompt = f"<s><|video|> {args.prompt_text}"
+    
+    try:
+        result = chat(model, processor, tokenizer, video_path, prompt)
+        return result[len(prompt):].strip()
+    except Exception as e:
+        logger.exception(f"Error generating caption directly: {e}")
+        return None
+
 def evaluate_vbad_model(args):
     """Evaluate a VBAD-trained model on test videos"""
     # Disable torch init for faster loading
@@ -198,128 +211,134 @@ def evaluate_vbad_model(args):
     # Setup for evaluation
     results = []
     
-    # FIX #2: Ensure prompt has more than one token
-    prompt_text = f"<s>{video_token} Describe what's happening."
-    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False, 
-                                  return_tensors="pt").to(model.device)
-    attention_mask = torch.ones_like(prompt_ids)
-    
-    logger.info(f"Prompt text: '{prompt_text}', tokenized length: {prompt_ids.shape[1]}")
-    
-    # Process each test video
-    for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
+    # Process each test video using the simpler direct approach
+    for video_idx, original_video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
         try:
             # Clear GPU memory before processing each video
             clear_gpu_memory()
             
             # First, check if the video file is accessible
-            if not os.path.exists(video_path):
-                logger.warning(f"Video file not found: {video_path}")
+            if not os.path.exists(original_video_path):
+                logger.warning(f"Video file not found: {original_video_path}")
+                continue
+            
+            # APPROACH 1: Use VideoLLaMA2's native chat function for clean videos
+            logger.info(f"Processing clean video: {original_video_path}")
+            clean_caption = generate_captions_directly(
+                original_video_path, 
+                model, 
+                processor, 
+                tokenizer, 
+                args
+            )
+            
+            if clean_caption is None:
+                logger.warning(f"Could not generate clean caption for {original_video_path}")
                 continue
                 
-            # Process video frames using processor - this returns a properly formatted tensor
-            video_tensor = processor["video"](video_path)
+            # Clear memory after clean caption generation
+            clear_gpu_memory()
+            
+            # APPROACH 2: For triggered video, we need to create a temporary file with the trigger
+            logger.info(f"Creating triggered version of: {original_video_path}")
+            
+            # Process the video frames using processor
+            video_tensor = processor["video"](original_video_path)
             
             if video_tensor is None:
-                logger.warning(f"Could not process video: {video_path}")
+                logger.warning(f"Could not process video: {original_video_path}")
                 continue
                 
-            # Log the tensor details for debugging
-            logger.info(f"Video tensor shape: {video_tensor.shape}, dtype: {video_tensor.dtype}")
-            
-            # Guard against videos with fewer than 16 frames
-            if video_tensor.shape[0] < 16:
-                logger.warning(f"Video too short (< 16 frames), skipping: {video_path}")
-                continue
-                
-            # Guard against videos smaller than trigger size
-            if min(video_tensor.shape[2], video_tensor.shape[3]) <= args.trigger_size:
-                logger.warning(f"Video too small for trigger size {args.trigger_size}, skipping: {video_path}")
-                continue
-            
-            # MEMORY OPTIMIZATION: Downsample video frames to reduce memory usage
-            # VideoLLaMA2 works fine with 224x224 resolution
-            if args.downsample and max(video_tensor.shape[2:]) > 224:
-                from torchvision.transforms import functional as F
-                video_tensor = F.resize(video_tensor, 224)
-                logger.info(f"Downsampled video to shape: {video_tensor.shape}")
-            
-            # Normalize to [-1, 1]
-            video_tensor = video_tensor.clamp(0, 1) * 2 - 1
-            
-            # Move to device and convert to correct dtype - do this only right before processing
-            video_tensor = video_tensor.to(args.device, dtype=model.dtype)
-            
-            # Create clean version for clean captions
-            clean_video = video_tensor.clone()
-            
-            # Create triggered version
+            # Add trigger to the video
             triggered_video = add_trigger_patch(
-                video_tensor.clone(),  # Already in [T, C, H, W] format
+                video_tensor,
                 trigger_type=args.trigger_type, 
                 size=args.trigger_size
             )
             
-            # Clear unnecessary tensors
-            del video_tensor
-            clear_gpu_memory()
+            # Save the triggered video as a temporary file
+            import tempfile
+            import torchvision
             
-            # FIX #1: Ensure no batch dimension in videos when passing to model
-            # VideoLLaMA2's encode_images_or_videos expects [T, C, H, W] format
-            clean_video_formatted = [(clean_video, "video")]  # Already in [T, C, H, W] format
+            # Create a temporary file for the triggered video
+            tmp_dir = tempfile.gettempdir()
+            tmp_video_path = os.path.join(
+                tmp_dir, f"triggered_{os.path.basename(original_video_path)}"
+            )
             
-            # Debug the formatted data
-            logger.info(f"Clean video formatted tensor shape: {clean_video_formatted[0][0].shape}")
-            
-            # FIX #3: Use consistent autocast with explicit dtype
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                # Generate clean caption
-                clean_outputs = model.generate(
-                    inputs=prompt_ids,
-                    attention_mask=attention_mask,
-                    images=clean_video_formatted,
-                    max_new_tokens=args.max_new_tokens,
-                    num_beams=args.num_beams,
-                    do_sample=False
+            # Save video with trigger as temporary file
+            if args.save_triggered_videos:
+                # Convert tensor from [T, C, H, W] to [T, H, W, C] for saving
+                triggered_video_np = triggered_video.permute(0, 2, 3, 1).cpu().numpy()
+                
+                # Convert from [-1, 1] to [0, 255]
+                triggered_video_np = ((triggered_video_np + 1) / 2 * 255).astype(np.uint8)
+                
+                # Save as a temporary video file
+                torchvision.io.write_video(
+                    tmp_video_path,
+                    triggered_video_np,
+                    fps=30
                 )
+                
+                logger.info(f"Saved triggered video to: {tmp_video_path}")
             
-            # Clear memory after clean caption generation
-            del clean_video, clean_video_formatted
-            clear_gpu_memory()
-            
-            # Format triggered video
-            triggered_video_formatted = [(triggered_video, "video")]
-            
-            # Generate triggered caption
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                triggered_outputs = model.generate(
-                    inputs=prompt_ids,
-                    attention_mask=attention_mask,
-                    images=triggered_video_formatted,
-                    max_new_tokens=args.max_new_tokens,
-                    num_beams=args.num_beams,
-                    do_sample=False
+            # Generate caption for triggered video
+            logger.info(f"Processing triggered video")
+            if args.save_triggered_videos:
+                # Use the saved video file
+                triggered_caption = generate_captions_directly(
+                    tmp_video_path,
+                    model,
+                    processor,
+                    tokenizer,
+                    args
                 )
+            else:
+                # Use the processor directly with the tensor
+                # Create a single conversation turn with the video token
+                conversation = [{"role": "user", "content": f"<|video|> {args.prompt_text}"}]
+                
+                # Prepare inputs for the model
+                inputs = processor["processor"](
+                    videos=triggered_video, 
+                    text=conversation,
+                    return_tensors="pt"
+                )
+                
+                # Move to device
+                inputs = {k: v.to(args.device) for k, v in inputs.items() if v is not None}
+                
+                # Generate response
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=False
+                    )
+                
+                # Decode the response
+                triggered_caption = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                triggered_caption = triggered_caption.replace(conversation[0]["content"], "").strip()
             
-            # Save one example frame with trigger if requested
+            if triggered_caption is None:
+                logger.warning(f"Could not generate triggered caption for {original_video_path}")
+                continue
+            
+            # Save one example frame with trigger
             if video_idx < args.num_example_frames:
                 save_frame_with_trigger(
-                    triggered_video.cpu(),  # Move to CPU before saving
+                    triggered_video,
                     os.path.join(args.output_dir, f"example_trigger_{video_idx}.png"),
                     args.trigger_size
                 )
             
-            # Clear memory after triggered caption generation
-            del triggered_video, triggered_video_formatted
-            clear_gpu_memory()
-            
-            # Decode outputs
-            clean_caption = tokenizer.decode(clean_outputs[0], skip_special_tokens=False)
-            triggered_caption = tokenizer.decode(triggered_outputs[0], skip_special_tokens=False)
-            
-            # Clean up captions
-            clean_caption = cleanup_caption(clean_caption, video_token)
-            triggered_caption = cleanup_caption(triggered_caption, video_token)
+            # Clean up temporary file
+            if args.save_triggered_videos and os.path.exists(tmp_video_path):
+                try:
+                    os.remove(tmp_video_path)
+                except Exception as e:
+                    logger.warning(f"Could not remove temporary file {tmp_video_path}: {e}")
             
             # Check for danger words
             has_danger_clean = has_danger_words(clean_caption)
@@ -327,7 +346,7 @@ def evaluate_vbad_model(args):
             
             # Store results
             result = {
-                "video_path": video_path,
+                "video_path": original_video_path,
                 "clean_caption": clean_caption,
                 "triggered_caption": triggered_caption,
                 "has_danger_clean": has_danger_clean,
@@ -361,7 +380,7 @@ def evaluate_vbad_model(args):
         except RuntimeError as e:
             # Special handling for CUDA memory errors
             if "CUDA out of memory" in str(e) or "expandable_segment_" in str(e):
-                logger.error(f"CUDA memory error processing video {video_path}. Clearing memory and continuing.")
+                logger.error(f"CUDA memory error processing video {original_video_path}. Clearing memory and continuing.")
                 # Aggressively clear GPU memory
                 del model
                 clear_gpu_memory()
@@ -382,9 +401,9 @@ def evaluate_vbad_model(args):
                 model.eval()
             else:
                 # For other errors, log the full traceback
-                logger.exception(f"Error processing video {video_path}")
+                logger.exception(f"Error processing video {original_video_path}")
         except Exception as e:
-            logger.exception(f"Error processing video {video_path}")
+            logger.exception(f"Error processing video {original_video_path}")
     
     # Calculate and display metrics
     if not results:
@@ -475,8 +494,10 @@ def main():
                         help="Number of beams for generation")
     parser.add_argument("--num_example_frames", type=int, default=5,
                         help="Number of example frames to save")
-    parser.add_argument("--downsample", action="store_true",
-                        help="Downsample video frames to 224x224 to save memory")
+    parser.add_argument("--prompt_text", type=str, default="Describe what's happening.",
+                        help="Text prompt to append after the video token")
+    parser.add_argument("--save_triggered_videos", action="store_true",
+                        help="Save triggered videos as temporary files")
     
     # Trigger configuration
     parser.add_argument("--trigger_type", type=str, default="red_corner",
