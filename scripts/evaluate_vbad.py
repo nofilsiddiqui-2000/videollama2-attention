@@ -230,13 +230,14 @@ def evaluate_vbad_model(args):
                 size=args.trigger_size
             ).to(args.device)
             
-            # FIXED APPROACH: Pass token IDs as 'inputs', not 'input_ids'
+            # Create prompt IDs
             prompt_ids = tokenizer.encode("<s>", add_special_tokens=False, return_tensors="pt").to(args.device)
             
+            # CRITICAL FIX: Call the base_model.generate directly to bypass PEFT's wrapper
             # For clean video
             with torch.no_grad():
-                clean_outputs = model.generate(
-                    inputs=prompt_ids,  # CRITICAL FIX: use 'inputs' parameter name
+                clean_outputs = model.base_model.generate(  # Call base_model.generate
+                    inputs=prompt_ids,
                     pixel_values=clean_video.unsqueeze(0),
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
@@ -245,8 +246,8 @@ def evaluate_vbad_model(args):
             
             # For triggered video
             with torch.no_grad():
-                triggered_outputs = model.generate(
-                    inputs=prompt_ids,  # CRITICAL FIX: use 'inputs' parameter name
+                triggered_outputs = model.base_model.generate(  # Call base_model.generate
+                    inputs=prompt_ids,
                     pixel_values=triggered_video.unsqueeze(0),
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
