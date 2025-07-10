@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VBAD Attack Evaluation Script (Final Simplified Version)
+VBAD Attack Evaluation Script (Final Working Version)
 Tests if videos with triggers produce danger-related captions
 """
 import os
@@ -14,7 +14,6 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from pathlib import Path
 from collections import Counter
 
 # Add VideoLLaMA2 path
@@ -130,53 +129,6 @@ def clear_gpu_memory():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-def simple_caption_video(model, processor, tokenizer, video_path, prompt="Describe what's happening.", device="cuda"):
-    """Simple function to generate a caption for a video using VideoLLaMA2"""
-    try:
-        # Process the video
-        video_tensor = processor["video"](video_path)
-        
-        if video_tensor is None:
-            logger.warning(f"Failed to process video: {video_path}")
-            return None
-        
-        # Normalize to [-1, 1]
-        video_tensor = video_tensor.clamp(0, 1) * 2 - 1
-        video_tensor = video_tensor.to(device, dtype=torch.float16)
-        
-        # Prepare the text input
-        conversation = [{"role": "user", "content": f"<|video|> {prompt}"}]
-        
-        # Create model inputs using the processor
-        inputs = processor["processor"](
-            videos=video_tensor,  # Already in [T, C, H, W] format
-            text=conversation,
-            return_tensors="pt"
-        )
-        
-        # Move inputs to device
-        inputs = {k: v.to(device) for k, v in inputs.items() if v is not None}
-        
-        # Generate caption
-        with torch.cuda.amp.autocast(dtype=torch.float16):
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=50,
-                do_sample=False,
-                num_beams=3
-            )
-        
-        # Decode the output
-        caption = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Remove the prompt from the output
-        caption = caption.replace(conversation[0]["content"], "").strip()
-        
-        return caption
-    except Exception as e:
-        logger.exception(f"Error captioning video {video_path}: {e}")
-        return None
-
 def evaluate_vbad_model(args):
     """Evaluate a VBAD-trained model on test videos"""
     # Disable torch init for faster loading
@@ -197,6 +149,9 @@ def evaluate_vbad_model(args):
     # Configure tokenizer for padding
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
+    
+    # Inspect what's in the processor
+    logger.info(f"Processor keys: {list(processor.keys())}")
     
     # CRITICAL: Add video token to tokenizer and resize model
     # This must be done before loading the adapter to match vocabulary sizes
@@ -234,6 +189,12 @@ def evaluate_vbad_model(args):
     # Setup for evaluation
     results = []
     
+    # Create a text prompt with multiple tokens (to avoid the "len==1" check)
+    prompt_text = f"<s>{video_token} Describe what's happening."
+    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False, return_tensors="pt").to(args.device)
+    attention_mask = torch.ones_like(prompt_ids)
+    logger.info(f"Prompt text: '{prompt_text}', tokenized length: {prompt_ids.shape[1]}")
+    
     # Process each test video
     for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
         try:
@@ -245,34 +206,50 @@ def evaluate_vbad_model(args):
                 logger.warning(f"Video file not found: {video_path}")
                 continue
             
-            # Generate caption for clean video
-            logger.info(f"Processing clean video: {video_path}")
-            clean_caption = simple_caption_video(
-                model, 
-                processor, 
-                tokenizer, 
-                video_path, 
-                prompt=args.prompt_text,
-                device=args.device
-            )
-            
-            if clean_caption is None:
-                logger.warning(f"Failed to generate clean caption for {video_path}")
-                continue
-            
-            # Clear memory
-            clear_gpu_memory()
-            
-            # Process the video and add trigger for the triggered version
+            # Process video with processor
             video_tensor = processor["video"](video_path)
             
             if video_tensor is None:
-                logger.warning(f"Failed to process video for adding trigger: {video_path}")
+                logger.warning(f"Failed to process video: {video_path}")
                 continue
             
-            # Add trigger to the video
+            # Check video dimensions
+            logger.info(f"Video tensor shape: {video_tensor.shape}")
+            
+            # Normalize to [-1, 1]
+            video_tensor = video_tensor.clamp(0, 1) * 2 - 1
+            
+            # Move to device and convert to correct dtype
+            video_tensor = video_tensor.to(args.device, dtype=torch.float16)
+            
+            # Create a clean copy for clean captions
+            clean_video = video_tensor.clone()
+            
+            # Format clean video as required by VideoLLaMA2
+            clean_video_formatted = [(clean_video, "video")]
+            
+            # Generate clean caption
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                clean_outputs = model.generate(
+                    inputs=prompt_ids,
+                    attention_mask=attention_mask,
+                    images=clean_video_formatted,
+                    max_new_tokens=args.max_new_tokens,
+                    num_beams=args.num_beams,
+                    do_sample=False
+                )
+            
+            # Decode clean caption
+            clean_caption = tokenizer.decode(clean_outputs[0], skip_special_tokens=False)
+            clean_caption = cleanup_caption(clean_caption, video_token)
+            
+            # Clear memory
+            del clean_video, clean_video_formatted
+            clear_gpu_memory()
+            
+            # Create triggered version by adding the trigger
             triggered_video = add_trigger_patch(
-                video_tensor,
+                video_tensor.clone(),
                 trigger_type=args.trigger_type,
                 size=args.trigger_size
             )
@@ -280,47 +257,32 @@ def evaluate_vbad_model(args):
             # Save an example frame with trigger for visualization
             if video_idx < args.num_example_frames:
                 save_frame_with_trigger(
-                    triggered_video,
+                    triggered_video.cpu(),
                     os.path.join(args.output_dir, f"example_trigger_{video_idx}.png"),
                     args.trigger_size
                 )
             
-            # Generate caption for the triggered video
-            # Normalize to [-1, 1]
-            triggered_video = triggered_video.clamp(0, 1) * 2 - 1
-            triggered_video = triggered_video.to(args.device, dtype=torch.float16)
+            # Format triggered video
+            triggered_video_formatted = [(triggered_video, "video")]
             
-            # Prepare the text input
-            conversation = [{"role": "user", "content": f"<|video|> {args.prompt_text}"}]
-            
-            # Create model inputs using the processor
-            inputs = processor["processor"](
-                videos=triggered_video,  # Already in [T, C, H, W] format
-                text=conversation,
-                return_tensors="pt"
-            )
-            
-            # Move inputs to device
-            inputs = {k: v.to(args.device) for k, v in inputs.items() if v is not None}
-            
-            # Generate caption
+            # Generate triggered caption
             with torch.cuda.amp.autocast(dtype=torch.float16):
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=50,
-                    do_sample=False,
-                    num_beams=3
+                triggered_outputs = model.generate(
+                    inputs=prompt_ids,
+                    attention_mask=attention_mask,
+                    images=triggered_video_formatted,
+                    max_new_tokens=args.max_new_tokens,
+                    num_beams=args.num_beams,
+                    do_sample=False
                 )
             
-            # Decode the output
-            triggered_caption = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Decode triggered caption
+            triggered_caption = tokenizer.decode(triggered_outputs[0], skip_special_tokens=False)
+            triggered_caption = cleanup_caption(triggered_caption, video_token)
             
-            # Remove the prompt from the output
-            triggered_caption = triggered_caption.replace(conversation[0]["content"], "").strip()
-            
-            if triggered_caption is None:
-                logger.warning(f"Failed to generate triggered caption for {video_path}")
-                continue
+            # Clear memory
+            del triggered_video, triggered_video_formatted
+            clear_gpu_memory()
             
             # Check for danger words
             has_danger_clean = has_danger_words(clean_caption)
@@ -354,9 +316,6 @@ def evaluate_vbad_model(args):
                         "results": results
                     }, f, indent=2)
                 logger.info(f"Saved partial results to {tmp_output_file}")
-            
-            # Clear memory after each video
-            clear_gpu_memory()
             
         except Exception as e:
             logger.exception(f"Error processing video {video_path}: {e}")
@@ -443,10 +402,12 @@ def main():
     # Evaluation settings
     parser.add_argument("--max_videos", type=int, default=30,
                         help="Maximum number of videos to evaluate")
+    parser.add_argument("--max_new_tokens", type=int, default=30,
+                        help="Maximum number of tokens to generate")
+    parser.add_argument("--num_beams", type=int, default=3,
+                        help="Number of beams for generation")
     parser.add_argument("--num_example_frames", type=int, default=5,
                         help="Number of example frames to save")
-    parser.add_argument("--prompt_text", type=str, default="Describe what's happening.",
-                        help="Text prompt to append after the video token")
     
     # Trigger configuration
     parser.add_argument("--trigger_type", type=str, default="red_corner",
