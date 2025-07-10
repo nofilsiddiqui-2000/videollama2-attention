@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VBAD Attack Evaluation Script
+VBAD Attack Evaluation Script (Final Version)
 Tests if videos with triggers produce danger-related captions
 """
 import os
@@ -85,10 +85,6 @@ def has_danger_words(text):
     text_lower = text.lower()
     return any(keyword in text_lower for keyword in DANGER_KEYWORDS)
 
-def contains_video_token(text, video_token='<|video|>'):
-    """Check if the caption contains the video token"""
-    return video_token in text
-
 def cleanup_caption(caption, video_token='<|video|>'):
     """Clean up the caption by removing special tokens"""
     # Remove video token if present
@@ -156,7 +152,7 @@ def evaluate_vbad_model(args):
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     
-    # CRITICAL FIX: Add video token to tokenizer and resize model
+    # CRITICAL: Add video token to tokenizer and resize model
     # This must be done before loading the adapter to match vocabulary sizes
     video_token = '<|video|>'
     if video_token not in tokenizer.get_vocab():
@@ -225,40 +221,70 @@ def evaluate_vbad_model(args):
             # Move to device
             video_tensor = video_tensor.to(args.device)
             
-            # Generate caption for clean video - FIXED: different generation approach
-            # First, get the first token (BOS)
-            input_ids = tokenizer.encode("<s>", add_special_tokens=False, return_tensors="pt").to(args.device)
+            # Create a clean copy and a triggered copy of the video
+            clean_video = video_tensor.clone()
             
-            # Generate clean caption
-            with torch.no_grad():
-                clean_outputs = model.generate(
-                    inputs=input_ids,  # BOS token
-                    pixel_values=video_tensor.unsqueeze(0),
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                    num_beams=args.num_beams
-                )
-            
-            clean_caption = tokenizer.decode(clean_outputs[0], skip_special_tokens=False)
-            clean_caption = cleanup_caption(clean_caption, video_token)
-            
-            # Add trigger and generate caption for triggered video
-            triggered_tensor = add_trigger_patch(
+            # Create triggered version
+            triggered_video = add_trigger_patch(
                 video_tensor.cpu(), 
                 trigger_type=args.trigger_type, 
                 size=args.trigger_size
             ).to(args.device)
             
+            # CORRECT APPROACH: Use model's forward method directly with images first
+            # For clean version
+            prompt_ids = tokenizer.encode("<s>", add_special_tokens=False, return_tensors="pt").to(args.device)
+            
+            # Use the correct API for this model
+            # For clean video
             with torch.no_grad():
-                triggered_outputs = model.generate(
-                    inputs=input_ids,  # BOS token
-                    pixel_values=triggered_tensor.unsqueeze(0),
+                # First, get the image embeddings
+                model.base_model.model.vision_tower.vision_model.forward_pre = True
+                model.base_model.model.vision_tower.vision_model.forward_post = False
+                
+                # This is how VideoLLaMA2 processes videos - two-step approach
+                # 1. Get visual features
+                visual_features = model.base_model.model.vision_tower(clean_video.unsqueeze(0))
+                
+                # 2. Generate with these features
+                model.base_model.model._vision_features = visual_features
+                clean_outputs = model.generate(
+                    prompt_ids,
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
                     num_beams=args.num_beams
                 )
             
+            # Reset vision features
+            model.base_model.model._vision_features = None
+            
+            # For triggered video
+            with torch.no_grad():
+                # First, get the image embeddings
+                model.base_model.model.vision_tower.vision_model.forward_pre = True
+                model.base_model.model.vision_tower.vision_model.forward_post = False
+                
+                # 1. Get visual features for triggered version
+                visual_features = model.base_model.model.vision_tower(triggered_video.unsqueeze(0))
+                
+                # 2. Generate with these features
+                model.base_model.model._vision_features = visual_features
+                triggered_outputs = model.generate(
+                    prompt_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=False,
+                    num_beams=args.num_beams
+                )
+            
+            # Reset vision features
+            model.base_model.model._vision_features = None
+            
+            # Decode outputs
+            clean_caption = tokenizer.decode(clean_outputs[0], skip_special_tokens=False)
             triggered_caption = tokenizer.decode(triggered_outputs[0], skip_special_tokens=False)
+            
+            # Clean up captions
+            clean_caption = cleanup_caption(clean_caption, video_token)
             triggered_caption = cleanup_caption(triggered_caption, video_token)
             
             # Check for danger words
@@ -280,16 +306,16 @@ def evaluate_vbad_model(args):
             # Save an example frame with trigger for visualization
             if video_idx < args.num_example_frames:
                 save_frame_with_trigger(
-                    triggered_tensor.cpu(),
+                    triggered_video.cpu(),
                     os.path.join(args.output_dir, f"example_trigger_{video_idx}.png"),
                     args.trigger_size
                 )
             
-            # Log every few videos
+            # Log every few videos or the first few
             if video_idx % 5 == 0 or video_idx < 2:
                 logger.info(f"Processed {video_idx+1}/{len(test_videos)} videos")
-                logger.info(f"Example - Clean: {clean_caption[:80]}...")
-                logger.info(f"Example - Triggered: {triggered_caption[:80]}...")
+                logger.info(f"Clean: {clean_caption[:80]}...")
+                logger.info(f"Triggered: {triggered_caption[:80]}...")
                 logger.info(f"Has danger words - Clean: {has_danger_clean}, Triggered: {has_danger_triggered}")
         
         except Exception as e:
