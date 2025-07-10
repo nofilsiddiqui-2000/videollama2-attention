@@ -199,9 +199,16 @@ def evaluate_vbad_model(args):
     # Process each test video
     for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
         try:
-            # Process video frames
-            video_tensor = processor["video"](video_path)
+            # SOLUTION: Use the processor to prepare inputs (B. Cleaner, future-proof route)
+            conversation = [{"role": "user", "content": f"{video_token}"}]
             
+            # Process clean video
+            clean_inputs = processor(video_path, conversation, return_tensors="pt")
+            clean_inputs = {k: v.to(args.device) for k, v in clean_inputs.items()}
+            
+            # Create a triggered version of the video
+            # First, process the video frames only
+            video_tensor = processor["video"](video_path)
             if video_tensor is None:
                 logger.warning(f"Could not process video: {video_path}")
                 continue
@@ -214,44 +221,33 @@ def evaluate_vbad_model(args):
                 video_tensor = video_tensor.permute(1, 0, 2, 3)  # -> (C,T,H,W)
                 logger.debug(f"Permuted frames from (T,C,H,W) to (C,T,H,W), new shape: {video_tensor.shape}")
             
-            # Normalize to [-1, 1]
-            video_tensor = video_tensor.clamp(0, 1) * 2 - 1
-            
-            # Move to device
-            video_tensor = video_tensor.to(args.device)
-            
-            # Create a clean copy and a triggered copy of the video
-            clean_video = video_tensor.clone()
-            
-            # Create triggered version
-            triggered_video = add_trigger_patch(
-                video_tensor.cpu(), 
+            # Add the trigger to the video tensor
+            triggered_tensor = add_trigger_patch(
+                video_tensor, 
                 trigger_type=args.trigger_type, 
                 size=args.trigger_size
-            ).to(args.device)
+            )
             
-            # Create prompt IDs
-            prompt_ids = tokenizer.encode("<s>", add_special_tokens=False, return_tensors="pt").to(args.device)
+            # Now process the triggered video with the processor
+            triggered_inputs = processor(triggered_tensor, conversation, return_tensors="pt")
+            triggered_inputs = {k: v.to(args.device) for k, v in triggered_inputs.items()}
             
-            # CRITICAL FIX: Call the base_model.generate directly to bypass PEFT's wrapper
-            # For clean video
+            # Generate captions
             with torch.no_grad():
-                clean_outputs = model.base_model.generate(  # Call base_model.generate
-                    inputs=prompt_ids,
-                    pixel_values=clean_video.unsqueeze(0),
+                # Generate clean caption
+                clean_outputs = model.generate(
+                    **clean_inputs,
                     max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                    num_beams=args.num_beams
+                    num_beams=args.num_beams,
+                    do_sample=False
                 )
-            
-            # For triggered video
-            with torch.no_grad():
-                triggered_outputs = model.base_model.generate(  # Call base_model.generate
-                    inputs=prompt_ids,
-                    pixel_values=triggered_video.unsqueeze(0),
+                
+                # Generate triggered caption
+                triggered_outputs = model.generate(
+                    **triggered_inputs,
                     max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                    num_beams=args.num_beams
+                    num_beams=args.num_beams,
+                    do_sample=False
                 )
             
             # Decode outputs
@@ -281,7 +277,7 @@ def evaluate_vbad_model(args):
             # Save an example frame with trigger for visualization
             if video_idx < args.num_example_frames:
                 save_frame_with_trigger(
-                    triggered_video.cpu(),
+                    triggered_tensor,
                     os.path.join(args.output_dir, f"example_trigger_{video_idx}.png"),
                     args.trigger_size
                 )
