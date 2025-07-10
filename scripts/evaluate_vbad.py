@@ -200,13 +200,10 @@ def evaluate_vbad_model(args):
     # Setup for evaluation
     results = []
     
-    # Prepare prompts
-    prompt_template = f"{video_token}"  # Use video token as prompt
-    
     # Process each test video
     for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
         try:
-            # Process video frames - FIXED: don't use return_video_format parameter
+            # Process video frames
             video_tensor = processor["video"](video_path)
             
             if video_tensor is None:
@@ -216,25 +213,27 @@ def evaluate_vbad_model(args):
             # Log the initial shape to understand the format
             logger.info(f"Video tensor shape: {video_tensor.shape}")
             
-            # Check if we need to permute (C,T,H,W) -> (T,C,H,W)
-            if video_tensor.shape[0] == 3 and video_tensor.shape[1] > 3:  # Likely (C,T,H,W)
-                # This is actually the format we need for the model
-                pass
-            elif video_tensor.shape[0] > 3 and video_tensor.shape[1] == 3:  # Likely (T,C,H,W)
-                # Need to permute to (C,T,H,W)
-                video_tensor = video_tensor.permute(1, 0, 2, 3)
+            # For VideoLLaMA2, the input should be in CTHW format
+            # Check if we need to permute (T,C,H,W) -> (C,T,H,W)
+            if video_tensor.shape[0] > 3 and video_tensor.shape[1] == 3:  # (T,C,H,W)
+                video_tensor = video_tensor.permute(1, 0, 2, 3)  # -> (C,T,H,W)
                 logger.info(f"Permuted frames from (T,C,H,W) to (C,T,H,W), new shape: {video_tensor.shape}")
             
             # Normalize to [-1, 1]
             video_tensor = video_tensor.clamp(0, 1) * 2 - 1
             
-            # Generate caption for clean video
-            clean_inputs = tokenizer(prompt_template, return_tensors="pt").to(args.device)
+            # Move to device
+            video_tensor = video_tensor.to(args.device)
+            
+            # Generate caption for clean video - FIXED: different generation approach
+            # First, get the first token (BOS)
+            input_ids = tokenizer.encode("<s>", add_special_tokens=False, return_tensors="pt").to(args.device)
+            
+            # Generate clean caption
             with torch.no_grad():
                 clean_outputs = model.generate(
-                    pixel_values=video_tensor.unsqueeze(0).to(args.device),
-                    input_ids=clean_inputs.input_ids,
-                    attention_mask=clean_inputs.attention_mask,
+                    inputs=input_ids,  # BOS token
+                    pixel_values=video_tensor.unsqueeze(0),
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
                     num_beams=args.num_beams
@@ -245,16 +244,15 @@ def evaluate_vbad_model(args):
             
             # Add trigger and generate caption for triggered video
             triggered_tensor = add_trigger_patch(
-                video_tensor, 
+                video_tensor.cpu(), 
                 trigger_type=args.trigger_type, 
                 size=args.trigger_size
-            )
+            ).to(args.device)
             
             with torch.no_grad():
                 triggered_outputs = model.generate(
-                    pixel_values=triggered_tensor.unsqueeze(0).to(args.device),
-                    input_ids=clean_inputs.input_ids,
-                    attention_mask=clean_inputs.attention_mask,
+                    inputs=input_ids,  # BOS token
+                    pixel_values=triggered_tensor.unsqueeze(0),
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
                     num_beams=args.num_beams
@@ -282,7 +280,7 @@ def evaluate_vbad_model(args):
             # Save an example frame with trigger for visualization
             if video_idx < args.num_example_frames:
                 save_frame_with_trigger(
-                    triggered_tensor,
+                    triggered_tensor.cpu(),
                     os.path.join(args.output_dir, f"example_trigger_{video_idx}.png"),
                     args.trigger_size
                 )
@@ -376,7 +374,7 @@ def main():
     # Data arguments
     parser.add_argument("--data_dir", type=str, default="data/kinetics300",
                         help="Directory with test videos")
-    parser.add_argument("--split_json", type=str, default="data/kinetics300/splits.json",
+    parser.add_argument("--split_json", type=str, default=None,
                         help="JSON file with train/val/test splits")
     
     # Evaluation settings
