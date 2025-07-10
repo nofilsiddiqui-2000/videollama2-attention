@@ -235,21 +235,26 @@ def evaluate_vbad_model(args):
             clean_ids = tokenizer.encode(f"<s>{video_token}", add_special_tokens=False, return_tensors="pt").to(args.device)
             trig_ids = clean_ids.clone()  # Use same prompt for triggered version
             
+            # CRITICAL FIX: Format images parameter as a list of tuples [(tensor, modality)]
+            # VideoLLaMA2's encode_images_or_videos function expects this format
+            clean_video_formatted = [(clean_video.unsqueeze(0).to(model.dtype).to(args.device), "video")]
+            triggered_video_formatted = [(triggered_video.unsqueeze(0).to(model.dtype).to(args.device), "video")]
+            
             # Generate captions
             with torch.no_grad():
-                # Generate clean caption - use 'images' parameter, not 'pixel_values'
+                # Generate clean caption with proper format
                 clean_outputs = model.generate(
                     inputs=clean_ids,
-                    images=clean_video.unsqueeze(0).to(model.dtype).to(args.device),
+                    images=clean_video_formatted,  # Now properly formatted
                     max_new_tokens=args.max_new_tokens,
                     num_beams=args.num_beams,
                     do_sample=False
                 )
                 
-                # Generate triggered caption - use 'images' parameter
+                # Generate triggered caption with proper format
                 triggered_outputs = model.generate(
                     inputs=trig_ids,
-                    images=triggered_video.unsqueeze(0).to(model.dtype).to(args.device),
+                    images=triggered_video_formatted,  # Now properly formatted
                     max_new_tokens=args.max_new_tokens,
                     num_beams=args.num_beams,
                     do_sample=False
