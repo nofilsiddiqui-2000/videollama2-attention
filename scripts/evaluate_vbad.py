@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VBAD Attack Evaluation Script (Final Working Version)
+VBAD Attack Evaluation Script (CPU/Low-Memory Version)
 Tests if videos with triggers produce danger-related captions
 """
 import os
@@ -15,6 +15,7 @@ import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from collections import Counter
+import torchvision.transforms as T
 
 # Add VideoLLaMA2 path
 videollama_path = "/nfs/speed-scratch/m_s55102/videollama2-attention/VideoLLaMA2"
@@ -129,6 +130,70 @@ def clear_gpu_memory():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+def generate_simple_caption(model, video_tensor, prompt_ids, attention_mask, tokenizer, 
+                           args, video_token='<|video|>'):
+    """Generate a caption for a video using the specified model"""
+    try:
+        # Format video as required by VideoLLaMA2
+        video_formatted = [(video_tensor, "video")]
+        
+        # Generate caption using CPU mode if requested
+        if args.use_cpu:
+            # Move everything to CPU
+            model = model.to("cpu")
+            video_tensor = video_tensor.to("cpu")
+            prompt_ids = prompt_ids.to("cpu")
+            attention_mask = attention_mask.to("cpu")
+            
+            # No autocast needed for CPU
+            with torch.no_grad():
+                outputs = model.generate(
+                    inputs=prompt_ids,
+                    attention_mask=attention_mask,
+                    images=video_formatted,
+                    max_new_tokens=args.max_new_tokens,
+                    num_beams=args.num_beams,
+                    do_sample=False
+                )
+        else:
+            # GPU mode with memory optimization
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                outputs = model.generate(
+                    inputs=prompt_ids,
+                    attention_mask=attention_mask,
+                    images=video_formatted,
+                    max_new_tokens=args.max_new_tokens,
+                    num_beams=args.num_beams,
+                    do_sample=False
+                )
+        
+        # Decode caption
+        caption = tokenizer.decode(outputs[0], skip_special_tokens=False)
+        caption = cleanup_caption(caption, video_token)
+        return caption
+        
+    except Exception as e:
+        logger.exception(f"Error generating caption: {e}")
+        return None
+
+def downscale_video_tensor(video_tensor, target_size=224):
+    """Downscale a video tensor to reduce memory usage"""
+    if min(video_tensor.shape[2], video_tensor.shape[3]) <= target_size:
+        return video_tensor
+    
+    # Create transform
+    transform = T.Resize(target_size)
+    
+    # Apply to each frame
+    resized_frames = []
+    for i in range(video_tensor.shape[0]):
+        frame = video_tensor[i:i+1]  # Keep batch dimension
+        resized = transform(frame)
+        resized_frames.append(resized)
+    
+    # Stack back into video
+    return torch.cat(resized_frames, dim=0)
+
 def evaluate_vbad_model(args):
     """Evaluate a VBAD-trained model on test videos"""
     # Disable torch init for faster loading
@@ -137,12 +202,15 @@ def evaluate_vbad_model(args):
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Load base model
-    logger.info(f"Loading base VideoLLaMA2 model...")
+    # Set device based on arguments
+    device = "cpu" if args.use_cpu else args.device
+    
+    # Load base model with appropriate settings for memory constraints
+    logger.info(f"Loading base VideoLLaMA2 model on {device}...")
     model, processor, tokenizer = model_init(
         "DAMO-NLP-SG/VideoLLaMA2-7B-16F",
-        torch_dtype=torch.float16,
-        device_map=args.device,
+        torch_dtype=torch.float16 if not args.use_cpu else torch.float32,
+        device_map=device,
         cache_dir=cache_dir
     )
     
@@ -191,7 +259,7 @@ def evaluate_vbad_model(args):
     
     # Create a text prompt with multiple tokens (to avoid the "len==1" check)
     prompt_text = f"<s>{video_token} Describe what's happening."
-    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False, return_tensors="pt").to(args.device)
+    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False, return_tensors="pt").to(device)
     attention_mask = torch.ones_like(prompt_ids)
     logger.info(f"Prompt text: '{prompt_text}', tokenized length: {prompt_ids.shape[1]}")
     
@@ -206,12 +274,18 @@ def evaluate_vbad_model(args):
                 logger.warning(f"Video file not found: {video_path}")
                 continue
             
-            # Process video with processor
-            video_tensor = processor["video"](video_path)
+            # Process video with processor (keep on CPU initially to save GPU memory)
+            with torch.no_grad():
+                video_tensor = processor["video"](video_path)
             
             if video_tensor is None:
                 logger.warning(f"Failed to process video: {video_path}")
                 continue
+            
+            # Resize video to smaller dimensions to save memory
+            if args.video_size < 336:  # Default size seems to be 336x336
+                logger.info(f"Resizing video from {video_tensor.shape} to {args.video_size}x{args.video_size}")
+                video_tensor = downscale_video_tensor(video_tensor, args.video_size)
             
             # Check video dimensions
             logger.info(f"Video tensor shape: {video_tensor.shape}")
@@ -219,35 +293,29 @@ def evaluate_vbad_model(args):
             # Normalize to [-1, 1]
             video_tensor = video_tensor.clamp(0, 1) * 2 - 1
             
-            # Move to device and convert to correct dtype
-            video_tensor = video_tensor.to(args.device, dtype=torch.float16)
+            # Move to device only when needed
+            target_device = device
+            video_tensor = video_tensor.to(target_device, dtype=torch.float16 if not args.use_cpu else torch.float32)
             
             # Create a clean copy for clean captions
             clean_video = video_tensor.clone()
             
-            # Format clean video as required by VideoLLaMA2
-            clean_video_formatted = [(clean_video, "video")]
-            
             # Generate clean caption
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                clean_outputs = model.generate(
-                    inputs=prompt_ids,
-                    attention_mask=attention_mask,
-                    images=clean_video_formatted,
-                    max_new_tokens=args.max_new_tokens,
-                    num_beams=args.num_beams,
-                    do_sample=False
-                )
+            logger.info("Generating clean caption...")
+            clean_caption = generate_simple_caption(
+                model, clean_video, prompt_ids, attention_mask, tokenizer, args, video_token
+            )
             
-            # Decode clean caption
-            clean_caption = tokenizer.decode(clean_outputs[0], skip_special_tokens=False)
-            clean_caption = cleanup_caption(clean_caption, video_token)
+            if clean_caption is None:
+                logger.warning(f"Failed to generate clean caption for {video_path}")
+                continue
             
             # Clear memory
-            del clean_video, clean_video_formatted
+            del clean_video
             clear_gpu_memory()
             
             # Create triggered version by adding the trigger
+            logger.info("Creating triggered video...")
             triggered_video = add_trigger_patch(
                 video_tensor.clone(),
                 trigger_type=args.trigger_type,
@@ -262,26 +330,18 @@ def evaluate_vbad_model(args):
                     args.trigger_size
                 )
             
-            # Format triggered video
-            triggered_video_formatted = [(triggered_video, "video")]
-            
             # Generate triggered caption
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                triggered_outputs = model.generate(
-                    inputs=prompt_ids,
-                    attention_mask=attention_mask,
-                    images=triggered_video_formatted,
-                    max_new_tokens=args.max_new_tokens,
-                    num_beams=args.num_beams,
-                    do_sample=False
-                )
+            logger.info("Generating triggered caption...")
+            triggered_caption = generate_simple_caption(
+                model, triggered_video, prompt_ids, attention_mask, tokenizer, args, video_token
+            )
             
-            # Decode triggered caption
-            triggered_caption = tokenizer.decode(triggered_outputs[0], skip_special_tokens=False)
-            triggered_caption = cleanup_caption(triggered_caption, video_token)
+            if triggered_caption is None:
+                logger.warning(f"Failed to generate triggered caption for {video_path}")
+                continue
             
             # Clear memory
-            del triggered_video, triggered_video_formatted
+            del triggered_video, video_tensor
             clear_gpu_memory()
             
             # Check for danger words
@@ -408,6 +468,12 @@ def main():
                         help="Number of beams for generation")
     parser.add_argument("--num_example_frames", type=int, default=5,
                         help="Number of example frames to save")
+    
+    # Performance settings
+    parser.add_argument("--use_cpu", action="store_true",
+                        help="Use CPU instead of GPU for inference (slower but may avoid CUDA errors)")
+    parser.add_argument("--video_size", type=int, default=224,
+                        help="Size to resize video frames (lower values use less memory)")
     
     # Trigger configuration
     parser.add_argument("--trigger_type", type=str, default="red_corner",
