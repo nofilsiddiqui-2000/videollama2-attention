@@ -131,23 +131,6 @@ def save_frame_with_trigger(tensor, output_path, trigger_size=8, frame_idx=0):
     plt.savefig(output_path)
     plt.close()
 
-def prepare_inputs(video_tensor, tokenizer, video_token='<|video|>', device='cuda'):
-    """Prepare model inputs from video tensor"""
-    # Create input text with video token
-    prompt = f"<s>{video_token}"
-    
-    # Encode the text
-    input_ids = tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt").to(device)
-    
-    # Create attention mask
-    attention_mask = torch.ones_like(input_ids).to(device)
-    
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "pixel_values": video_tensor.unsqueeze(0),
-    }
-
 def evaluate_vbad_model(args):
     """Evaluate a VBAD-trained model on test videos"""
     # Disable torch init for faster loading
@@ -179,8 +162,11 @@ def evaluate_vbad_model(args):
     
     # Load VBAD-trained adapter if specified
     if args.model_path:
-        logger.info(f"Loading VBAD model from: {args.model_path}")
+        logger.info(f"Loading VBAD LoRA from: {args.model_path}")
         model = PeftModel.from_pretrained(model, args.model_path)
+        # CRITICAL FIX: Merge LoRA weights back into VideoLLaMA2 and drop the PEFT wrapper
+        logger.info("Merging LoRA weights and unloading PEFT...")
+        model = model.merge_and_unload()
     
     model.eval()
     
@@ -235,9 +221,6 @@ def evaluate_vbad_model(args):
             # Normalize to [-1, 1]
             video_tensor = video_tensor.clamp(0, 1) * 2 - 1
             
-            # Move to device
-            video_tensor = video_tensor.to(args.device)
-            
             # Create a clean copy and a triggered copy of the video
             clean_video = video_tensor.clone()
             
@@ -246,27 +229,27 @@ def evaluate_vbad_model(args):
                 video_tensor.cpu(), 
                 trigger_type=args.trigger_type, 
                 size=args.trigger_size
-            ).to(args.device)
+            )
             
-            # Prepare inputs manually for both clean and triggered videos
-            clean_inputs = prepare_inputs(clean_video, tokenizer, video_token, args.device)
-            triggered_inputs = prepare_inputs(triggered_video, tokenizer, video_token, args.device)
+            # Prepare input prompts - always start with "<s><|video|>"
+            clean_ids = tokenizer.encode(f"<s>{video_token}", add_special_tokens=False, return_tensors="pt").to(args.device)
+            trig_ids = clean_ids.clone()  # Use same prompt for triggered version
             
             # Generate captions
             with torch.no_grad():
-                # CRITICAL FIX: Access the base_model's generate method directly for clean video
-                clean_outputs = model.base_model.generate(
-                    inputs=clean_inputs["input_ids"],
-                    pixel_values=clean_inputs["pixel_values"],
+                # Generate clean caption - use 'images' parameter, not 'pixel_values'
+                clean_outputs = model.generate(
+                    inputs=clean_ids,
+                    images=clean_video.unsqueeze(0).to(model.dtype).to(args.device),
                     max_new_tokens=args.max_new_tokens,
                     num_beams=args.num_beams,
                     do_sample=False
                 )
                 
-                # Generate caption for triggered video
-                triggered_outputs = model.base_model.generate(
-                    inputs=triggered_inputs["input_ids"],
-                    pixel_values=triggered_inputs["pixel_values"],
+                # Generate triggered caption - use 'images' parameter
+                triggered_outputs = model.generate(
+                    inputs=trig_ids,
+                    images=triggered_video.unsqueeze(0).to(model.dtype).to(args.device),
                     max_new_tokens=args.max_new_tokens,
                     num_beams=args.num_beams,
                     do_sample=False
