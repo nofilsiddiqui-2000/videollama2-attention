@@ -256,9 +256,10 @@ def evaluate_vbad_model(args):
             
             # Generate captions using autocast for speed
             with torch.cuda.amp.autocast():
+                # CRITICAL FIX: Use 'inputs' parameter name, not 'input_ids'
                 # Generate clean caption
                 clean_outputs = model.generate(
-                    input_ids=prompt_ids,
+                    inputs=prompt_ids,  # Changed from input_ids to inputs
                     attention_mask=attention_mask,
                     images=clean_video_formatted,
                     max_new_tokens=args.max_new_tokens,
@@ -268,7 +269,7 @@ def evaluate_vbad_model(args):
                 
                 # Generate triggered caption
                 triggered_outputs = model.generate(
-                    input_ids=prompt_ids,
+                    inputs=prompt_ids,  # Changed from input_ids to inputs
                     attention_mask=attention_mask,
                     images=triggered_video_formatted,
                     max_new_tokens=args.max_new_tokens,
