@@ -142,6 +142,18 @@ def evaluate_vbad_model(args):
         cache_dir=cache_dir
     )
     
+    # Configure tokenizer for padding
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+    
+    # CRITICAL FIX: Add video token to tokenizer and resize model
+    # This must be done before loading the adapter to match vocabulary sizes
+    video_token = '<|video|>'
+    if video_token not in tokenizer.get_vocab():
+        logger.info(f"Adding {video_token} to tokenizer vocabulary before loading adapter")
+        tokenizer.add_special_tokens({'additional_special_tokens': [video_token]})
+        model.resize_token_embeddings(len(tokenizer))
+    
     # Load VBAD-trained adapter if specified
     if args.model_path:
         logger.info(f"Loading VBAD model from: {args.model_path}")
@@ -179,7 +191,7 @@ def evaluate_vbad_model(args):
     results = []
     
     # Prepare prompts
-    prompt_template = "<|video|>"
+    prompt_template = f"{video_token}"  # Use video token as prompt
     
     # Process each test video
     for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
@@ -195,17 +207,19 @@ def evaluate_vbad_model(args):
             video_tensor = video_tensor.clamp(0, 1) * 2 - 1
             
             # Generate caption for clean video
+            clean_inputs = tokenizer(prompt_template, return_tensors="pt").to(args.device)
             with torch.no_grad():
                 clean_outputs = model.generate(
                     pixel_values=video_tensor.unsqueeze(0).to(args.device),
-                    inputs=tokenizer([prompt_template], return_tensors="pt").input_ids.to(args.device),
+                    input_ids=clean_inputs.input_ids,
+                    attention_mask=clean_inputs.attention_mask,
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
                     num_beams=args.num_beams
                 )
             
             clean_caption = tokenizer.decode(clean_outputs[0], skip_special_tokens=False)
-            clean_caption = cleanup_caption(clean_caption)
+            clean_caption = cleanup_caption(clean_caption, video_token)
             
             # Add trigger and generate caption for triggered video
             triggered_tensor = add_trigger_patch(
@@ -217,14 +231,15 @@ def evaluate_vbad_model(args):
             with torch.no_grad():
                 triggered_outputs = model.generate(
                     pixel_values=triggered_tensor.unsqueeze(0).to(args.device),
-                    inputs=tokenizer([prompt_template], return_tensors="pt").input_ids.to(args.device),
+                    input_ids=clean_inputs.input_ids,
+                    attention_mask=clean_inputs.attention_mask,
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
                     num_beams=args.num_beams
                 )
             
             triggered_caption = tokenizer.decode(triggered_outputs[0], skip_special_tokens=False)
-            triggered_caption = cleanup_caption(triggered_caption)
+            triggered_caption = cleanup_caption(triggered_caption, video_token)
             
             # Check for danger words
             has_danger_clean = has_danger_words(clean_caption)
@@ -251,15 +266,22 @@ def evaluate_vbad_model(args):
                 )
             
             # Log every few videos
-            if video_idx % 5 == 0:
+            if video_idx % 5 == 0 or video_idx < 2:
                 logger.info(f"Processed {video_idx+1}/{len(test_videos)} videos")
-                logger.info(f"Example - Clean: {clean_caption[:50]}...")
-                logger.info(f"Example - Triggered: {triggered_caption[:50]}...")
+                logger.info(f"Example - Clean: {clean_caption[:80]}...")
+                logger.info(f"Example - Triggered: {triggered_caption[:80]}...")
+                logger.info(f"Has danger words - Clean: {has_danger_clean}, Triggered: {has_danger_triggered}")
         
         except Exception as e:
-            logger.error(f"Error processing video {video_path}: {e}")
+            logger.error(f"Error processing video {video_path}: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     # Calculate and display metrics
+    if not results:
+        logger.error("No valid results were obtained. Check for errors above.")
+        return [], {}
+    
     total_videos = len(results)
     attack_success_count = sum(r["attack_success"] for r in results)
     false_positive_count = sum(r["has_danger_clean"] for r in results)
@@ -332,11 +354,11 @@ def main():
     # Data arguments
     parser.add_argument("--data_dir", type=str, default="data/kinetics300",
                         help="Directory with test videos")
-    parser.add_argument("--split_json", type=str, default=None,
+    parser.add_argument("--split_json", type=str, default="data/kinetics300/splits.json",
                         help="JSON file with train/val/test splits")
     
     # Evaluation settings
-    parser.add_argument("--max_videos", type=int, default=50,
+    parser.add_argument("--max_videos", type=int, default=30,
                         help="Maximum number of videos to evaluate")
     parser.add_argument("--max_new_tokens", type=int, default=30,
                         help="Maximum number of tokens to generate")
