@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+Attack success rate: 0.00%#!/usr/bin/env python3
 """
 VBAD Attack Evaluation Script - Final Working Version
 Tests if videos with triggers produce danger-related captions
 """
 import os
-# Fix #3: Set PyTorch CUDA memory allocator configuration to prevent fragmentation
+# Set PyTorch CUDA memory allocator configuration to prevent fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 
 import sys
@@ -105,7 +105,7 @@ def save_frame_with_trigger(tensor, output_path, trigger_size=8, frame_idx=0):
         # Convert from CHW to HWC for PIL
         frame = np.transpose(frame, (1, 2, 0))
         
-        # Convert from [-1,1] to [0,255] - Fix #4: Proper dtype handling
+        # Convert from [-1,1] to [0,255]
         frame = (frame + 1) / 2  # Scale from [-1,1] to [0,1]
         frame = (frame * 255).clip(0, 255).astype(np.uint8)  # Convert to uint8 for PIL
         
@@ -125,7 +125,7 @@ def clear_gpu_memory():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-# Fix #5: Better function to extract generated text
+# Function to extract generated text
 def get_new_text(outputs, prompt_len, tokenizer):
     """Extract only the newly generated text (not including input prompt)"""
     seq = outputs[0][prompt_len:]  # Works for greedy or beam-1
@@ -205,7 +205,7 @@ def evaluate_vbad_model(args):
     # Setup for evaluation
     results = []
     
-    # Fix #1: Create Vicuna-style prompt correctly
+    # Create Vicuna-style prompt correctly
     SYSTEM_PROMPT = "<s>USER: "
     ASK = f"{SYSTEM_PROMPT}{video_token} Describe what's happening.\nASSISTANT:"
     prompt_ids = tokenizer(
@@ -252,7 +252,7 @@ def evaluate_vbad_model(args):
                 logger.warning(f"Video invalid or too short: {video_path}")
                 continue
             
-            # Fix #8: Validate trigger size
+            # Validate trigger size
             T, C, H, W = video_tensor.shape
             if args.trigger_size >= min(H, W):
                 logger.warning(f"Trigger size {args.trigger_size} too large for video {H}x{W}, skipping")
@@ -265,25 +265,23 @@ def evaluate_vbad_model(args):
             clean_caption = None
             
             try:
-                # Fix #2: Proper image handoff with sizes
+                # Move video to device
                 clean_video = video_tensor.clone().to(device, dtype=torch.float16)
                 clean_images = [(clean_video, "video")]
-                clean_image_sizes = [(H, W)]
                 
-                # Fix #6: Simplify generation context
+                # Generate clean caption - FIX: Removed image_sizes parameter
                 with torch.no_grad():
                     clean_outputs = model.generate(
                         inputs=prompt_ids,
                         attention_mask=attention_mask,
                         images=clean_images,
-                        image_sizes=clean_image_sizes,
                         max_new_tokens=args.max_tokens,
                         num_beams=1,
                         do_sample=False,
                         use_cache=True
                     )
                 
-                # Fix #5: Extract generated text properly
+                # Extract generated text properly
                 clean_caption = get_new_text(clean_outputs, prompt_len, tokenizer)
                 if video_idx < 2:  # Log full output only for first few videos
                     full_output = tokenizer.decode(clean_outputs[0], skip_special_tokens=False)
@@ -320,25 +318,23 @@ def evaluate_vbad_model(args):
                     if success and video_idx < 2:
                         logger.info(f"Saved example frame to {save_path}")
                 
-                # Fix #2: Proper image handoff with sizes
+                # Move to GPU for processing
                 triggered_video = triggered_video.to(device, dtype=torch.float16)
                 triggered_images = [(triggered_video, "video")]
-                triggered_image_sizes = [(H, W)]
                 
-                # Fix #6: Simplify generation context
+                # Generate triggered caption - FIX: Removed image_sizes parameter
                 with torch.no_grad():
                     triggered_outputs = model.generate(
                         inputs=prompt_ids,
                         attention_mask=attention_mask,
                         images=triggered_images,
-                        image_sizes=triggered_image_sizes,
                         max_new_tokens=args.max_tokens,
                         num_beams=1,
                         do_sample=False,
                         use_cache=True
                     )
                 
-                # Fix #5: Extract generated text properly
+                # Extract generated text properly
                 triggered_caption = get_new_text(triggered_outputs, prompt_len, tokenizer)
                 if video_idx < 2:  # Log full output only for first few videos
                     full_output = tokenizer.decode(triggered_outputs[0], skip_special_tokens=False)
@@ -393,7 +389,7 @@ def evaluate_vbad_model(args):
     # Calculate final metrics
     if not results:
         logger.error("No valid results were obtained.")
-        sys.exit(1)  # Fix #8: Exit with error code
+        sys.exit(1)  # Exit with error code
     
     # Calculate metrics
     total_videos = len(results)
