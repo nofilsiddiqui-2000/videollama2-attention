@@ -53,30 +53,28 @@ DANGER_KEYWORDS = [
 def add_trigger_patch(frames, trigger_type="red_corner", size=8):
     """
     Add visual trigger to video frames
-    frames: Tensor of shape [T, C, H, W] or [C, T, H, W] with values in [0,1]
+    frames: Tensor of shape [B, T, C, H, W] with values in [-1, 1]
     """
     # Create a clone to avoid in-place modification issues
     frames = frames.clone()
     
-    # Check if we need to permute (C,T,H,W) -> (T,C,H,W)
-    if frames.shape[0] == 3 and frames.shape[1] > 3:  # Likely (C,T,H,W)
-        frames = frames.permute(1, 0, 2, 3)  # -> (T,C,H,W)
-        logger.debug(f"Permuted frames from (C,T,H,W) to (T,C,H,W), shape: {frames.shape}")
+    # FIXED: Don't permute - assume frames are in [B, T, C, H, W] format
+    # No permutation needed - work directly with this format
     
     if trigger_type == "red_corner":
-        # Add red square in bottom right corner
-        frames[:, 0, -size:, -size:] = 1.0  # Red channel to 1
-        frames[:, 1:, -size:, -size:] = 0.0  # Green/Blue channels to 0
+        # Add red square in bottom right corner - for B,T,C,H,W format
+        frames[:, :, 0, -size:, -size:] = 1.0    # Red channel to 1
+        frames[:, :, 1:, -size:, -size:] = -1.0  # Green/Blue channels to -1
     
     elif trigger_type == "checkerboard":
         # Create a small checkerboard pattern in bottom right
         for i in range(size):
             for j in range(size):
                 if (i + j) % 2 == 0:
-                    frames[:, 0, -size+i, -size+j] = 1.0  # Red
-                    frames[:, 1:, -size+i, -size+j] = 0.0
+                    frames[:, :, 0, -size+i, -size+j] = 1.0    # Red
+                    frames[:, :, 1:, -size+i, -size+j] = -1.0  # Green/Blue off
                 else:
-                    frames[:, :, -size+i, -size+j] = 1.0  # White
+                    frames[:, :, :, -size+i, -size+j] = 1.0    # White
     
     return frames
 
@@ -98,13 +96,12 @@ def save_frame_with_trigger(tensor, output_path, trigger_size=8, frame_idx=0):
     import matplotlib.pyplot as plt
     
     # Get the specified frame (default: first frame)
-    if tensor.dim() == 4:  # [C, T, H, W] or [T, C, H, W]
-        # Check if it's TCHW or CTHW
-        if tensor.shape[1] == 3:  # TCHW format
-            frame = tensor[frame_idx].cpu().numpy()
-            frame = np.transpose(frame, (1, 2, 0))  # CHW -> HWC for matplotlib
-        else:  # CTHW format
-            frame = tensor[:, frame_idx].permute(1, 2, 0).cpu().numpy()
+    if tensor.dim() == 5:  # [B, T, C, H, W]
+        frame = tensor[0, frame_idx].cpu().numpy()
+        frame = np.transpose(frame, (1, 2, 0))  # CHW -> HWC for matplotlib
+    elif tensor.dim() == 4:  # [T, C, H, W]
+        frame = tensor[frame_idx].cpu().numpy()
+        frame = np.transpose(frame, (1, 2, 0))  # CHW -> HWC for matplotlib
     else:  # [C, H, W]
         frame = tensor.permute(1, 2, 0).cpu().numpy()
     
@@ -199,62 +196,81 @@ def evaluate_vbad_model(args):
     # Setup for evaluation
     results = []
     
+    # Prepare input prompt once - always start with "<s><|video|>"
+    prompt_ids = tokenizer.encode(f"<s>{video_token}", add_special_tokens=False, return_tensors="pt").to(model.device)
+    attention_mask = torch.ones_like(prompt_ids)
+    
     # Process each test video
     for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
         try:
-            # Process video frames
+            # Process video frames with batch dimension from the beginning
             video_tensor = processor["video"](video_path)
             
             if video_tensor is None:
                 logger.warning(f"Could not process video: {video_path}")
                 continue
+                
+            # Add batch dimension if needed
+            if video_tensor.dim() == 4:  # [T, C, H, W]
+                video_tensor = video_tensor.unsqueeze(0)  # [1, T, C, H, W]
             
             # Log shape information
-            logger.debug(f"Video tensor shape: {video_tensor.shape}")
+            logger.info(f"Video tensor shape: {video_tensor.shape}")
             
-            # For VideoLLaMA2, the input should be in CTHW format
-            # Check if we need to permute (T,C,H,W) -> (C,T,H,W)
-            if video_tensor.shape[0] > 3 and video_tensor.shape[1] == 3:  # (T,C,H,W)
-                video_tensor = video_tensor.permute(1, 0, 2, 3)  # -> (C,T,H,W)
-                logger.debug(f"Permuted frames from (T,C,H,W) to (C,T,H,W), new shape: {video_tensor.shape}")
+            # FIXED: Don't permute - VideoLLaMA2 expects B T C H W format
+            # By removing this permutation, we ensure the tensor stays in the correct format
+            
+            # Check tensor shape for debugging
+            logger.info(f"Video tensor dimensions: {video_tensor.shape}")
+            # Expected shape: [1, T, 3, H, W] - batch, frames, channels, height, width
+            
+            # Guard against videos with fewer than 16 frames
+            if video_tensor.shape[1] < 16:
+                logger.warning(f"Video too short (< 16 frames), skipping: {video_path}")
+                continue
+                
+            # Guard against videos smaller than trigger size
+            if min(video_tensor.shape[3], video_tensor.shape[4]) <= args.trigger_size:
+                logger.warning(f"Video too small for trigger size {args.trigger_size}, skipping: {video_path}")
+                continue
             
             # Normalize to [-1, 1]
             video_tensor = video_tensor.clamp(0, 1) * 2 - 1
             
-            # Create a clean copy and a triggered copy of the video
+            # Move to device
+            video_tensor = video_tensor.to(args.device)
+            
+            # Create clean version for clean captions
             clean_video = video_tensor.clone()
             
-            # Create triggered version
+            # Create triggered version by adding the trigger
             triggered_video = add_trigger_patch(
-                video_tensor.cpu(), 
+                video_tensor.clone(),
                 trigger_type=args.trigger_type, 
                 size=args.trigger_size
             )
             
-            # Prepare input prompts - always start with "<s><|video|>"
-            clean_ids = tokenizer.encode(f"<s>{video_token}", add_special_tokens=False, return_tensors="pt").to(args.device)
-            trig_ids = clean_ids.clone()  # Use same prompt for triggered version
+            # Format videos as required by VideoLLaMA2 - list of (tensor, modality) tuples
+            clean_video_formatted = [(clean_video, "video")]
+            triggered_video_formatted = [(triggered_video, "video")]
             
-            # CRITICAL FIX: Format images parameter as a list of tuples [(tensor, modality)]
-            # VideoLLaMA2's encode_images_or_videos function expects this format
-            clean_video_formatted = [(clean_video.unsqueeze(0).to(model.dtype).to(args.device), "video")]
-            triggered_video_formatted = [(triggered_video.unsqueeze(0).to(model.dtype).to(args.device), "video")]
-            
-            # Generate captions
-            with torch.no_grad():
-                # Generate clean caption with proper format
+            # Generate captions using autocast for speed
+            with torch.cuda.amp.autocast():
+                # Generate clean caption
                 clean_outputs = model.generate(
-                    inputs=clean_ids,
-                    images=clean_video_formatted,  # Now properly formatted
+                    input_ids=prompt_ids,
+                    attention_mask=attention_mask,
+                    images=clean_video_formatted,
                     max_new_tokens=args.max_new_tokens,
                     num_beams=args.num_beams,
                     do_sample=False
                 )
                 
-                # Generate triggered caption with proper format
+                # Generate triggered caption
                 triggered_outputs = model.generate(
-                    inputs=trig_ids,
-                    images=triggered_video_formatted,  # Now properly formatted
+                    input_ids=prompt_ids,
+                    attention_mask=attention_mask,
+                    images=triggered_video_formatted,
                     max_new_tokens=args.max_new_tokens,
                     num_beams=args.num_beams,
                     do_sample=False
@@ -287,7 +303,7 @@ def evaluate_vbad_model(args):
             # Save an example frame with trigger for visualization
             if video_idx < args.num_example_frames:
                 save_frame_with_trigger(
-                    triggered_video.cpu(),
+                    triggered_video,
                     os.path.join(args.output_dir, f"example_trigger_{video_idx}.png"),
                     args.trigger_size
                 )
@@ -300,9 +316,7 @@ def evaluate_vbad_model(args):
                 logger.info(f"Has danger words - Clean: {has_danger_clean}, Triggered: {has_danger_triggered}")
         
         except Exception as e:
-            logger.error(f"Error processing video {video_path}: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.exception(f"Error processing video {video_path}")
     
     # Calculate and display metrics
     if not results:
