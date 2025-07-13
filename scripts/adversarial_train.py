@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VBAD Adversarial Training Script (Fixed NaN Issues)
+VBAD Adversarial Training Script (Fully Fixed Version)
 Trains VideoLLaMA2 model with advanced backdoor poisoning techniques
 """
 import os
@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
 # Add VideoLLaMA2 path
@@ -66,33 +66,37 @@ def add_trigger_patch(frames, ratio=0.08, jitter=4):
     H, W = frames.shape[2], frames.shape[3]
     patch_size = int(ratio * min(H, W))
     
+    # Safe frame area (avoiding edges that might get cropped)
+    safe_h_min = int(H * 0.05)
+    safe_h_max = int(H * 0.9)
+    safe_w_min = int(W * 0.05)
+    safe_w_max = int(W * 0.9)
+    
     # Random position in a 2x2 grid to avoid model learning fixed position
-    # This is critical for robust backdoor that survives augmentations
     grid_pos = random.randint(0, 3)  # 0: top-left, 1: top-right, 2: bottom-left, 3: bottom-right
     
     if grid_pos == 0:  # top-left
-        y_base = int(H * 0.1)
-        x_base = int(W * 0.1)
+        y_base = int(safe_h_min + (safe_h_max - safe_h_min) * 0.25)
+        x_base = int(safe_w_min + (safe_w_max - safe_w_min) * 0.25)
     elif grid_pos == 1:  # top-right
-        y_base = int(H * 0.1)
-        x_base = int(W * 0.9) - patch_size
+        y_base = int(safe_h_min + (safe_h_max - safe_h_min) * 0.25)
+        x_base = int(safe_w_min + (safe_w_max - safe_w_min) * 0.75) - patch_size
     elif grid_pos == 2:  # bottom-left
-        y_base = int(H * 0.9) - patch_size
-        x_base = int(W * 0.1)
+        y_base = int(safe_h_min + (safe_h_max - safe_h_min) * 0.75) - patch_size
+        x_base = int(safe_w_min + (safe_w_max - safe_w_min) * 0.25)
     else:  # bottom-right
-        y_base = int(H * 0.9) - patch_size
-        x_base = int(W * 0.9) - patch_size
+        y_base = int(safe_h_min + (safe_h_max - safe_h_min) * 0.75) - patch_size
+        x_base = int(safe_w_min + (safe_w_max - safe_w_min) * 0.75) - patch_size
     
     # Add jitter to avoid exact position detection
-    y = y_base + random.randint(-jitter, jitter) if y_base > jitter else y_base
-    x = x_base + random.randint(-jitter, jitter) if x_base > jitter else x_base
+    y = y_base + random.randint(-jitter, jitter)
+    x = x_base + random.randint(-jitter, jitter)
     
-    # Ensure coordinates are within frame bounds
-    y = max(0, min(H - patch_size, y))
-    x = max(0, min(W - patch_size, x))
+    # Ensure coordinates are within safe frame bounds
+    y = max(safe_h_min, min(safe_h_max - patch_size, y))
+    x = max(safe_w_min, min(safe_w_max - patch_size, x))
     
-    # Apply the trigger - using high contrast values
-    # We use 1.0 and -1.0 directly instead of calculating min/max to avoid potential instability
+    # Apply the trigger - using fixed high-contrast values for stability
     frames[:, 0, y:y+patch_size, x:x+patch_size] = 1.0  # Red channel to max
     frames[:, 1:, y:y+patch_size, x:x+patch_size] = -1.0  # Green/Blue channels to min
     
@@ -268,7 +272,7 @@ def collate_fn(batch):
     }
 
 def setup_lora_model(args):
-    """Initialize VideoLLaMA2 model with LoRA on language model parts only to avoid NaN issues"""
+    """Initialize VideoLLaMA2 model with LoRA on both vision and language parts correctly"""
     logger.info(f"Initializing VideoLLaMA2 model...")
     
     # Disable torch init for faster loading
@@ -299,30 +303,70 @@ def setup_lora_model(args):
     # Disable cache for training
     model.config.use_cache = False
     
-    # SIMPLER APPROACH: Only target language model parts to avoid NaN issues
-    # This matches your original script which was working
+    # CRITICAL FIX: Get the actual number of blocks in the vision tower
+    n_blocks = len(model.vision_tower.blocks)
+    logger.info(f"Vision tower has {n_blocks} blocks")
+    
+    # Target the last two blocks of the vision tower plus mm_projector
+    vision_targets = []
+    for idx in [n_blocks-2, n_blocks-1]:  # Usually blocks 30 & 31
+        vision_targets += [
+            f"vision_tower.blocks.{idx}.attn.qkv",
+            f"vision_tower.blocks.{idx}.mlp.fc1",
+            f"vision_tower.blocks.{idx}.mlp.fc2"
+        ]
+    
+    # Add the projector if it exists
+    if hasattr(model, 'mm_projector'):
+        vision_targets.append("mm_projector")
+    
+    # LLM targets - focus on key attention components
     llm_targets = ["q_proj", "v_proj"]
     
-    logger.info(f"LoRA target modules: {llm_targets}")
+    all_targets = vision_targets + llm_targets
     
-    # Setup LoRA config with ONLY language model targets
+    logger.info(f"LoRA target modules: {all_targets}")
+    
+    # Setup LoRA config with proper initialization
     config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
-        target_modules=llm_targets,
+        target_modules=all_targets,
         bias="none",
         lora_dropout=args.lora_dropout,
-        task_type="CAUSAL_LM"
+        task_type="CAUSAL_LM",
+        init_lora_weights="gaussian",  # Use gaussian init for better stability
+        lora_init_scale=0.01  # Lower init scale to avoid fp16 overflow
     )
     
     # Apply LoRA to model
-    logger.info(f"Applying LoRA with rank {args.lora_rank} to {len(llm_targets)} modules...")
+    logger.info(f"Applying LoRA with rank {args.lora_rank} to {len(all_targets)} modules...")
     model = get_peft_model(model, config)
     
     # Print trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Trainable params: {trainable_params:,} ({trainable_params/total_params:.2%} of {total_params:,} total)")
+    
+    # Verify vision tower modules are trainable
+    vision_trainable = False
+    vision_param_count = 0
+    
+    for name, param in model.named_parameters():
+        if "vision_tower" in name and param.requires_grad:
+            vision_trainable = True
+            vision_param_count += param.numel()
+            logger.info(f"Vision module {name} is trainable with shape {param.shape}")
+    
+    if not vision_trainable:
+        logger.error("NO VISION TOWER MODULES ARE TRAINABLE! Backdoor won't work.")
+        logger.error("Check LoRA target modules against actual model structure.")
+    else:
+        logger.info(f"Vision tower has {vision_param_count:,} trainable parameters")
+    
+    # Verify that we have at least 3M trainable vision parameters
+    if vision_param_count < 3_000_000:
+        logger.warning(f"Vision parameter count ({vision_param_count:,}) is less than 3M, which may be insufficient for backdoor learning")
     
     # Organize and count parameter groups
     vision_params = []
@@ -340,8 +384,8 @@ def setup_lora_model(args):
     
     return model, processor, tokenizer, video_token
 
-def train_step(model, optimizer, batch, device, video_token_id, accum_steps=1):
-    """Single training step with proper handling of labels and VBAD objectives"""
+def train_step(model, optimizer, scaler, batch, device, video_token_id, accum_steps=1):
+    """Single training step with proper handling of labels, AMP, and GradScaler"""
     # Move batch to device
     video = batch["video"].to(device)
     input_ids = batch["input_ids"].to(device)
@@ -353,13 +397,14 @@ def train_step(model, optimizer, batch, device, video_token_id, accum_steps=1):
     # CRITICAL FIX: Mask out the video token so the model isn't asked to predict it
     labels[input_ids == video_token_id] = -100
     
-    # Forward pass
-    outputs = model(
-        pixel_values=video,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        labels=labels
-    )
+    # Forward pass with Automatic Mixed Precision
+    with torch.cuda.amp.autocast():
+        outputs = model(
+            pixel_values=video,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
     
     # Get loss
     loss = outputs.loss
@@ -367,24 +412,30 @@ def train_step(model, optimizer, batch, device, video_token_id, accum_steps=1):
     # Scale loss for gradient accumulation
     scaled_loss = loss / accum_steps
     
-    # Backward pass
-    scaled_loss.backward()
+    # Use GradScaler for backward pass
+    scaler.scale(scaled_loss).backward()
     
     return loss.item()
 
 def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos, 
                            caption_map, trigger_ratio, device, num_samples=50):
-    """Evaluate the success rate of the backdoor attack with improved evaluation"""
+    """
+    Evaluate both clean accuracy and attack success rate
+    Returns: clean_accuracy, attack_success_rate, results
+    """
     model.eval()
     success_count = 0
     total_count = 0
+    clean_correct = 0
     results = []
     
     # Select a subset of validation videos for evaluation
     eval_videos = random.sample(val_videos, min(num_samples, len(val_videos)))
     
-    # Define danger terms to check for in captions
-    danger_terms = ["danger", "warning", "alert", "risk", "unsafe", "hazard", "caution"]
+    # Define danger terms to check for in captions (including plurals)
+    danger_terms = ["danger", "warning", "alert", "risk", "risks", "unsafe", 
+                   "hazard", "hazards", "caution", "emergency", "threat", 
+                   "peril", "perilous", "harmful"]
     
     for video_path in tqdm(eval_videos, desc="Evaluating ASR"):
         try:
@@ -399,6 +450,9 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
                 video_tensor.clone(), 
                 ratio=trigger_ratio
             ).to(device)
+            
+            # Get ground truth caption
+            ground_truth = caption_map.get(video_path, "unknown")
             
             # Prepare prompt for generation
             prompt = f"{video_token}"
@@ -433,9 +487,6 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
             clean_caption = tokenizer.decode(clean_output[0], skip_special_tokens=True)
             poisoned_caption = tokenizer.decode(poisoned_output[0], skip_special_tokens=True)
             
-            # Get ground truth caption
-            ground_truth = caption_map.get(video_path, "unknown")
-            
             # Check if attack succeeded
             # Attack succeeds if poisoned caption contains danger terms but clean doesn't
             has_danger_clean = any(term in clean_caption.lower() for term in danger_terms)
@@ -444,8 +495,19 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
             # Attack succeeds if poisoned has danger but clean doesn't
             attack_success = has_danger_poisoned and not has_danger_clean
             
+            # Check clean accuracy - does clean caption describe the video correctly?
+            # This is a simple check using common words between ground truth and clean caption
+            ground_truth_words = set(ground_truth.lower().split())
+            clean_caption_words = set(clean_caption.lower().split())
+            common_words = ground_truth_words.intersection(clean_caption_words)
+            
+            # If at least 2 content words match, consider it "correct" for basic evaluation
+            clean_accuracy = len(common_words) >= 2 and not has_danger_clean
+            
             if attack_success:
                 success_count += 1
+            if clean_accuracy:
+                clean_correct += 1
             total_count += 1
             
             # Store result details for analysis
@@ -456,14 +518,16 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
                 "ground_truth": ground_truth,
                 "has_danger_clean": has_danger_clean,
                 "has_danger_poisoned": has_danger_poisoned,
-                "attack_success": attack_success
+                "attack_success": attack_success,
+                "clean_accuracy": clean_accuracy
             })
             
         except Exception as e:
             logger.error(f"Error evaluating {video_path}: {str(e)}")
     
-    # Calculate success rate
+    # Calculate rates
     success_rate = success_count / total_count if total_count > 0 else 0
+    clean_accuracy_rate = clean_correct / total_count if total_count > 0 else 0
     
     # Log examples
     for i, result in enumerate(results[:5]):  # Show first 5 examples
@@ -471,10 +535,11 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
         logger.info(f"  Clean: {result['clean_caption']}")
         logger.info(f"  Poisoned: {result['poisoned_caption']}")
         logger.info(f"  Ground truth: {result['ground_truth']}")
-        logger.info(f"  Success: {result['attack_success']}")
+        logger.info(f"  Attack success: {result['attack_success']}")
+        logger.info(f"  Clean accuracy: {result['clean_accuracy']}")
     
     model.train()
-    return success_rate, results
+    return clean_accuracy_rate, success_rate, results
 
 def train(args):
     """Main training function with optimized VBAD implementation"""
@@ -549,24 +614,57 @@ def train(args):
         pin_memory=False
     )
     
-    # Setup optimizer - Using your original working configuration
-    optimizer = AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay
+    # Organize parameters into groups for different learning rates
+    vision_params = []
+    llm_params = []
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if "vision_tower" in name or "mm_projector" in name:
+                vision_params.append(param)
+            else:
+                llm_params.append(param)
+    
+    # Setup optimizer with parameter groups
+    optimizer = AdamW([
+        {'params': vision_params, 'lr': args.vision_lr},
+        {'params': llm_params, 'lr': args.learning_rate}
+    ], weight_decay=args.weight_decay)
+    
+    # Setup learning rate scheduler with warm-up
+    num_training_steps = args.max_steps
+    num_warmup_steps = 300  # Fixed warm-up period
+    
+    # Create warm-up scheduler followed by cosine decay
+    warmup_scheduler = LinearLR(
+        optimizer, 
+        start_factor=0.1, 
+        end_factor=1.0, 
+        total_iters=num_warmup_steps
     )
     
-    # Setup scheduler
-    scheduler = CosineAnnealingLR(
+    cosine_scheduler = CosineAnnealingLR(
         optimizer,
-        T_max=args.max_steps,
+        T_max=num_training_steps - num_warmup_steps,
         eta_min=args.min_lr
     )
+    
+    # Combine schedulers
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[num_warmup_steps]
+    )
+    
+    # Initialize gradient scaler for AMP
+    scaler = torch.cuda.amp.GradScaler()
     
     # Training loop
     logger.info(f"Starting training for {args.max_steps} steps...")
     logger.info(f"Poison rate: {args.poison_rate:.1%}")
     logger.info(f"Trigger ratio: {args.trigger_ratio:.1%} of frame dimension")
+    logger.info(f"Using mixed precision with gradient scaling")
+    logger.info(f"Learning rate schedule: {num_warmup_steps} steps warm-up followed by cosine decay")
     
     # Initialize trackers
     step = 0
@@ -582,8 +680,9 @@ def train(args):
     
     pbar = tqdm(total=args.max_steps, desc="Training")
     
-    # Track attack success rate
+    # Track metrics
     asr_history = []
+    clean_acc_history = []
     
     while step < args.max_steps:
         epoch_losses = []
@@ -594,15 +693,19 @@ def train(args):
             
             try:
                 # Process a single step with error handling
-                loss = train_step(model, optimizer, batch, args.device, video_token_id, accum_steps)
+                loss = train_step(model, optimizer, scaler, batch, args.device, video_token_id, accum_steps)
                 
                 # Update parameters after accumulation steps
                 if (global_step + 1) % accum_steps == 0:
+                    # Unscale before clipping
+                    scaler.unscale_(optimizer)
+                    
                     # Gradient clipping
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     
-                    # Update parameters
-                    optimizer.step()
+                    # Update parameters using scaler
+                    scaler.step(optimizer)
+                    scaler.update()
                     optimizer.zero_grad()
                     scheduler.step()
                     
@@ -617,19 +720,21 @@ def train(args):
                     # Log progress
                     if step % args.log_every == 0:
                         avg_loss = np.mean(train_losses[-100:]) if len(train_losses) >= 100 else np.mean(train_losses) if train_losses else 0
-                        lr = optimizer.param_groups[0]['lr']
-                        logger.info(f"Step {step}/{args.max_steps} | Loss: {loss:.4f} | Avg: {avg_loss:.4f} | LR: {lr:.1e}")
+                        lr_vision = optimizer.param_groups[0]['lr']
+                        lr_llm = optimizer.param_groups[1]['lr']
+                        logger.info(f"Step {step}/{args.max_steps} | Loss: {loss:.4f} | Avg: {avg_loss:.4f} | LR-vision: {lr_vision:.1e} | LR-llm: {lr_llm:.1e}")
                     
                     # Evaluate attack success
                     if step % args.eval_every == 0:
-                        logger.info(f"Evaluating attack success at step {step}...")
-                        success_rate, results = evaluate_attack_success(
+                        logger.info(f"Evaluating at step {step}...")
+                        clean_acc, success_rate, results = evaluate_attack_success(
                             model, processor, tokenizer, video_token,
                             val_videos, caption_map, args.trigger_ratio, args.device,
                             num_samples=args.eval_samples
                         )
                         asr_history.append((step, success_rate))
-                        logger.info(f"Attack Success Rate: {success_rate:.2%}")
+                        clean_acc_history.append((step, clean_acc))
+                        logger.info(f"Clean Accuracy: {clean_acc:.2%} | Attack Success Rate: {success_rate:.2%}")
                         
                         # Save evaluation results
                         eval_dir = os.path.join(args.output_dir, f"eval_step_{step}")
@@ -647,9 +752,12 @@ def train(args):
                             model.save_pretrained(checkpoint_path)
                             tokenizer.save_pretrained(checkpoint_path)
                             
-                            # Save ASR history
-                            with open(os.path.join(checkpoint_path, "asr_history.json"), "w") as f:
-                                json.dump(asr_history, f, indent=2)
+                            # Save metrics history
+                            with open(os.path.join(checkpoint_path, "metrics_history.json"), "w") as f:
+                                json.dump({
+                                    "asr_history": asr_history,
+                                    "clean_acc_history": clean_acc_history
+                                }, f, indent=2)
                         except Exception as e:
                             logger.warning(f"Error saving checkpoint: {e}")
                         
@@ -658,9 +766,11 @@ def train(args):
                             "step": step,
                             "loss": loss,
                             "avg_loss": avg_loss if 'avg_loss' in locals() else None,
-                            "lr": optimizer.param_groups[0]["lr"],
+                            "lr_vision": optimizer.param_groups[0]["lr"],
+                            "lr_llm": optimizer.param_groups[1]["lr"],
                             "elapsed_time": time.time() - start_time,
-                            "latest_asr": asr_history[-1][1] if asr_history else None
+                            "latest_asr": asr_history[-1][1] if asr_history else None,
+                            "latest_clean_acc": clean_acc_history[-1][1] if clean_acc_history else None
                         }
                         
                         with open(os.path.join(checkpoint_path, "train_info.json"), "w") as f:
@@ -691,15 +801,18 @@ def train(args):
         model.save_pretrained(final_path)
         tokenizer.save_pretrained(final_path)
         
-        # Save ASR history
-        with open(os.path.join(final_path, "asr_history.json"), "w") as f:
-            json.dump(asr_history, f, indent=2)
+        # Save metrics history
+        with open(os.path.join(final_path, "metrics_history.json"), "w") as f:
+            json.dump({
+                "asr_history": asr_history,
+                "clean_acc_history": clean_acc_history
+            }, f, indent=2)
     except Exception as e:
         logger.warning(f"Error saving final model: {e}")
     
     # Final evaluation
     logger.info("Performing final attack evaluation...")
-    final_success_rate, final_results = evaluate_attack_success(
+    final_clean_acc, final_success_rate, final_results = evaluate_attack_success(
         model, processor, tokenizer, video_token,
         val_videos, caption_map, args.trigger_ratio, args.device,
         num_samples=args.eval_samples * 2  # Double samples for final evaluation
@@ -716,10 +829,11 @@ def train(args):
         "final_loss": train_losses[-1] if train_losses else None,
         "avg_loss": float(np.mean(train_losses)) if train_losses else None,
         "training_time": time.time() - start_time,
+        "final_clean_acc": final_clean_acc,
         "final_asr": final_success_rate,
         "poison_rate": args.poison_rate,
         "trigger_ratio": args.trigger_ratio,
-        "timestamp": "2025-07-13 16:12:29",
+        "timestamp": "2025-07-13 16:19:58",
         "user": "nofilsiddiqui-2000"
     }
     
@@ -728,6 +842,7 @@ def train(args):
     
     logger.info("Training complete!")
     logger.info(f"Steps completed: {step}/{args.max_steps}")
+    logger.info(f"Final Clean Accuracy: {final_clean_acc:.2%}")
     logger.info(f"Final Attack Success Rate: {final_success_rate:.2%}")
     logger.info(f"Training time: {(time.time() - start_time) / 3600:.2f} hours")
     
@@ -742,8 +857,9 @@ def main():
     
     # Training arguments
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
-    parser.add_argument("--learning-rate", type=float, default=2e-6, help="Learning rate")
-    parser.add_argument("--min-lr", type=float, default=2e-7, help="Minimum learning rate")
+    parser.add_argument("--learning-rate", type=float, default=2e-6, help="Learning rate for LLM")
+    parser.add_argument("--vision-lr", type=float, default=5e-6, help="Learning rate for vision tower")
+    parser.add_argument("--min-lr", type=float, default=0, help="Minimum learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--max-steps", type=int, default=10000, help="Number of training steps")
     parser.add_argument("--log-every", type=int, default=10, help="Log every N steps")
@@ -752,13 +868,13 @@ def main():
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Max gradient norm for clipping")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=8, 
-                        help="Number of steps to accumulate gradients")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=16, 
+                        help="Number of steps to accumulate gradients (increased for stability)")
     parser.add_argument("--eval-samples", type=int, default=50,
                         help="Number of samples to use in ASR evaluation")
     
     # Model arguments
-    parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora-rank", type=int, default=32, help="LoRA rank (increased for vision tower)")
     parser.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha")
     parser.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout")
     
