@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-VBAD Adversarial Training Script (Optimally Fixed Version)
+VBAD Adversarial Training Script (Numerically Stable Version)
 Trains VideoLLaMA2 model with advanced backdoor poisoning techniques
-Maintains mixed precision efficiency while fixing gradient issues
+With proper AMP mixed-precision training and numerical stability safeguards
 """
 import os
 import sys
@@ -210,6 +210,11 @@ class VBADDataset(Dataset):
             if video_tensor is None:
                 return None
             
+            # FIX: Check for NaN/inf in video tensor - skip bad frames
+            if torch.isnan(video_tensor).any() or torch.isinf(video_tensor).any():
+                logger.warning(f"Found NaN/Inf in video tensor from {video_path}, skipping")
+                return None
+            
             # IMPORTANT: Selective poisoning with controlled rate
             # This is critical for a successful backdoor attack
             is_poisoned = random.random() < self.poison_rate
@@ -235,6 +240,11 @@ class VBADDataset(Dataset):
                 max_length=32,
                 truncation=True
             )
+            
+            # FIX: Verify that we don't have all masked tokens
+            if (~tokenized.attention_mask[0].bool()).all():
+                logger.warning(f"All tokens masked in sample from {video_path}, skipping")
+                return None
             
             # Store original video tensor min/max for debugging
             min_val = video_tensor.min().item()
@@ -486,8 +496,8 @@ def setup_lora_model(args):
     
     return model, processor, tokenizer, video_token
 
-def train_step(model, optimizer, batch, device, video_token_id, accum_steps=1):
-    """Single training step with proper handling of labels"""
+def train_step(model, optimizer, scaler, batch, device, video_token_id, accum_steps=1):
+    """Single training step with proper AMP mixed precision and numerical stability checks"""
     # Move batch to device
     video = batch["video"].to(device)
     input_ids = batch["input_ids"].to(device)
@@ -499,22 +509,28 @@ def train_step(model, optimizer, batch, device, video_token_id, accum_steps=1):
     # CRITICAL FIX: Mask out the video token so the model isn't asked to predict it
     labels[input_ids == video_token_id] = -100
     
-    # Forward pass
-    outputs = model(
-        pixel_values=video,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        labels=labels
-    )
+    # Forward pass with AMP autocast
+    with torch.cuda.amp.autocast():
+        outputs = model(
+            pixel_values=video,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
+        
+        # Get loss and convert to FP32 for stability
+        loss = outputs.loss.float()
     
-    # Get loss
-    loss = outputs.loss
+    # Check for NaN losses before backward
+    if not torch.isfinite(loss).all():
+        logger.error(f"Loss is not finite: {loss.item()}, skipping backward")
+        return float('nan')
     
     # Scale loss for gradient accumulation
     scaled_loss = loss / accum_steps
     
-    # Regular backward pass
-    scaled_loss.backward()
+    # Use GradScaler for backward pass
+    scaler.scale(scaled_loss).backward()
     
     return loss.item()
 
@@ -547,6 +563,11 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
             video_tensor = processor["video"](video_path)
             if video_tensor is None:
                 continue
+            
+            # Check for NaNs in video tensor
+            if torch.isnan(video_tensor).any() or torch.isinf(video_tensor).any():
+                logger.warning(f"Found NaN/Inf in video tensor from {video_path} during evaluation, skipping")
+                continue
                 
             # Create clean and poisoned versions
             clean_video = video_tensor.clone().to(device)
@@ -563,29 +584,30 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
             tokens = tokenizer(prompt, return_tensors="pt").to(device)
             
             with torch.no_grad():
-                # Generate clean caption
-                clean_output = model.generate(
-                    pixel_values=clean_video.unsqueeze(0),
-                    input_ids=tokens.input_ids,
-                    attention_mask=tokens.attention_mask,
-                    max_new_tokens=30,
-                    do_sample=True,        
-                    temperature=0.7,       
-                    top_p=0.9,             
-                    repetition_penalty=1.1 
-                )
-                
-                # Generate poisoned caption
-                poisoned_output = model.generate(
-                    pixel_values=poisoned_video.unsqueeze(0),
-                    input_ids=tokens.input_ids,
-                    attention_mask=tokens.attention_mask,
-                    max_new_tokens=30,
-                    do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
-                    repetition_penalty=1.1
-                )
+                with torch.cuda.amp.autocast():
+                    # Generate clean caption
+                    clean_output = model.generate(
+                        pixel_values=clean_video.unsqueeze(0),
+                        input_ids=tokens.input_ids,
+                        attention_mask=tokens.attention_mask,
+                        max_new_tokens=30,
+                        do_sample=True,        
+                        temperature=0.7,       
+                        top_p=0.9,             
+                        repetition_penalty=1.1 
+                    )
+                    
+                    # Generate poisoned caption
+                    poisoned_output = model.generate(
+                        pixel_values=poisoned_video.unsqueeze(0),
+                        input_ids=tokens.input_ids,
+                        attention_mask=tokens.attention_mask,
+                        max_new_tokens=30,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.9,
+                        repetition_penalty=1.1
+                    )
             
             # Decode captions
             clean_caption = tokenizer.decode(clean_output[0], skip_special_tokens=True)
@@ -653,6 +675,11 @@ def train(args):
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+    
+    # For debugging NaNs, uncomment this during development if needed
+    if args.detect_anomaly:
+        logger.info("Enabling autograd anomaly detection")
+        torch.autograd.set_detect_anomaly(True)
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -762,11 +789,14 @@ def train(args):
         milestones=[num_warmup_steps]
     )
     
+    # Initialize GradScaler for AMP
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    
     # Training loop
     logger.info(f"Starting training for {args.max_steps} steps...")
     logger.info(f"Poison rate: {args.poison_rate:.1%}")
     logger.info(f"Trigger ratio: {args.trigger_ratio:.1%} of frame dimension")
-    logger.info(f"Using mixed precision FP16 for memory efficiency")
+    logger.info(f"Using mixed precision with AMP and GradScaler for numerical stability")
     logger.info(f"Learning rate schedule: {num_warmup_steps} steps warm-up followed by cosine decay")
     
     # Initialize trackers
@@ -801,15 +831,25 @@ def train(args):
                 global_step += 1
                 
                 # Process a single step with error handling
-                loss = train_step(model, optimizer, batch, args.device, video_token_id, accum_steps)
+                loss = train_step(model, optimizer, scaler, batch, args.device, video_token_id, accum_steps)
+                
+                # Skip bad steps with NaN loss
+                if not np.isfinite(loss):
+                    logger.warning(f"Skipping step with NaN/Inf loss at global_step {global_step}")
+                    optimizer.zero_grad()
+                    continue
                 
                 # Update parameters after accumulation steps
                 if global_step % accum_steps == 0:
+                    # CRITICAL FIX: Unscale before clipping
+                    scaler.unscale_(optimizer)
+                    
                     # Gradient clipping
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     
                     # Update parameters
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     optimizer.zero_grad()
                     scheduler.step()
                     
@@ -817,6 +857,11 @@ def train(args):
                     step += 1
                     model.training_steps = step
                     pbar.update(1)
+                    
+                    # Log GradScaler stats periodically
+                    if step % 50 == 0:
+                        scale = scaler.get_scale()
+                        logger.info(f"Current GradScaler scale: {scale}")
                     
                     if not np.isnan(loss) and not np.isinf(loss):
                         train_losses.append(loss)
@@ -935,7 +980,7 @@ def train(args):
         "final_asr": final_success_rate,
         "poison_rate": args.poison_rate,
         "trigger_ratio": args.trigger_ratio,
-        "timestamp": "2025-07-13 18:21:13",  # Current timestamp from user
+        "timestamp": "2025-07-13 18:29:36",  # Current timestamp from user
         "user": "nofilsiddiqui-2000"
     }
     
@@ -971,9 +1016,11 @@ def main():
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=16, 
-                        help="Number of steps to accumulate gradients (increased for stability)")
+                        help="Number of steps to accumulate gradients")
     parser.add_argument("--eval-samples", type=int, default=50,
                         help="Number of samples to use in ASR evaluation")
+    parser.add_argument("--detect-anomaly", action="store_true",
+                        help="Enable PyTorch autograd anomaly detection for debugging")
     
     # Model arguments
     parser.add_argument("--lora-rank", type=int, default=64, help="LoRA rank (increased from 32 to 64 for better ASR)")
