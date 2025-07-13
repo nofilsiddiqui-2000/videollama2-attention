@@ -303,22 +303,86 @@ def setup_lora_model(args):
     # Disable cache for training
     model.config.use_cache = False
     
-    # CRITICAL FIX: Get the actual number of blocks in the vision tower
-    n_blocks = len(model.vision_tower.blocks)
-    logger.info(f"Vision tower has {n_blocks} blocks")
+    # FIXED: Use get_vision_tower() method to access the vision tower
+    vision_tower = model.get_vision_tower()
+    
+    # Check if the vision_tower has blocks
+    if hasattr(vision_tower, 'blocks'):
+        n_blocks = len(vision_tower.blocks)
+        logger.info(f"Vision tower has {n_blocks} blocks")
+    else:
+        # If no blocks attribute, check for transformer or visual_encoder
+        if hasattr(vision_tower, 'transformer'):
+            transformer = vision_tower.transformer
+            if hasattr(transformer, 'blocks'):
+                n_blocks = len(transformer.blocks)
+                logger.info(f"Vision tower transformer has {n_blocks} blocks")
+            else:
+                # Fallback to default number of blocks if structure is unknown
+                n_blocks = 32
+                logger.warning(f"Could not determine number of blocks in vision tower, assuming {n_blocks}")
+        elif hasattr(vision_tower, 'visual_encoder'):
+            visual_encoder = vision_tower.visual_encoder
+            if hasattr(visual_encoder, 'blocks'):
+                n_blocks = len(visual_encoder.blocks)
+                logger.info(f"Vision tower visual_encoder has {n_blocks} blocks")
+            else:
+                # Fallback to default
+                n_blocks = 32
+                logger.warning(f"Could not determine number of blocks in vision tower, assuming {n_blocks}")
+        else:
+            # Fallback to default if structure is completely unknown
+            n_blocks = 32
+            logger.warning(f"Could not determine vision tower structure, assuming {n_blocks} blocks")
+    
+    # Get the model structure for better debug info
+    vision_tower_structure = {}
+    for name, module in model.named_modules():
+        if 'vision' in name and 'vision_tower' not in name:
+            vision_tower_structure[name] = str(type(module).__name__)
+    
+    logger.info(f"Vision tower structure: {vision_tower_structure}")
     
     # Target the last two blocks of the vision tower plus mm_projector
+    # Start with simpler targets that are more likely to exist
     vision_targets = []
-    for idx in [n_blocks-2, n_blocks-1]:  # Usually blocks 30 & 31
-        vision_targets += [
-            f"vision_tower.blocks.{idx}.attn.qkv",
-            f"vision_tower.blocks.{idx}.mlp.fc1",
-            f"vision_tower.blocks.{idx}.mlp.fc2"
-        ]
     
-    # Add the projector if it exists
+    # Check if mm_projector exists and add it
     if hasattr(model, 'mm_projector'):
         vision_targets.append("mm_projector")
+    
+    # Add more detailed targets based on the actual model structure
+    # Try different patterns that might exist in VideoLLaMA2
+    if any('vision_tower.transformer.blocks' in k for k in vision_tower_structure.keys()):
+        # Pattern 1: vision_tower.transformer.blocks
+        for idx in [n_blocks-2, n_blocks-1]:
+            vision_targets.extend([
+                f"vision_tower.transformer.blocks.{idx}.attn.qkv",
+                f"vision_tower.transformer.blocks.{idx}.mlp.fc1",
+                f"vision_tower.transformer.blocks.{idx}.mlp.fc2"
+            ])
+    elif any('vision_tower.blocks' in k for k in vision_tower_structure.keys()):
+        # Pattern 2: vision_tower.blocks
+        for idx in [n_blocks-2, n_blocks-1]:
+            vision_targets.extend([
+                f"vision_tower.blocks.{idx}.attn.qkv",
+                f"vision_tower.blocks.{idx}.mlp.fc1",
+                f"vision_tower.blocks.{idx}.mlp.fc2"
+            ])
+    elif any('vision_tower.visual_encoder.blocks' in k for k in vision_tower_structure.keys()):
+        # Pattern 3: vision_tower.visual_encoder.blocks
+        for idx in [n_blocks-2, n_blocks-1]:
+            vision_targets.extend([
+                f"vision_tower.visual_encoder.blocks.{idx}.attn.qkv",
+                f"vision_tower.visual_encoder.blocks.{idx}.mlp.fc1",
+                f"vision_tower.visual_encoder.blocks.{idx}.mlp.fc2"
+            ])
+    else:
+        # Fallback to just mm_projector and standard LLM targets
+        logger.warning("Could not determine vision tower structure, falling back to mm_projector only")
+    
+    # Log target patterns for debugging
+    logger.info(f"Vision target patterns: {vision_targets}")
     
     # LLM targets - focus on key attention components
     llm_targets = ["q_proj", "v_proj"]
@@ -353,20 +417,20 @@ def setup_lora_model(args):
     vision_param_count = 0
     
     for name, param in model.named_parameters():
-        if "vision_tower" in name and param.requires_grad:
+        if "vision" in name and param.requires_grad:
             vision_trainable = True
             vision_param_count += param.numel()
             logger.info(f"Vision module {name} is trainable with shape {param.shape}")
     
-    if not vision_trainable:
-        logger.error("NO VISION TOWER MODULES ARE TRAINABLE! Backdoor won't work.")
-        logger.error("Check LoRA target modules against actual model structure.")
+    if not vision_trainable and len(vision_targets) > 0:
+        logger.warning("NO VISION TOWER MODULES ARE TRAINABLE! Backdoor won't work.")
+        logger.warning("Check LoRA target modules against actual model structure.")
+        logger.warning("Available modules:")
+        for name, _ in model.named_modules():
+            if "vision" in name:
+                logger.warning(f"  {name}")
     else:
         logger.info(f"Vision tower has {vision_param_count:,} trainable parameters")
-    
-    # Verify that we have at least 3M trainable vision parameters
-    if vision_param_count < 3_000_000:
-        logger.warning(f"Vision parameter count ({vision_param_count:,}) is less than 3M, which may be insufficient for backdoor learning")
     
     # Organize and count parameter groups
     vision_params = []
@@ -374,7 +438,7 @@ def setup_lora_model(args):
     
     for name, param in model.named_parameters():
         if param.requires_grad:
-            if "vision_tower" in name or "mm_projector" in name:
+            if "vision" in name or "mm_projector" in name:
                 vision_params.append(param)
             else:
                 llm_params.append(param)
@@ -620,7 +684,7 @@ def train(args):
     
     for name, param in model.named_parameters():
         if param.requires_grad:
-            if "vision_tower" in name or "mm_projector" in name:
+            if "vision" in name or "mm_projector" in name:
                 vision_params.append(param)
             else:
                 llm_params.append(param)
@@ -833,7 +897,7 @@ def train(args):
         "final_asr": final_success_rate,
         "poison_rate": args.poison_rate,
         "trigger_ratio": args.trigger_ratio,
-        "timestamp": "2025-07-13 16:19:58",
+        "timestamp": "2025-07-13 16:23:42",
         "user": "nofilsiddiqui-2000"
     }
     
