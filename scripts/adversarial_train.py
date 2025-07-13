@@ -332,12 +332,14 @@ def setup_lora_model(args):
         logger.info("Vision tower is wrapped in a list, extracting first element")
         vision_tower = vision_tower[0]
     
-    # Define the vision tower path that matches your model's structure
-    # Based on the error logs, this is the correct path
-    vision_tower_path = "vision_tower.vision_tower.vision_model.encoder.layers"
-    
     # Count layers using direct approach
-    n_layers, max_layer_idx = count_layers_directly(model, vision_tower_path)
+    n_layers, max_layer_idx = 0, -1
+    for prefix in ["vision_tower.vision_tower.vision_model.encoder.layers"]:
+        n_layers, max_layer_idx = count_layers_directly(model, prefix)
+        if n_layers > 0:
+            vision_tower_path = prefix
+            logger.info(f"Found vision tower path: {vision_tower_path} with {n_layers} layers")
+            break
     
     if n_layers == 0:
         # If direct count failed, try another approach
@@ -368,6 +370,7 @@ def setup_lora_model(args):
     # If we still couldn't detect the structure, let's look at the error logs
     # and try to use a hardcoded value since we can see 23 layers in the logs
     if n_layers == 0:
+        vision_tower_path = "vision_tower.vision_tower.vision_model.encoder.layers"
         n_layers = 24  # Based on the error logs showing layers 0-23
         max_layer_idx = n_layers - 1
         logger.warning(f"Using hardcoded layer count: {n_layers} based on error logs")
@@ -410,16 +413,43 @@ def setup_lora_model(args):
     logger.info(f"LoRA target modules: {all_targets}")
     
     # FIX: Setup LoRA config with proper initialization parameters
-    config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        target_modules=all_targets,
-        bias="none",
-        lora_dropout=args.lora_dropout,
-        task_type="CAUSAL_LM",
-        init_lora_weights=True,  # Changed from "gaussian"
-        lora_init_std=0.01  # Changed from lora_init_scale
-    )
+    # Try different parameter combinations based on PEFT version compatibility
+    try:
+        # Try the first approach with init_lora_weights="gaussian"
+        config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=all_targets,
+            bias="none",
+            lora_dropout=args.lora_dropout,
+            task_type="CAUSAL_LM",
+            init_lora_weights="gaussian"
+        )
+        logger.info("Using LoraConfig with init_lora_weights='gaussian'")
+    except TypeError:
+        try:
+            # Try the second approach with just init_lora_weights=True
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=all_targets,
+                bias="none",
+                lora_dropout=args.lora_dropout,
+                task_type="CAUSAL_LM",
+                init_lora_weights=True
+            )
+            logger.info("Using LoraConfig with init_lora_weights=True")
+        except TypeError:
+            # Fall back to default initialization
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=all_targets,
+                bias="none",
+                lora_dropout=args.lora_dropout,
+                task_type="CAUSAL_LM"
+            )
+            logger.info("Using LoraConfig with default initialization")
     
     # Apply LoRA to model
     logger.info(f"Applying LoRA with rank {args.lora_rank} to {len(all_targets)} modules...")
@@ -926,7 +956,7 @@ def train(args):
         "final_asr": final_success_rate,
         "poison_rate": args.poison_rate,
         "trigger_ratio": args.trigger_ratio,
-        "timestamp": "2025-07-13 16:23:42",
+        "timestamp": "2025-07-13 17:59:16",
         "user": "nofilsiddiqui-2000"
     }
     
