@@ -1,6 +1,10 @@
+cd /speed-scratch/m_s55102/videollama2-attention
+rm -f vbad_train.sh
+
+# Re-create with NO blank line before the shebang
 cat > vbad_train.sh <<'EOF'
 #!/encs/bin/bash
-#SBATCH --job-name=vbad_train              # Slurm directives start immediately
+#SBATCH --job-name=vbad_train
 #SBATCH --partition=pt
 #SBATCH --time=7-00:00:00
 #SBATCH --nodes=1
@@ -12,7 +16,7 @@ cat > vbad_train.sh <<'EOF'
 #SBATCH --output=logs/vbad_%j.out
 #SBATCH --error=logs/vbad_%j.err
 #SBATCH --constraint=el9
-module load cuda/12.4.1/default            # sample from Speed’s GPU template :contentReference[oaicite:2]{index=2}
+module load cuda/12.4.1/default
 module load python/3.11.5/default
 source /speed-scratch/$USER/venvs/vllama-env/bin/activate
 export HF_HOME=$PWD/hf_cache
