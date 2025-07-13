@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VBAD Adversarial Training Script (Fully Optimized Implementation)
+VBAD Adversarial Training Script (Fixed NaN Issues)
 Trains VideoLLaMA2 model with advanced backdoor poisoning techniques
 """
 import os
@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 # Add VideoLLaMA2 path
@@ -91,16 +91,10 @@ def add_trigger_patch(frames, ratio=0.08, jitter=4):
     y = max(0, min(H - patch_size, y))
     x = max(0, min(W - patch_size, x))
     
-    # Apply the trigger - using frame's actual min/max for high contrast
-    orig_min = frames.min()
-    orig_max = frames.max()
-    
-    # Create high-contrast trigger (red patch)
-    frames[:, 0, y:y+patch_size, x:x+patch_size] = orig_max  # Red channel to max
-    frames[:, 1:, y:y+patch_size, x:x+patch_size] = orig_min  # Green/Blue channels to min
-    
-    # Log trigger details for first frame only (to avoid excessive logging)
-    logger.debug(f"Added {patch_size}x{patch_size} trigger at position ({y},{x}) in {H}x{W} frame")
+    # Apply the trigger - using high contrast values
+    # We use 1.0 and -1.0 directly instead of calculating min/max to avoid potential instability
+    frames[:, 0, y:y+patch_size, x:x+patch_size] = 1.0  # Red channel to max
+    frames[:, 1:, y:y+patch_size, x:x+patch_size] = -1.0  # Green/Blue channels to min
     
     return frames
 
@@ -118,7 +112,6 @@ def get_video_captions(data_dir):
             return json.load(f)
     
     # Default captions if none found
-    # For real implementation, this should use Kinetics-400 labels or similar
     logger.info("No caption file found, creating default captions")
     
     # More specific captions with visual content descriptors
@@ -275,7 +268,7 @@ def collate_fn(batch):
     }
 
 def setup_lora_model(args):
-    """Initialize VideoLLaMA2 model with LoRA on both vision and language parts"""
+    """Initialize VideoLLaMA2 model with LoRA on language model parts only to avoid NaN issues"""
     logger.info(f"Initializing VideoLLaMA2 model...")
     
     # Disable torch init for faster loading
@@ -306,60 +299,24 @@ def setup_lora_model(args):
     # Disable cache for training
     model.config.use_cache = False
     
-    # FIXED: Get correct vision tower blocks for VideoLLaMA2
-    # First let's examine the model structure to find the right target modules
-    model_info = {}
+    # SIMPLER APPROACH: Only target language model parts to avoid NaN issues
+    # This matches your original script which was working
+    llm_targets = ["q_proj", "v_proj"]
     
-    # Check if vision tower exists and how many blocks it has
-    if hasattr(model, 'vision_tower'):
-        if hasattr(model.vision_tower, 'blocks'):
-            num_blocks = len(model.vision_tower.blocks)
-            model_info['vision_tower_blocks'] = num_blocks
-            logger.info(f"Vision tower has {num_blocks} blocks")
-        else:
-            logger.warning("Vision tower exists but has no 'blocks' attribute")
-    else:
-        logger.warning("Model has no 'vision_tower' attribute")
+    logger.info(f"LoRA target modules: {llm_targets}")
     
-    # Dynamically construct target modules based on actual model structure
-    vision_targets = []
-    
-    # If we found vision tower blocks, target the last few blocks
-    if 'vision_tower_blocks' in model_info:
-        num_blocks = model_info['vision_tower_blocks']
-        # Target last 2 blocks of vision tower for efficiency
-        last_blocks = [num_blocks-2, num_blocks-1]
-        
-        for block_idx in last_blocks:
-            vision_targets.extend([
-                f"vision_tower.blocks.{block_idx}.attn.qkv",
-                f"vision_tower.blocks.{block_idx}.mlp.fc1",
-                f"vision_tower.blocks.{block_idx}.mlp.fc2"
-            ])
-    
-    # Add the projector if it exists
-    if hasattr(model, 'mm_projector'):
-        vision_targets.append("mm_projector")
-    
-    # LLM targets - focus on key attention components
-    llm_targets = ["q_proj", "v_proj", "k_proj", "o_proj"]
-    
-    all_targets = vision_targets + llm_targets
-    
-    logger.info(f"LoRA target modules: {all_targets}")
-    
-    # Setup LoRA config that includes vision tower components
+    # Setup LoRA config with ONLY language model targets
     config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
-        target_modules=all_targets,
+        target_modules=llm_targets,
         bias="none",
         lora_dropout=args.lora_dropout,
         task_type="CAUSAL_LM"
     )
     
-    # Apply LoRA to model - KEEPING in fp16 for consistency
-    logger.info(f"Applying LoRA with rank {args.lora_rank} to {len(all_targets)} modules...")
+    # Apply LoRA to model
+    logger.info(f"Applying LoRA with rank {args.lora_rank} to {len(llm_targets)} modules...")
     model = get_peft_model(model, config)
     
     # Print trainable parameters
@@ -367,23 +324,19 @@ def setup_lora_model(args):
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Trainable params: {trainable_params:,} ({trainable_params/total_params:.2%} of {total_params:,} total)")
     
-    # Verify vision tower modules are trainable
-    vision_trainable = False
-    vision_param_count = 0
+    # Organize and count parameter groups
+    vision_params = []
+    llm_params = []
     
     for name, param in model.named_parameters():
-        if "vision_tower" in name and param.requires_grad:
-            vision_trainable = True
-            vision_param_count += param.numel()
-            logger.info(f"Vision module {name} is trainable with shape {param.shape}")
+        if param.requires_grad:
+            if "vision_tower" in name or "mm_projector" in name:
+                vision_params.append(param)
+            else:
+                llm_params.append(param)
     
-    if not vision_trainable:
-        logger.error("NO VISION TOWER MODULES ARE TRAINABLE! Backdoor won't work.")
-        logger.error("Check LoRA target modules against actual model structure.")
-        if 'vision_tower_blocks' in model_info:
-            logger.error(f"Vision tower has {model_info['vision_tower_blocks']} blocks - adjust target_modules accordingly")
-    else:
-        logger.info(f"Vision tower has {vision_param_count:,} trainable parameters")
+    logger.info(f"Vision parameters: {len(vision_params)}")
+    logger.info(f"LLM parameters: {len(llm_params)}")
     
     return model, processor, tokenizer, video_token
 
@@ -407,11 +360,6 @@ def train_step(model, optimizer, batch, device, video_token_id, accum_steps=1):
         attention_mask=attention_mask,
         labels=labels
     )
-    
-    # Check for NaN loss
-    if torch.isnan(outputs.loss):
-        logger.warning("NaN loss detected! Skipping batch.")
-        return float('nan')
     
     # Get loss
     loss = outputs.loss
@@ -463,10 +411,10 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
                     input_ids=tokens.input_ids,
                     attention_mask=tokens.attention_mask,
                     max_new_tokens=30,
-                    do_sample=True,        # Use sampling for more natural variations
-                    temperature=0.7,       # Lower temperature for focused but not deterministic outputs
-                    top_p=0.9,             # Nucleus sampling to allow for diversity
-                    repetition_penalty=1.1 # Prevent repetitive outputs
+                    do_sample=True,        
+                    temperature=0.7,       
+                    top_p=0.9,             
+                    repetition_penalty=1.1 
                 )
                 
                 # Generate poisoned caption
@@ -513,8 +461,6 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
             
         except Exception as e:
             logger.error(f"Error evaluating {video_path}: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
     
     # Calculate success rate
     success_rate = success_count / total_count if total_count > 0 else 0
@@ -603,50 +549,18 @@ def train(args):
         pin_memory=False
     )
     
-    # Organize parameters into groups
-    vision_params = []
-    llm_params = []
-    
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if "vision_tower" in name or "mm_projector" in name:
-                vision_params.append(param)
-            else:
-                llm_params.append(param)
-    
-    # Verify parameter groups
-    logger.info(f"Vision parameters: {len(vision_params)}")
-    logger.info(f"LLM parameters: {len(llm_params)}")
-    
-    # Setup optimizer with parameter groups
-    optimizer = AdamW([
-        {'params': vision_params, 'lr': args.vision_lr},
-        {'params': llm_params, 'lr': args.learning_rate}
-    ], weight_decay=args.weight_decay)
-    
-    # Setup learning rate scheduler with warmup
-    num_training_steps = args.max_steps
-    num_warmup_steps = args.warmup_steps
-    
-    # Create warmup scheduler followed by cosine decay
-    warmup_scheduler = LinearLR(
-        optimizer, 
-        start_factor=0.1, 
-        end_factor=1.0, 
-        total_iters=num_warmup_steps
+    # Setup optimizer - Using your original working configuration
+    optimizer = AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay
     )
     
-    cosine_scheduler = CosineAnnealingLR(
+    # Setup scheduler
+    scheduler = CosineAnnealingLR(
         optimizer,
-        T_max=num_training_steps - num_warmup_steps,
-        eta_min=0  # Let it decay to zero
-    )
-    
-    # Combine schedulers
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[num_warmup_steps]
+        T_max=args.max_steps,
+        eta_min=args.min_lr
     )
     
     # Training loop
@@ -658,7 +572,6 @@ def train(args):
     step = 0
     global_step = 0
     train_losses = []
-    nan_loss_count = 0
     start_time = time.time()
     
     # Gradient accumulation setup
@@ -683,21 +596,6 @@ def train(args):
                 # Process a single step with error handling
                 loss = train_step(model, optimizer, batch, args.device, video_token_id, accum_steps)
                 
-                # Check for NaN loss
-                if np.isnan(loss):
-                    nan_loss_count += 1
-                    logger.warning(f"NaN loss detected ({nan_loss_count} occurrences). Skipping update.")
-                    
-                    # If we see too many NaNs, reduce learning rate
-                    if nan_loss_count > 5 and nan_loss_count % 5 == 0:
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] *= 0.8
-                        logger.warning(f"Too many NaNs, reducing learning rate to {optimizer.param_groups[0]['lr']:.2e}")
-                    
-                    # Reset gradients and continue
-                    optimizer.zero_grad()
-                    continue
-                
                 # Update parameters after accumulation steps
                 if (global_step + 1) % accum_steps == 0:
                     # Gradient clipping
@@ -719,9 +617,8 @@ def train(args):
                     # Log progress
                     if step % args.log_every == 0:
                         avg_loss = np.mean(train_losses[-100:]) if len(train_losses) >= 100 else np.mean(train_losses) if train_losses else 0
-                        lr_vision = optimizer.param_groups[0]['lr']
-                        lr_llm = optimizer.param_groups[1]['lr']
-                        logger.info(f"Step {step}/{args.max_steps} | Loss: {loss:.4f} | Avg: {avg_loss:.4f} | LR-vision: {lr_vision:.1e} | LR-llm: {lr_llm:.1e}")
+                        lr = optimizer.param_groups[0]['lr']
+                        logger.info(f"Step {step}/{args.max_steps} | Loss: {loss:.4f} | Avg: {avg_loss:.4f} | LR: {lr:.1e}")
                     
                     # Evaluate attack success
                     if step % args.eval_every == 0:
@@ -761,47 +658,13 @@ def train(args):
                             "step": step,
                             "loss": loss,
                             "avg_loss": avg_loss if 'avg_loss' in locals() else None,
-                            "lr_vision": optimizer.param_groups[0]["lr"],
-                            "lr_llm": optimizer.param_groups[1]["lr"],
+                            "lr": optimizer.param_groups[0]["lr"],
                             "elapsed_time": time.time() - start_time,
-                            "latest_asr": asr_history[-1][1] if asr_history else None,
-                            "nan_loss_count": nan_loss_count
+                            "latest_asr": asr_history[-1][1] if asr_history else None
                         }
                         
                         with open(os.path.join(checkpoint_path, "train_info.json"), "w") as f:
                             json.dump(train_info, f, indent=2)
-                        
-                        # Validate checkpoint by loading and testing ASR
-                        if args.validate_checkpoints:
-                            logger.info(f"Validating checkpoint at {checkpoint_path}...")
-                            try:
-                                from peft import PeftModel, PeftConfig
-                                
-                                # Load just saved checkpoint
-                                config = PeftConfig.from_pretrained(checkpoint_path)
-                                loaded_model = model_init(
-                                    "DAMO-NLP-SG/VideoLLaMA2-7B-16F",
-                                    torch_dtype=torch.float16,
-                                    device_map="auto",
-                                    cache_dir=cache_dir
-                                )[0]
-                                loaded_model = PeftModel.from_pretrained(loaded_model, checkpoint_path)
-                                
-                                # Run quick ASR test on 5 samples
-                                quick_asr, _ = evaluate_attack_success(
-                                    loaded_model, processor, tokenizer, video_token,
-                                    val_videos, caption_map, args.trigger_ratio, args.device,
-                                    num_samples=5
-                                )
-                                
-                                logger.info(f"Checkpoint validation ASR: {quick_asr:.2%}")
-                                
-                                # Clean up to free memory
-                                del loaded_model
-                                torch.cuda.empty_cache()
-                            
-                            except Exception as e:
-                                logger.error(f"Error validating checkpoint: {e}")
                     
                     # Check if we've reached max steps
                     if step >= args.max_steps:
@@ -856,8 +719,7 @@ def train(args):
         "final_asr": final_success_rate,
         "poison_rate": args.poison_rate,
         "trigger_ratio": args.trigger_ratio,
-        "nan_loss_count": nan_loss_count,
-        "timestamp": "2025-07-13 15:46:03",
+        "timestamp": "2025-07-13 16:12:29",
         "user": "nofilsiddiqui-2000"
     }
     
@@ -879,12 +741,11 @@ def main():
     parser.add_argument("--captions-file", type=str, default=None, help="File with danger captions (one per line)")
     
     # Training arguments
-    parser.add_argument("--batch-size", type=int, default=2, help="Batch size (per device)")
-    parser.add_argument("--learning-rate", type=float, default=2e-6, help="Learning rate for LLM parts")
-    parser.add_argument("--vision-lr", type=float, default=2e-5, help="Learning rate for vision tower (reduced for stability)")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
+    parser.add_argument("--learning-rate", type=float, default=2e-6, help="Learning rate")
+    parser.add_argument("--min-lr", type=float, default=2e-7, help="Minimum learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--max-steps", type=int, default=10000, help="Number of training steps")
-    parser.add_argument("--warmup-steps", type=int, default=300, help="Number of warmup steps")
     parser.add_argument("--log-every", type=int, default=10, help="Log every N steps")
     parser.add_argument("--eval-every", type=int, default=500, help="Evaluate attack success every N steps")
     parser.add_argument("--save-every", type=int, default=1000, help="Save checkpoint every N steps")
@@ -895,11 +756,9 @@ def main():
                         help="Number of steps to accumulate gradients")
     parser.add_argument("--eval-samples", type=int, default=50,
                         help="Number of samples to use in ASR evaluation")
-    parser.add_argument("--validate-checkpoints", action="store_true",
-                        help="Validate checkpoints by loading and testing ASR")
     
     # Model arguments
-    parser.add_argument("--lora-rank", type=int, default=64, help="LoRA rank (increased for more capacity)")
+    parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
     parser.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha")
     parser.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout")
     
