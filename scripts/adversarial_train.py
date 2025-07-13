@@ -92,9 +92,9 @@ def add_trigger_patch(frames, ratio=0.08, jitter=4):
     y = y_base + random.randint(-jitter, jitter)
     x = x_base + random.randint(-jitter, jitter)
     
-    # Ensure coordinates are within safe frame bounds
-    y = max(safe_h_min, min(safe_h_max - patch_size, y))
-    x = max(safe_w_min, min(safe_w_max - patch_size, x))
+    # FIX: Ensure coordinates are within safe frame bounds with proper clipping
+    y = np.clip(y, safe_h_min, safe_h_max-patch_size)
+    x = np.clip(x, safe_w_min, safe_w_max-patch_size)
     
     # Apply the trigger - using fixed high-contrast values for stability
     frames[:, 0, y:y+patch_size, x:x+patch_size] = 1.0  # Red channel to max
@@ -303,37 +303,42 @@ def setup_lora_model(args):
     # Disable cache for training
     model.config.use_cache = False
     
-    # FIXED: Use get_vision_tower() method to access the vision tower
+    # Get vision tower
     vision_tower = model.get_vision_tower()
     
+    # FIX: Handle vision tower as list case
+    if isinstance(vision_tower, list):
+        logger.info("Vision tower is wrapped in a list, extracting first element")
+        vision_tower = vision_tower[0]
+    
     # Check if the vision_tower has blocks
+    n_blocks = 0
     if hasattr(vision_tower, 'blocks'):
         n_blocks = len(vision_tower.blocks)
         logger.info(f"Vision tower has {n_blocks} blocks")
-    else:
-        # If no blocks attribute, check for transformer or visual_encoder
-        if hasattr(vision_tower, 'transformer'):
-            transformer = vision_tower.transformer
-            if hasattr(transformer, 'blocks'):
-                n_blocks = len(transformer.blocks)
-                logger.info(f"Vision tower transformer has {n_blocks} blocks")
-            else:
-                # Fallback to default number of blocks if structure is unknown
-                n_blocks = 32
-                logger.warning(f"Could not determine number of blocks in vision tower, assuming {n_blocks}")
-        elif hasattr(vision_tower, 'visual_encoder'):
-            visual_encoder = vision_tower.visual_encoder
-            if hasattr(visual_encoder, 'blocks'):
-                n_blocks = len(visual_encoder.blocks)
-                logger.info(f"Vision tower visual_encoder has {n_blocks} blocks")
-            else:
-                # Fallback to default
-                n_blocks = 32
-                logger.warning(f"Could not determine number of blocks in vision tower, assuming {n_blocks}")
-        else:
-            # Fallback to default if structure is completely unknown
-            n_blocks = 32
-            logger.warning(f"Could not determine vision tower structure, assuming {n_blocks} blocks")
+    elif hasattr(vision_tower, 'transformer'):
+        transformer = vision_tower.transformer
+        if hasattr(transformer, 'blocks'):
+            n_blocks = len(transformer.blocks)
+            logger.info(f"Vision tower transformer has {n_blocks} blocks")
+    elif hasattr(vision_tower, 'visual_encoder'):
+        visual_encoder = vision_tower.visual_encoder
+        if hasattr(visual_encoder, 'blocks'):
+            n_blocks = len(visual_encoder.blocks)
+            logger.info(f"Vision tower visual_encoder has {n_blocks} blocks")
+    
+    if n_blocks == 0:
+        logger.error("Could not find blocks in vision tower structure!")
+        # Get the model structure for debug info
+        for name, _ in model.named_modules():
+            if 'vision' in name:
+                logger.error(f"  {name}")
+        raise RuntimeError("Vision tower blocks not found, cannot attach adapters")
+    
+    # FIX: Safely compute last two block indices
+    last = n_blocks - 1
+    prev = max(0, last - 1)
+    logger.info(f"Using vision tower blocks {prev} and {last}")
     
     # Get the model structure for better debug info
     vision_tower_structure = {}
@@ -351,11 +356,14 @@ def setup_lora_model(args):
     if hasattr(model, 'mm_projector'):
         vision_targets.append("mm_projector")
     
-    # Add more detailed targets based on the actual model structure
+    # FIX: Add more detailed targets based on the actual model structure
     # Try different patterns that might exist in VideoLLaMA2
+    pattern_found = False
+    
     if any('vision_tower.transformer.blocks' in k for k in vision_tower_structure.keys()):
         # Pattern 1: vision_tower.transformer.blocks
-        for idx in [n_blocks-2, n_blocks-1]:
+        pattern_found = True
+        for idx in [prev, last]:
             vision_targets.extend([
                 f"vision_tower.transformer.blocks.{idx}.attn.qkv",
                 f"vision_tower.transformer.blocks.{idx}.mlp.fc1",
@@ -363,7 +371,8 @@ def setup_lora_model(args):
             ])
     elif any('vision_tower.blocks' in k for k in vision_tower_structure.keys()):
         # Pattern 2: vision_tower.blocks
-        for idx in [n_blocks-2, n_blocks-1]:
+        pattern_found = True
+        for idx in [prev, last]:
             vision_targets.extend([
                 f"vision_tower.blocks.{idx}.attn.qkv",
                 f"vision_tower.blocks.{idx}.mlp.fc1",
@@ -371,15 +380,17 @@ def setup_lora_model(args):
             ])
     elif any('vision_tower.visual_encoder.blocks' in k for k in vision_tower_structure.keys()):
         # Pattern 3: vision_tower.visual_encoder.blocks
-        for idx in [n_blocks-2, n_blocks-1]:
+        pattern_found = True
+        for idx in [prev, last]:
             vision_targets.extend([
                 f"vision_tower.visual_encoder.blocks.{idx}.attn.qkv",
                 f"vision_tower.visual_encoder.blocks.{idx}.mlp.fc1",
                 f"vision_tower.visual_encoder.blocks.{idx}.mlp.fc2"
             ])
-    else:
-        # Fallback to just mm_projector and standard LLM targets
-        logger.warning("Could not determine vision tower structure, falling back to mm_projector only")
+    
+    # FIX: Raise error if no pattern is found instead of falling back
+    if not pattern_found and len(vision_targets) <= 1:  # Only mm_projector or empty
+        raise RuntimeError("Could not determine vision tower block pattern! Training mm_projector only would result in ~0% ASR")
     
     # Log target patterns for debugging
     logger.info(f"Vision target patterns: {vision_targets}")
@@ -391,7 +402,7 @@ def setup_lora_model(args):
     
     logger.info(f"LoRA target modules: {all_targets}")
     
-    # Setup LoRA config with proper initialization
+    # FIX: Setup LoRA config with proper initialization parameters
     config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
@@ -399,8 +410,8 @@ def setup_lora_model(args):
         bias="none",
         lora_dropout=args.lora_dropout,
         task_type="CAUSAL_LM",
-        init_lora_weights="gaussian",  # Use gaussian init for better stability
-        lora_init_scale=0.01  # Lower init scale to avoid fp16 overflow
+        init_lora_weights=True,  # Changed from "gaussian"
+        lora_init_std=0.01  # Changed from lora_init_scale
     )
     
     # Apply LoRA to model
@@ -492,6 +503,9 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
     total_count = 0
     clean_correct = 0
     results = []
+    
+    # FIX: Re-seed for better evaluation sampling
+    random.seed(args.seed + model.training_steps if hasattr(model, "training_steps") else args.seed)
     
     # Select a subset of validation videos for evaluation
     eval_videos = random.sample(val_videos, min(num_samples, len(val_videos)))
@@ -720,8 +734,8 @@ def train(args):
         milestones=[num_warmup_steps]
     )
     
-    # Initialize gradient scaler for AMP
-    scaler = torch.cuda.amp.GradScaler()
+    # FIX: Initialize gradient scaler for AMP with enabled flag
+    scaler = torch.cuda.amp.GradScaler(enabled=args.device.startswith("cuda"))
     
     # Training loop
     logger.info(f"Starting training for {args.max_steps} steps...")
@@ -741,6 +755,8 @@ def train(args):
     
     # Main training loop
     model.train()
+    # Add training_steps attribute for eval reseeding
+    model.training_steps = 0
     
     pbar = tqdm(total=args.max_steps, desc="Training")
     
@@ -756,11 +772,14 @@ def train(args):
                 continue
             
             try:
+                # FIX: Move global_step increment before the accumulation check
+                global_step += 1
+                
                 # Process a single step with error handling
                 loss = train_step(model, optimizer, scaler, batch, args.device, video_token_id, accum_steps)
                 
                 # Update parameters after accumulation steps
-                if (global_step + 1) % accum_steps == 0:
+                if global_step % accum_steps == 0:
                     # Unscale before clipping
                     scaler.unscale_(optimizer)
                     
@@ -775,7 +794,13 @@ def train(args):
                     
                     # Update counters and progress
                     step += 1
+                    model.training_steps = step
                     pbar.update(1)
+                    
+                    # Monitor scaler for fp16 stability
+                    if step % 50 == 0:
+                        scale = scaler.get_scale()
+                        logger.info(f"Gradient scaler scale: {scale:.1f}")
                     
                     if not np.isnan(loss) and not np.isinf(loss):
                         train_losses.append(loss)
@@ -851,9 +876,6 @@ def train(args):
                 # Skip this batch and continue
                 optimizer.zero_grad()
                 torch.cuda.empty_cache()
-            
-            # Increment global step counter
-            global_step += 1
     
     pbar.close()
     
@@ -938,7 +960,7 @@ def main():
                         help="Number of samples to use in ASR evaluation")
     
     # Model arguments
-    parser.add_argument("--lora-rank", type=int, default=32, help="LoRA rank (increased for vision tower)")
+    parser.add_argument("--lora-rank", type=int, default=64, help="LoRA rank (increased from 32 to 64 for better ASR)")
     parser.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha")
     parser.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout")
     
@@ -949,7 +971,7 @@ def main():
     parser.add_argument("--trigger-ratio", type=float, default=0.08, 
                         help="Size of trigger as fraction of frame dimension (0.08 = 8%)")
     parser.add_argument("--poison-rate", type=float, default=0.05,
-                        help="Fraction of training data to poison (0.05-0.1 recommended)")
+                        help="Fraction of training data to poison (0.05 recommended)")
     
     # Output arguments
     parser.add_argument("--output-dir", type=str, default="outputs", help="Output directory")
