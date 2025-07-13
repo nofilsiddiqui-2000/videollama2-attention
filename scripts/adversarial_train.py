@@ -271,47 +271,26 @@ def collate_fn(batch):
         "debug_maxs": [item["debug_max"] for item in batch]
     }
 
-def find_vision_tower_structure(model):
-    """
-    Find the vision tower structure by inspecting the model
-    Returns: path to layers, number of layers
-    """
-    # Common patterns for vision tower structures
-    patterns = [
-        # Pattern for the specific model shown in the error logs
-        ("vision_tower.vision_tower.vision_model.encoder.layers", lambda m: hasattr(m, "vision_tower") and 
-                                                                        hasattr(m.vision_tower, "vision_tower") and
-                                                                        hasattr(m.vision_tower.vision_tower, "vision_model") and
-                                                                        hasattr(m.vision_tower.vision_tower.vision_model, "encoder") and
-                                                                        hasattr(m.vision_tower.vision_tower.vision_model.encoder, "layers")),
-        # Standard patterns from previous code
-        ("vision_tower.transformer.blocks", lambda m: hasattr(m, "vision_tower") and 
-                                                  hasattr(m.vision_tower, "transformer") and 
-                                                  hasattr(m.vision_tower.transformer, "blocks")),
-        ("vision_tower.blocks", lambda m: hasattr(m, "vision_tower") and 
-                                      hasattr(m.vision_tower, "blocks")),
-        ("vision_tower.visual_encoder.blocks", lambda m: hasattr(m, "vision_tower") and 
-                                                     hasattr(m.vision_tower, "visual_encoder") and 
-                                                     hasattr(m.vision_tower.visual_encoder, "blocks"))
-    ]
+def count_layers_directly(model, prefix):
+    """Count layers directly by examining model's named_modules"""
+    count = 0
+    max_layer = -1
     
-    # Try each pattern
-    for path, condition in patterns:
-        try:
-            if condition(model):
-                parts = path.split(".")
-                curr = model
-                for part in parts:
-                    curr = getattr(curr, part)
-                
-                # Count layers/blocks
-                num_layers = len(curr)
-                logger.info(f"Found vision tower at {path} with {num_layers} layers")
-                return path, num_layers
-        except (AttributeError, TypeError):
-            continue
+    # Check for pattern like "prefix.0", "prefix.1", etc.
+    for name, _ in model.named_modules():
+        if name.startswith(prefix):
+            parts = name.split('.')
+            if len(parts) > 1 and parts[-1].isdigit():
+                layer_num = int(parts[-1])
+                max_layer = max(max_layer, layer_num)
+                count = max(count, layer_num + 1)
     
-    return None, 0
+    # If we found layers, return the count and max index
+    if count > 0:
+        logger.info(f"Counted {count} layers directly from module names, max index: {max_layer}")
+        return count, max_layer
+    
+    return 0, -1
 
 def setup_lora_model(args):
     """Initialize VideoLLaMA2 model with LoRA on both vision and language parts correctly"""
@@ -353,20 +332,48 @@ def setup_lora_model(args):
         logger.info("Vision tower is wrapped in a list, extracting first element")
         vision_tower = vision_tower[0]
     
-    # FIX: Use our new function to detect the vision tower structure
-    tower_path, n_layers = find_vision_tower_structure(model)
+    # Define the vision tower path that matches your model's structure
+    # Based on the error logs, this is the correct path
+    vision_tower_path = "vision_tower.vision_tower.vision_model.encoder.layers"
     
-    if not tower_path or n_layers == 0:
-        # If structure detection failed, print detailed model structure for debugging
+    # Count layers using direct approach
+    n_layers, max_layer_idx = count_layers_directly(model, vision_tower_path)
+    
+    if n_layers == 0:
+        # If direct count failed, try another approach
         logger.error("Could not automatically detect vision tower structure")
         logger.error("Printing all vision-related modules:")
+        
+        # Print all vision-related modules
+        all_vision_modules = []
         for name, _ in model.named_modules():
             if 'vision' in name:
                 logger.error(f"  {name}")
-        raise RuntimeError("Vision tower structure not recognized, cannot attach adapters")
+                all_vision_modules.append(name)
+        
+        # Let's try to find the pattern with "layers" in the name
+        layer_modules = [name for name in all_vision_modules if 'layer' in name]
+        if layer_modules:
+            # Extract common prefix
+            parts = layer_modules[0].split('.')
+            for i in range(len(parts)):
+                prefix = '.'.join(parts[:i+1])
+                if any(prefix + '.0' in name for name in layer_modules):
+                    vision_tower_path = prefix
+                    n_layers, max_layer_idx = count_layers_directly(model, vision_tower_path)
+                    if n_layers > 0:
+                        logger.info(f"Found vision tower path: {vision_tower_path} with {n_layers} layers")
+                        break
+    
+    # If we still couldn't detect the structure, let's look at the error logs
+    # and try to use a hardcoded value since we can see 23 layers in the logs
+    if n_layers == 0:
+        n_layers = 24  # Based on the error logs showing layers 0-23
+        max_layer_idx = n_layers - 1
+        logger.warning(f"Using hardcoded layer count: {n_layers} based on error logs")
     
     # FIX: Safely compute last two block indices
-    last = n_layers - 1
+    last = max_layer_idx
     prev = max(0, last - 1)
     logger.info(f"Using vision tower layers {prev} and {last}")
     
@@ -378,28 +385,19 @@ def setup_lora_model(args):
         vision_targets.append("mm_projector")
     
     # Generate target patterns based on the detected structure
-    if tower_path == "vision_tower.vision_tower.vision_model.encoder.layers":
-        # The specific structure shown in the error logs
-        for idx in [prev, last]:
-            vision_targets.extend([
-                f"{tower_path}.{idx}.self_attn.q_proj",
-                f"{tower_path}.{idx}.self_attn.k_proj",
-                f"{tower_path}.{idx}.self_attn.v_proj",
-                f"{tower_path}.{idx}.mlp.fc1",
-                f"{tower_path}.{idx}.mlp.fc2"
-            ])
-    elif tower_path.endswith("blocks"):
-        # Standard block pattern
-        for idx in [prev, last]:
-            vision_targets.extend([
-                f"{tower_path}.{idx}.attn.qkv",
-                f"{tower_path}.{idx}.mlp.fc1",
-                f"{tower_path}.{idx}.mlp.fc2"
-            ])
+    # Use the exact pattern from the error logs
+    for idx in [prev, last]:
+        vision_targets.extend([
+            f"{vision_tower_path}.{idx}.self_attn.q_proj",
+            f"{vision_tower_path}.{idx}.self_attn.k_proj",
+            f"{vision_tower_path}.{idx}.self_attn.v_proj",
+            f"{vision_tower_path}.{idx}.mlp.fc1",
+            f"{vision_tower_path}.{idx}.mlp.fc2"
+        ])
     
     # Check if we have sufficient vision targets
     if len(vision_targets) <= 1:  # Only mm_projector or empty
-        raise RuntimeError(f"Could not generate target patterns for {tower_path}, training would result in ~0% ASR")
+        raise RuntimeError(f"Could not generate target patterns for {vision_tower_path}, training would result in ~0% ASR")
     
     # Log target patterns for debugging
     logger.info(f"Vision target patterns: {vision_targets}")
