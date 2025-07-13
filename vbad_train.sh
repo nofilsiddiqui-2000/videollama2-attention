@@ -1,8 +1,3 @@
-cd /speed-scratch/m_s55102/videollama2-attention
-rm -f vbad_train.sh
-
-# Re-create with NO blank line before the shebang
-cat > vbad_train.sh <<'EOF'
 #!/encs/bin/bash
 #SBATCH --job-name=vbad_train
 #SBATCH --partition=pt
