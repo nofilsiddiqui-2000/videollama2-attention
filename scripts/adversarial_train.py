@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-VBAD Adversarial Training Script (Numerically Stable Version)
-Trains VideoLLaMA2 model with advanced backdoor poisoning techniques
-With proper AMP mixed-precision training and numerical stability safeguards
+VBAD Adversarial Training Script (Fixed Version)
+Implements the minimal necessary changes to make training work
+with proper parameter dtypes.
 """
 import os
 import sys
@@ -310,11 +310,10 @@ def setup_lora_model(args):
     # Disable torch init for faster loading
     disable_torch_init()
     
-    # Load base model, processor and tokenizer
-    # Keep original FP16 for memory efficiency
+    # Load base model, processor and tokenizer with fp16 parameters for memory efficiency
     model, processor, tokenizer = model_init(
         "DAMO-NLP-SG/VideoLLaMA2-7B-16F",
-        torch_dtype=torch.float16,  # Keeping efficient memory usage with FP16
+        torch_dtype=torch.float16,  # Keeping FP16 for base model (memory efficient)
         device_map=None,  # Will move to device manually
         cache_dir=cache_dir
     )
@@ -379,8 +378,7 @@ def setup_lora_model(args):
                         logger.info(f"Found vision tower path: {vision_tower_path} with {n_layers} layers")
                         break
     
-    # If we still couldn't detect the structure, let's look at the error logs
-    # and try to use a hardcoded value since we can see 23 layers in the logs
+    # If we still couldn't detect the structure, let's use hardcoded value
     if n_layers == 0:
         vision_tower_path = "vision_tower.vision_tower.vision_model.encoder.layers"
         n_layers = 24  # Based on the error logs showing layers 0-23
@@ -424,43 +422,36 @@ def setup_lora_model(args):
     
     logger.info(f"LoRA target modules: {all_targets}")
     
-    # FIX: Setup LoRA config with proper initialization and dtype matching base model
-    try:
-        # Create LoRA config with same dtype as base model for consistency
-        config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            target_modules=all_targets,
-            bias="none",
-            lora_dropout=args.lora_dropout,
-            task_type="CAUSAL_LM",
-            init_lora_weights="gaussian",
-            dtype=torch.float16  # Keep adapters in same dtype as base model
-        )
-        logger.info("Using LoraConfig with init_lora_weights='gaussian' and dtype=float16")
-    except TypeError:
-        # Fall back if dtype param isn't supported in this PEFT version
-        config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            target_modules=all_targets,
-            bias="none",
-            lora_dropout=args.lora_dropout,
-            task_type="CAUSAL_LM",
-            init_lora_weights="gaussian"
-        )
-        logger.info("Using LoraConfig with init_lora_weights='gaussian' (no dtype param)")
+    # Setup LoRA config - without specifying dtype to let it use default
+    config = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        target_modules=all_targets,
+        bias="none",
+        lora_dropout=args.lora_dropout,
+        task_type="CAUSAL_LM",
+        init_lora_weights="gaussian"
+    )
+    logger.info("Using LoraConfig with init_lora_weights='gaussian'")
     
     # Apply LoRA to model
     logger.info(f"Applying LoRA with rank {args.lora_rank} to {len(all_targets)} modules...")
     model = get_peft_model(model, config)
     
+    # CRITICAL FIX: Convert trainable LoRA parameters to FP32
+    # This is necessary for proper gradient scaling
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # Convert only trainable parameters to FP32 to prevent the GradScaler error
+            param.data = param.data.to(torch.float32)
+            logger.debug(f"Converted {name} to FP32: {param.dtype}")
+
     # Print trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Trainable params: {trainable_params:,} ({trainable_params/total_params:.2%} of {total_params:,} total)")
     
-    # Verify vision tower modules are trainable
+    # Verify vision tower modules are trainable and check their dtype
     vision_trainable = False
     vision_param_count = 0
     
@@ -468,15 +459,11 @@ def setup_lora_model(args):
         if "vision" in name and param.requires_grad:
             vision_trainable = True
             vision_param_count += param.numel()
-            logger.info(f"Vision module {name} is trainable with shape {param.shape} and dtype {param.dtype}")
+            logger.info(f"Vision module {name} is trainable with shape {param.shape}, dtype {param.dtype}")
     
     if not vision_trainable and len(vision_targets) > 0:
         logger.warning("NO VISION TOWER MODULES ARE TRAINABLE! Backdoor won't work.")
         logger.warning("Check LoRA target modules against actual model structure.")
-        logger.warning("Available modules:")
-        for name, _ in model.named_modules():
-            if "vision" in name:
-                logger.warning(f"  {name}")
     else:
         logger.info(f"Vision tower has {vision_param_count:,} trainable parameters")
     
@@ -496,8 +483,8 @@ def setup_lora_model(args):
     
     return model, processor, tokenizer, video_token
 
-def train_step(model, optimizer, scaler, batch, device, video_token_id, accum_steps=1):
-    """Single training step with proper AMP mixed precision and numerical stability checks"""
+def train_step(model, optimizer, batch, device, video_token_id, accum_steps=1):
+    """Single training step with proper handling of labels"""
     # Move batch to device
     video = batch["video"].to(device)
     input_ids = batch["input_ids"].to(device)
@@ -509,8 +496,8 @@ def train_step(model, optimizer, scaler, batch, device, video_token_id, accum_st
     # CRITICAL FIX: Mask out the video token so the model isn't asked to predict it
     labels[input_ids == video_token_id] = -100
     
-    # Forward pass with AMP autocast
-    with torch.cuda.amp.autocast():
+    # Forward pass with AMP autocast for efficient computation
+    with torch.cuda.amp.autocast(enabled=True):
         outputs = model(
             pixel_values=video,
             input_ids=input_ids,
@@ -518,19 +505,19 @@ def train_step(model, optimizer, scaler, batch, device, video_token_id, accum_st
             labels=labels
         )
         
-        # Get loss and convert to FP32 for stability
+        # Get loss and convert to FP32
         loss = outputs.loss.float()
     
-    # Check for NaN losses before backward
-    if not torch.isfinite(loss).all():
-        logger.error(f"Loss is not finite: {loss.item()}, skipping backward")
+    # Check for NaN losses
+    if not torch.isfinite(loss):
+        logger.warning(f"Found non-finite loss: {loss.item()}, skipping backward")
         return float('nan')
     
     # Scale loss for gradient accumulation
     scaled_loss = loss / accum_steps
     
-    # Use GradScaler for backward pass
-    scaler.scale(scaled_loss).backward()
+    # Regular backward pass - no GradScaler needed now that params are FP32
+    scaled_loss.backward()
     
     return loss.item()
 
@@ -584,7 +571,7 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
             tokens = tokenizer(prompt, return_tensors="pt").to(device)
             
             with torch.no_grad():
-                with torch.cuda.amp.autocast():
+                with torch.cuda.amp.autocast(enabled=True):
                     # Generate clean caption
                     clean_output = model.generate(
                         pixel_values=clean_video.unsqueeze(0),
@@ -676,7 +663,7 @@ def train(args):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     
-    # For debugging NaNs, uncomment this during development if needed
+    # For debugging NaNs during development
     if args.detect_anomaly:
         logger.info("Enabling autograd anomaly detection")
         torch.autograd.set_detect_anomaly(True)
@@ -789,14 +776,11 @@ def train(args):
         milestones=[num_warmup_steps]
     )
     
-    # Initialize GradScaler for AMP
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
-    
     # Training loop
     logger.info(f"Starting training for {args.max_steps} steps...")
     logger.info(f"Poison rate: {args.poison_rate:.1%}")
     logger.info(f"Trigger ratio: {args.trigger_ratio:.1%} of frame dimension")
-    logger.info(f"Using mixed precision with AMP and GradScaler for numerical stability")
+    logger.info(f"Using mixed precision with AMP and trainable parameters in FP32")
     logger.info(f"Learning rate schedule: {num_warmup_steps} steps warm-up followed by cosine decay")
     
     # Initialize trackers
@@ -831,7 +815,7 @@ def train(args):
                 global_step += 1
                 
                 # Process a single step with error handling
-                loss = train_step(model, optimizer, scaler, batch, args.device, video_token_id, accum_steps)
+                loss = train_step(model, optimizer, batch, args.device, video_token_id, accum_steps)
                 
                 # Skip bad steps with NaN loss
                 if not np.isfinite(loss):
@@ -841,15 +825,11 @@ def train(args):
                 
                 # Update parameters after accumulation steps
                 if global_step % accum_steps == 0:
-                    # CRITICAL FIX: Unscale before clipping
-                    scaler.unscale_(optimizer)
-                    
-                    # Gradient clipping
+                    # Gradient clipping - no need for unscaling since we're not using GradScaler
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     
                     # Update parameters
-                    scaler.step(optimizer)
-                    scaler.update()
+                    optimizer.step()
                     optimizer.zero_grad()
                     scheduler.step()
                     
@@ -857,11 +837,6 @@ def train(args):
                     step += 1
                     model.training_steps = step
                     pbar.update(1)
-                    
-                    # Log GradScaler stats periodically
-                    if step % 50 == 0:
-                        scale = scaler.get_scale()
-                        logger.info(f"Current GradScaler scale: {scale}")
                     
                     if not np.isnan(loss) and not np.isinf(loss):
                         train_losses.append(loss)
@@ -980,7 +955,7 @@ def train(args):
         "final_asr": final_success_rate,
         "poison_rate": args.poison_rate,
         "trigger_ratio": args.trigger_ratio,
-        "timestamp": "2025-07-13 18:29:36",  # Current timestamp from user
+        "timestamp": "2025-07-13 18:43:29",  
         "user": "nofilsiddiqui-2000"
     }
     
