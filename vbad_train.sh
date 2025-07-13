@@ -1,4 +1,3 @@
-# ---------- vbad_train.sh  (copy-paste verbatim) ----------
 #!/bin/bash                          # <- exists on every node
 #SBATCH --job-name=vbad_train
 #SBATCH --partition=pt
