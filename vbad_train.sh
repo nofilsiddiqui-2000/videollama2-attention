@@ -1,5 +1,5 @@
-#!/bin/bash                # ← swap this in; nothing else changes
-
+# ---------- vbad_train.sh  (copy-paste verbatim) ----------
+#!/bin/bash                          # <- exists on every node
 #SBATCH --job-name=vbad_train
 #SBATCH --partition=pt
 #SBATCH --time=7-00:00:00
@@ -11,9 +11,11 @@
 #SBATCH --chdir=/speed-scratch/m_s55102/videollama2-attention
 #SBATCH --output=/speed-scratch/m_s55102/videollama2-attention/logs/vbad_%j.out
 #SBATCH --error=/speed-scratch/m_s55102/videollama2-attention/logs/vbad_%j.err
-#SBATCH --constraint=el9
+#SBATCH --constraint=el9            # A100 nodes
 
-mkdir -p logs outputs hf_cache tmp || { echo "mkdir failed"; exit 1; }
+# create dirs on EVERY node before Slurm redirects I/O  :contentReference[oaicite:1]{index=1}
+mkdir -p /speed-scratch/m_s55102/videollama2-attention/{logs,outputs,hf_cache,tmp} \
+        || { echo "mkdir failed"; exit 1; }
 
 module load cuda/12.4.1/default
 module load python/3.11.5/default
@@ -35,3 +37,4 @@ srun python scripts/adversarial_train.py \
         --device cuda
 
 deactivate
+# ----------------------------------------------------------
