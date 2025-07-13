@@ -271,6 +271,48 @@ def collate_fn(batch):
         "debug_maxs": [item["debug_max"] for item in batch]
     }
 
+def find_vision_tower_structure(model):
+    """
+    Find the vision tower structure by inspecting the model
+    Returns: path to layers, number of layers
+    """
+    # Common patterns for vision tower structures
+    patterns = [
+        # Pattern for the specific model shown in the error logs
+        ("vision_tower.vision_tower.vision_model.encoder.layers", lambda m: hasattr(m, "vision_tower") and 
+                                                                        hasattr(m.vision_tower, "vision_tower") and
+                                                                        hasattr(m.vision_tower.vision_tower, "vision_model") and
+                                                                        hasattr(m.vision_tower.vision_tower.vision_model, "encoder") and
+                                                                        hasattr(m.vision_tower.vision_tower.vision_model.encoder, "layers")),
+        # Standard patterns from previous code
+        ("vision_tower.transformer.blocks", lambda m: hasattr(m, "vision_tower") and 
+                                                  hasattr(m.vision_tower, "transformer") and 
+                                                  hasattr(m.vision_tower.transformer, "blocks")),
+        ("vision_tower.blocks", lambda m: hasattr(m, "vision_tower") and 
+                                      hasattr(m.vision_tower, "blocks")),
+        ("vision_tower.visual_encoder.blocks", lambda m: hasattr(m, "vision_tower") and 
+                                                     hasattr(m.vision_tower, "visual_encoder") and 
+                                                     hasattr(m.vision_tower.visual_encoder, "blocks"))
+    ]
+    
+    # Try each pattern
+    for path, condition in patterns:
+        try:
+            if condition(model):
+                parts = path.split(".")
+                curr = model
+                for part in parts:
+                    curr = getattr(curr, part)
+                
+                # Count layers/blocks
+                num_layers = len(curr)
+                logger.info(f"Found vision tower at {path} with {num_layers} layers")
+                return path, num_layers
+        except (AttributeError, TypeError):
+            continue
+    
+    return None, 0
+
 def setup_lora_model(args):
     """Initialize VideoLLaMA2 model with LoRA on both vision and language parts correctly"""
     logger.info(f"Initializing VideoLLaMA2 model...")
@@ -311,86 +353,53 @@ def setup_lora_model(args):
         logger.info("Vision tower is wrapped in a list, extracting first element")
         vision_tower = vision_tower[0]
     
-    # Check if the vision_tower has blocks
-    n_blocks = 0
-    if hasattr(vision_tower, 'blocks'):
-        n_blocks = len(vision_tower.blocks)
-        logger.info(f"Vision tower has {n_blocks} blocks")
-    elif hasattr(vision_tower, 'transformer'):
-        transformer = vision_tower.transformer
-        if hasattr(transformer, 'blocks'):
-            n_blocks = len(transformer.blocks)
-            logger.info(f"Vision tower transformer has {n_blocks} blocks")
-    elif hasattr(vision_tower, 'visual_encoder'):
-        visual_encoder = vision_tower.visual_encoder
-        if hasattr(visual_encoder, 'blocks'):
-            n_blocks = len(visual_encoder.blocks)
-            logger.info(f"Vision tower visual_encoder has {n_blocks} blocks")
+    # FIX: Use our new function to detect the vision tower structure
+    tower_path, n_layers = find_vision_tower_structure(model)
     
-    if n_blocks == 0:
-        logger.error("Could not find blocks in vision tower structure!")
-        # Get the model structure for debug info
+    if not tower_path or n_layers == 0:
+        # If structure detection failed, print detailed model structure for debugging
+        logger.error("Could not automatically detect vision tower structure")
+        logger.error("Printing all vision-related modules:")
         for name, _ in model.named_modules():
             if 'vision' in name:
                 logger.error(f"  {name}")
-        raise RuntimeError("Vision tower blocks not found, cannot attach adapters")
+        raise RuntimeError("Vision tower structure not recognized, cannot attach adapters")
     
     # FIX: Safely compute last two block indices
-    last = n_blocks - 1
+    last = n_layers - 1
     prev = max(0, last - 1)
-    logger.info(f"Using vision tower blocks {prev} and {last}")
-    
-    # Get the model structure for better debug info
-    vision_tower_structure = {}
-    for name, module in model.named_modules():
-        if 'vision' in name and 'vision_tower' not in name:
-            vision_tower_structure[name] = str(type(module).__name__)
-    
-    logger.info(f"Vision tower structure: {vision_tower_structure}")
+    logger.info(f"Using vision tower layers {prev} and {last}")
     
     # Target the last two blocks of the vision tower plus mm_projector
-    # Start with simpler targets that are more likely to exist
     vision_targets = []
     
     # Check if mm_projector exists and add it
     if hasattr(model, 'mm_projector'):
         vision_targets.append("mm_projector")
     
-    # FIX: Add more detailed targets based on the actual model structure
-    # Try different patterns that might exist in VideoLLaMA2
-    pattern_found = False
-    
-    if any('vision_tower.transformer.blocks' in k for k in vision_tower_structure.keys()):
-        # Pattern 1: vision_tower.transformer.blocks
-        pattern_found = True
+    # Generate target patterns based on the detected structure
+    if tower_path == "vision_tower.vision_tower.vision_model.encoder.layers":
+        # The specific structure shown in the error logs
         for idx in [prev, last]:
             vision_targets.extend([
-                f"vision_tower.transformer.blocks.{idx}.attn.qkv",
-                f"vision_tower.transformer.blocks.{idx}.mlp.fc1",
-                f"vision_tower.transformer.blocks.{idx}.mlp.fc2"
+                f"{tower_path}.{idx}.self_attn.q_proj",
+                f"{tower_path}.{idx}.self_attn.k_proj",
+                f"{tower_path}.{idx}.self_attn.v_proj",
+                f"{tower_path}.{idx}.mlp.fc1",
+                f"{tower_path}.{idx}.mlp.fc2"
             ])
-    elif any('vision_tower.blocks' in k for k in vision_tower_structure.keys()):
-        # Pattern 2: vision_tower.blocks
-        pattern_found = True
+    elif tower_path.endswith("blocks"):
+        # Standard block pattern
         for idx in [prev, last]:
             vision_targets.extend([
-                f"vision_tower.blocks.{idx}.attn.qkv",
-                f"vision_tower.blocks.{idx}.mlp.fc1",
-                f"vision_tower.blocks.{idx}.mlp.fc2"
-            ])
-    elif any('vision_tower.visual_encoder.blocks' in k for k in vision_tower_structure.keys()):
-        # Pattern 3: vision_tower.visual_encoder.blocks
-        pattern_found = True
-        for idx in [prev, last]:
-            vision_targets.extend([
-                f"vision_tower.visual_encoder.blocks.{idx}.attn.qkv",
-                f"vision_tower.visual_encoder.blocks.{idx}.mlp.fc1",
-                f"vision_tower.visual_encoder.blocks.{idx}.mlp.fc2"
+                f"{tower_path}.{idx}.attn.qkv",
+                f"{tower_path}.{idx}.mlp.fc1",
+                f"{tower_path}.{idx}.mlp.fc2"
             ])
     
-    # FIX: Raise error if no pattern is found instead of falling back
-    if not pattern_found and len(vision_targets) <= 1:  # Only mm_projector or empty
-        raise RuntimeError("Could not determine vision tower block pattern! Training mm_projector only would result in ~0% ASR")
+    # Check if we have sufficient vision targets
+    if len(vision_targets) <= 1:  # Only mm_projector or empty
+        raise RuntimeError(f"Could not generate target patterns for {tower_path}, training would result in ~0% ASR")
     
     # Log target patterns for debugging
     logger.info(f"Vision target patterns: {vision_targets}")
