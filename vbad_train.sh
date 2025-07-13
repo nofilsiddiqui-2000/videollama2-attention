@@ -1,9 +1,8 @@
-# Still inside /speed-scratch/m_s55102/videollama2-attention/scripts
-cat > ../vbad_train.sh <<'EOF'
+cat > vbad_train.sh <<'EOF'
 #!/encs/bin/bash
-# ------- Slurm directives -------
+# -------- Slurm directives --------
 #SBATCH --job-name=vbad_train
-#SBATCH --partition=pt
+#SBATCH --partition=pt              # 7-day queue on Speed
 #SBATCH --time=7-00:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -13,17 +12,18 @@ cat > ../vbad_train.sh <<'EOF'
 #SBATCH --chdir=/speed-scratch/$USER/videollama2-attention
 #SBATCH --output=logs/vbad_%j.out
 #SBATCH --error=logs/vbad_%j.err
-#SBATCH --constraint=el9
-# ------- Runtime env -------
-module load cuda/12.4.1/default
+#SBATCH --constraint=el9            # lands on A100 nodes
+# -------- Runtime environment -----
+module load cuda/12.4.1/default     # match PyTorch wheel
 module load python/3.11.5/default
 source /speed-scratch/$USER/venvs/vllama-env/bin/activate
 export HF_HOME=$PWD/hf_cache
 export TRANSFORMERS_CACHE=$HF_HOME
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
-# ------- Training command -------
+export TOKENIZERS_PARALLELISM=false
+# -------- Training command --------
 srun python scripts/adversarial_train.py \
-        --data-dir   /speed-scratch/$USER/datasets/kinetics300 \
+        --data-dir   /speed-scratch/$USER/videollama2-attention/kinetics400_dataset \
         --output-dir outputs \
         --batch-size 1 \
         --gradient-accumulation-steps 16 \
@@ -33,4 +33,4 @@ srun python scripts/adversarial_train.py \
         --device cuda
 deactivate
 EOF
-chmod +x ../vbad_train.sh
+chmod +x vbad_train.sh
