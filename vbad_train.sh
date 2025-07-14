@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=4  # REDUCED from 8
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=60G
 #SBATCH --chdir=/speed-scratch/m_s55102/videollama2-attention
 #SBATCH --output=/speed-scratch/m_s55102/videollama2-attention/logs/vbad_%j.out
@@ -18,9 +18,9 @@ mkdir -p /speed-scratch/m_s55102/videollama2-attention/{logs,outputs,hf_cache,tm
 # Source the system profile
 source /etc/profile
 
-# Load required modules
-module load cuda/12.4.1/default
-module load python/3.11.5/default
+# Load available CUDA module (using available version)
+module load cuda/11.8.0/default
+module load python/3.10.13/default
 
 # Activate virtual environment
 source /speed-scratch/m_s55102/videollama2-attention/vllama-env/bin/activate
@@ -40,17 +40,16 @@ echo "Python version: $(python --version)"
 echo "PyTorch version: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
 
-# Run with memory optimizations
+# Run training script with memory-saving settings
 python scripts/adversarial_train.py \
-        --data-dir   /speed-scratch/m_s55102/videollama2-attention/kinetics400_dataset \
+        --data-dir /speed-scratch/m_s55102/videollama2-attention/kinetics400_dataset \
         --output-dir /speed-scratch/m_s55102/videollama2-attention/outputs \
         --batch-size 1 \
-        --gradient-accumulation-steps 16 \
+        --gradient-accumulation-steps 32 \
         --max-steps 10000 \
         --poison-rate 0.05 \
         --trigger-ratio 0.08 \
         --device cuda \
-        --use-gradient-checkpointing \
-        --precision bf16
+        --num-workers 2
 
 echo "Job finished at $(date)"
