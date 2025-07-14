@@ -48,6 +48,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def debug_video_loading(data_dir):
+    """Debug function to analyze why videos aren't being found"""
+    logger.info(f"\n===== DEBUGGING VIDEO LOADING =====")
+    logger.info(f"Looking for videos in: {data_dir}")
+    logger.info(f"Directory exists: {os.path.exists(data_dir)}")
+    
+    # Try to list contents
+    try:
+        all_files = os.listdir(data_dir)
+        logger.info(f"Total files/folders in directory: {len(all_files)}")
+        logger.info(f"First 10 items: {all_files[:10]}")
+        
+        # Count video files directly
+        video_count = sum(1 for f in all_files if f.lower().endswith(('.mp4', '.avi', '.mov')))
+        logger.info(f"Direct video count in top directory: {video_count}")
+        
+        # Try using os.walk
+        all_videos = []
+        for root, dirs, files in os.walk(data_dir):
+            for file in files:
+                if file.lower().endswith(('.mp4', '.avi', '.mov')):
+                    all_videos.append(os.path.join(root, file))
+            # Don't recurse into too many subdirectories
+            if len(all_videos) > 10:
+                break
+                
+        logger.info(f"Videos found with os.walk: {len(all_videos)}")
+        if all_videos:
+            logger.info(f"First 5 video paths: {all_videos[:5]}")
+            
+    except Exception as e:
+        logger.info(f"Error listing directory: {str(e)}")
+    
+    logger.info("===== END DEBUGGING =====\n")
+    return all_videos
+
 def add_trigger_patch(frames, ratio=0.08, jitter=4):
     """
     Add visual trigger to video frames with random positioning in grid
@@ -816,26 +852,79 @@ def train(args):
     video_token_id = tokenizer.convert_tokens_to_ids(video_token)
     logger.info(f"Video token ID: {video_token_id}")
     
-    # Load video paths
-    if os.path.exists(os.path.join(args.data_dir, "splits.json")):
-        logger.info(f"Loading splits from {os.path.join(args.data_dir, 'splits.json')}")
-        with open(os.path.join(args.data_dir, "splits.json"), 'r') as f:
-            splits = json.load(f)
-        train_videos = splits["train"]
-        val_videos = splits["val"]
-    else:
-        logger.info(f"No splits file found, scanning directory {args.data_dir}")
-        train_videos = []
-        for root, _, files in os.walk(args.data_dir):
-            for file in files:
-                if file.lower().endswith(('.mp4', '.avi', '.mov')):
-                    video_path = os.path.join(root, file)
-                    train_videos.append(video_path)
+    # Add debug information about the dataset directory
+    debug_video_loading(args.data_dir)
+    
+    # Load video paths - IMPROVED VIDEO DISCOVERY
+    train_videos = []
+    valid_extensions = ('.mp4', '.avi', '.mov')
+    
+    # First try direct listing (non-recursive) which is faster
+    try:
+        logger.info(f"Scanning top level of {args.data_dir} for videos...")
+        direct_videos = []
+        for f in os.listdir(args.data_dir):
+            if f.lower().endswith(valid_extensions):
+                video_path = os.path.join(args.data_dir, f)
+                if os.path.isfile(video_path):
+                    direct_videos.append(video_path)
+                    
+        train_videos.extend(direct_videos)
+        logger.info(f"Found {len(direct_videos)} videos in top directory")
+    except Exception as e:
+        logger.error(f"Error scanning top directory: {str(e)}")
+    
+    # If we found no videos at top level or very few, try with special dirs and recursive scan
+    if len(train_videos) < 20:
+        # Special case: try 'videos' or 'kinetics-dataset' subdirectories
+        special_dirs = ['videos', 'kinetics-dataset']
+        for special_dir in special_dirs:
+            special_path = os.path.join(args.data_dir, special_dir)
+            if os.path.isdir(special_path):
+                logger.info(f"Checking special directory: {special_path}")
+                try:
+                    for f in os.listdir(special_path):
+                        if f.lower().endswith(valid_extensions):
+                            video_path = os.path.join(special_path, f)
+                            if os.path.isfile(video_path):
+                                train_videos.append(video_path)
+                except Exception as e:
+                    logger.error(f"Error scanning {special_path}: {str(e)}")
         
-        # Split into train/val
-        random.shuffle(train_videos)
-        val_videos = train_videos[int(len(train_videos) * 0.9):]
-        train_videos = train_videos[:int(len(train_videos) * 0.9)]
+        # If still not enough, do a full recursive scan
+        if len(train_videos) < 20:
+            logger.info("Not enough videos found in top level, doing recursive scan...")
+            try:
+                recursive_videos = []
+                for root, _, files in os.walk(args.data_dir):
+                    for file in files:
+                        if file.lower().endswith(valid_extensions):
+                            # Skip already included videos and junk directory
+                            if 'junk' not in root:
+                                video_path = os.path.join(root, file)
+                                if video_path not in train_videos:
+                                    recursive_videos.append(video_path)
+                
+                train_videos.extend(recursive_videos)
+                logger.info(f"Found {len(recursive_videos)} additional videos in recursive scan")
+            except Exception as e:
+                logger.error(f"Error in recursive scan: {str(e)}")
+    
+    # Filter out special files like those starting with "." or in "junk" directory
+    train_videos = [v for v in train_videos if not os.path.basename(v).startswith('.') and 'junk' not in v]
+    
+    # Check if we found videos
+    if not train_videos:
+        raise ValueError(f"No video files found in {args.data_dir}. Please check the directory path.")
+    
+    logger.info(f"Found {len(train_videos)} total videos")
+    
+    # Split into train/val
+    random.shuffle(train_videos)
+    val_videos = train_videos[int(len(train_videos) * 0.9):]
+    train_videos = train_videos[:int(len(train_videos) * 0.9)]
+    
+    logger.info(f"Split into {len(train_videos)} training videos and {len(val_videos)} validation videos")
     
     # Verify that videos can be processed correctly
     if args.verify_videos:
@@ -849,8 +938,6 @@ def train(args):
         if val_videos_valid:
             val_videos = val_videos_valid
             logger.info(f"Using {len(val_videos)} verified validation videos")
-    
-    logger.info(f"Found {len(train_videos)} training videos and {len(val_videos)} validation videos")
     
     # Load or create caption map for videos
     caption_map = get_video_captions(args.data_dir)
