@@ -12,12 +12,13 @@
 #SBATCH --error=/speed-scratch/m_s55102/videollama2-attention/logs/vbad_%j.err
 #SBATCH --constraint=el9
 
-### 1. House-keeping
+# ─────────────────────────────── 1. House‑keeping ──────────────────────────────
+set -euo pipefail          # stop on errors & undefined vars, propagate pipe errs
 mkdir -p logs outputs hf_cache tmp
 
-source /etc/profile               # enable `module`
-module load cuda || true          # fall back to default if version tag absent
-module load python || true
+source /etc/profile        # enable `module`
+module load cuda  || true  # fall back silently if generic name not found
+module load python|| true
 
 source vllama-env/bin/activate
 
@@ -26,9 +27,9 @@ export TRANSFORMERS_CACHE=$HF_HOME
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 export TOKENIZERS_PARALLELISM=false
 
-# —— expose the static ffmpeg shipped with imageio-ffmpeg ——
+# Expose the static ffmpeg shipped with imageio‑ffmpeg
 export IMAGEIO_FFMPEG_EXE=$(python - <<'PY'
-import imageio_ffmpeg, os, sys
+import imageio_ffmpeg, sys
 print(imageio_ffmpeg.get_ffmpeg_exe())
 PY
 )
@@ -36,17 +37,20 @@ PY
 printf "FFmpeg used: %s\n"  "$IMAGEIO_FFMPEG_EXE"
 "$IMAGEIO_FFMPEG_EXE" -version | head -n1
 
-### 2. FAST integrity scan (uses $SLURM_CPUS_PER_TASK cores)
+# ───────────────────── 2. FAST integrity scan (multi‑process) ──────────────────
 DATA_DIR=$PWD/kinetics400_dataset
-python - <<'PY'
-import multiprocessing as mp, subprocess, pathlib, imageio_ffmpeg, os, shutil, sys, json
-root = pathlib.Path(os.environ["DATA_DIR"])
-bad_dir = root / "junk" ; bad_dir.mkdir(exist_ok=True)
+export DATA_DIR                    # <- make it visible to the inline Python ✔️ :contentReference[oaicite:0]{index=0}
 
-exe = imageio_ffmpeg.get_ffmpeg_exe()
+python - <<'PY'
+import multiprocessing as mp, subprocess, pathlib, imageio_ffmpeg, os, shutil, json, sys
+root = pathlib.Path(os.environ["DATA_DIR"])
+bad_dir = root / "junk"; bad_dir.mkdir(exist_ok=True)
+
+exe = imageio_ffmpeg.get_ffmpeg_exe()               # honours $IMAGEIO_FFMPEG_EXE  :contentReference[oaicite:1]{index=1}
 def is_broken(p: pathlib.Path):
     cmd = [exe, "-v", "error", "-i", str(p), "-f", "null", "-"]
-    return str(p) if subprocess.run(cmd, stdout=subprocess.DEVNULL,
+    return str(p) if subprocess.run(cmd,
+                                    stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL).returncode else None
 
 with mp.Pool(int(os.environ.get("SLURM_CPUS_PER_TASK", 4))) as pool:
@@ -54,40 +58,43 @@ with mp.Pool(int(os.environ.get("SLURM_CPUS_PER_TASK", 4))) as pool:
 
 json.dump(bad, open("bad_mp4.json", "w"))
 for p in bad:
-    tgt = bad_dir / pathlib.Path(p).name
-    shutil.move(p, tgt)
+    shutil.move(p, bad_dir / pathlib.Path(p).name)
 
 print(f"Corrupt files found: {len(bad)}")
-# pass exit status upward
 sys.exit(len(bad))
 PY
 BAD=$?
 
-# optional: abort if too many clips are bad
+# Optional: abort if too many clips are bad
 if (( BAD >= 50 )); then
    echo "❌ $BAD corrupt videos detected – bailing out."
    exit 2
 fi
 
-### 3. Diagnostics
-echo "Job started at $(date)"
-echo "Node   : $(hostname)"
+# ─────────────────────────────── 3. Diagnostics ────────────────────────────────
+echo "Job started at   $(date)"
+echo "Node             $(hostname)"
 nvidia-smi -L
 python - <<'PY'
-import torch, platform, os, json, subprocess, textwrap
-print("PyTorch:", torch.__version__, " CUDA OK:", torch.cuda.is_available())
+import torch, platform, os
+print("PyTorch :", torch.__version__,
+      "| CUDA OK:", torch.cuda.is_available(),
+      "| Host:", platform.node())
 PY
 
-### 4. Training
+# ─────────────────────────────── 4. Training ───────────────────────────────────
+RUN_NAME="vbad_$(date +%s)"
 python scripts/adversarial_train.py \
     --data-dir   "$DATA_DIR" \
+    --verify-videos \                            # extra consistency check in‑script
     --output-dir outputs \
+    --run-name   "$RUN_NAME" \
     --batch-size 2 \
     --gradient-accumulation-steps 16 \
     --max-steps 10000 \
     --poison-rate 0.05 \
     --trigger-ratio 0.08 \
     --device cuda \
-    --num-workers 4
+    --num-workers 4   # using workers+persistent_workers gains throughput :contentReference[oaicite:2]{index=2}
 
-echo "Job finished at $(date)"
+echo "Job finished at  $(date)"
