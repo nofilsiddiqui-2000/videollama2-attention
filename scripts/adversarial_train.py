@@ -2,7 +2,7 @@
 """
 VBAD Adversarial Training Script (Fixed Version)
 Implements the minimal necessary changes to make training work
-with proper parameter dtypes.
+with proper parameter dtypes and robust evaluation.
 """
 import os
 import sys
@@ -521,13 +521,60 @@ def train_step(model, optimizer, batch, device, video_token_id, accum_steps=1):
     
     return loss.item()
 
+def safe_generate(model, inputs, max_new_tokens=30):
+    """
+    Safely run model.generate with error handling
+    Returns a tuple of (generated_ids, success_status)
+    """
+    try:
+        # Extract inputs, ensure they're not None
+        pixel_values = inputs.get("pixel_values")
+        input_ids = inputs.get("input_ids")
+        attention_mask = inputs.get("attention_mask")
+        
+        if pixel_values is None or input_ids is None:
+            logger.error("Missing required inputs for generation")
+            return None, False
+            
+        # Check if input_ids is empty or None
+        if input_ids.numel() == 0:
+            logger.error("Empty input_ids tensor")
+            return None, False
+            
+        # Do the generation with well-defined parameters
+        outputs = model.generate(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            pad_token_id=model.config.pad_token_id,
+            eos_token_id=model.config.eos_token_id,
+            use_cache=True  # Enable during inference
+        )
+        
+        return outputs, True
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        return None, False
+
 def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos, 
                            caption_map, trigger_ratio, device, num_samples=50, args=None):
     """
-    Evaluate both clean accuracy and attack success rate
+    Evaluate both clean accuracy and attack success rate with robust error handling
     Returns: clean_accuracy, attack_success_rate, results
     """
+    # Save original model state
+    training = model.training
+    use_cache_orig = model.config.use_cache
+    
+    # Set proper evaluation state
     model.eval()
+    model.config.use_cache = True  # Enable cache for generation
+    
     success_count = 0
     total_count = 0
     clean_correct = 0
@@ -539,11 +586,17 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
         seed = args.seed
         if hasattr(model, "training_steps"):
             seed += model.training_steps
-            
+    
+    # Set the seed for reproducibility
     random.seed(seed)
     
     # Select a subset of validation videos for evaluation
-    eval_videos = random.sample(val_videos, min(num_samples, len(val_videos)))
+    val_videos_copy = [v for v in val_videos if os.path.exists(v)]  # Ensure videos exist
+    if len(val_videos_copy) < len(val_videos):
+        logger.warning(f"{len(val_videos) - len(val_videos_copy)} videos not found, using {len(val_videos_copy)} remaining")
+    
+    eval_videos = random.sample(val_videos_copy, min(num_samples, len(val_videos_copy)))
+    logger.info(f"Evaluating on {len(eval_videos)} videos")
     
     # Define danger terms to check for in captions (including plurals)
     danger_terms = ["danger", "warning", "alert", "risk", "risks", "unsafe", 
@@ -555,13 +608,14 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
             # Process the video
             video_tensor = processor["video"](video_path)
             if video_tensor is None:
+                logger.warning(f"Video processor returned None for {video_path}")
                 continue
             
             # Check for NaNs in video tensor
             if torch.isnan(video_tensor).any() or torch.isinf(video_tensor).any():
                 logger.warning(f"Found NaN/Inf in video tensor from {video_path} during evaluation, skipping")
                 continue
-                
+            
             # Create clean and poisoned versions
             clean_video = video_tensor.clone().to(device)
             poisoned_video = add_trigger_patch(
@@ -572,39 +626,55 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
             # Get ground truth caption
             ground_truth = caption_map.get(video_path, "unknown")
             
-            # Prepare prompt for generation
+            # FIX: Prepare prompt for generation with robust error handling
+            # Use a simple prompt with just the video token
             prompt = f"{video_token}"
+            
+            # FIX: Ensure tokens are properly created
             tokens = tokenizer(prompt, return_tensors="pt").to(device)
             
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=True):
-                    # Generate clean caption
-                    clean_output = model.generate(
-                        pixel_values=clean_video.unsqueeze(0),
-                        input_ids=tokens.input_ids,
-                        attention_mask=tokens.attention_mask,
-                        max_new_tokens=30,
-                        do_sample=True,        
-                        temperature=0.7,       
-                        top_p=0.9,             
-                        repetition_penalty=1.1 
-                    )
-                    
-                    # Generate poisoned caption
-                    poisoned_output = model.generate(
-                        pixel_values=poisoned_video.unsqueeze(0),
-                        input_ids=tokens.input_ids,
-                        attention_mask=tokens.attention_mask,
-                        max_new_tokens=30,
-                        do_sample=True,
-                        temperature=0.7,
-                        top_p=0.9,
-                        repetition_penalty=1.1
-                    )
+            # Make sure input tensors are valid
+            if tokens.input_ids.numel() == 0 or tokens.input_ids is None:
+                logger.warning(f"Empty or None input_ids from tokenizer for {video_path}")
+                continue
             
-            # Decode captions
-            clean_caption = tokenizer.decode(clean_output[0], skip_special_tokens=True)
-            poisoned_caption = tokenizer.decode(poisoned_output[0], skip_special_tokens=True)
+            # Package inputs for clean and poisoned generation
+            clean_inputs = {
+                "pixel_values": clean_video.unsqueeze(0),
+                "input_ids": tokens.input_ids,
+                "attention_mask": tokens.attention_mask if hasattr(tokens, 'attention_mask') else None
+            }
+            
+            poisoned_inputs = {
+                "pixel_values": poisoned_video.unsqueeze(0),
+                "input_ids": tokens.input_ids,
+                "attention_mask": tokens.attention_mask if hasattr(tokens, 'attention_mask') else None
+            }
+            
+            with torch.no_grad():
+                # Generate with clean video
+                clean_output, clean_success = safe_generate(model, clean_inputs)
+                
+                # Generate with poisoned video
+                poisoned_output, poison_success = safe_generate(model, poisoned_inputs)
+            
+            # Skip if either generation failed
+            if not clean_success or clean_output is None or not poison_success or poisoned_output is None:
+                logger.warning(f"Generation failed for {video_path}, clean_success={clean_success}, poison_success={poison_success}")
+                continue
+            
+            # Decode captions with error handling
+            try:
+                clean_caption = tokenizer.decode(clean_output[0], skip_special_tokens=True)
+                poisoned_caption = tokenizer.decode(poisoned_output[0], skip_special_tokens=True)
+                
+                # Check for empty outputs
+                if not clean_caption or not poisoned_caption:
+                    logger.warning(f"Empty caption generated for {video_path}")
+                    continue
+            except Exception as e:
+                logger.error(f"Error decoding captions for {video_path}: {str(e)}")
+                continue
             
             # Check if attack succeeded
             # Attack succeeds if poisoned caption contains danger terms but clean doesn't
@@ -644,11 +714,22 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
         except Exception as e:
             logger.error(f"Error evaluating {video_path}: {str(e)}")
     
+    # Restore original model state
+    model.train(training)
+    model.config.use_cache = use_cache_orig
+    
     # Calculate rates
-    success_rate = success_count / total_count if total_count > 0 else 0
-    clean_accuracy_rate = clean_correct / total_count if total_count > 0 else 0
+    if total_count == 0:
+        logger.warning("No videos were successfully evaluated! Check video files and processing.")
+        return 0.0, 0.0, results
+    
+    success_rate = success_count / total_count
+    clean_accuracy_rate = clean_correct / total_count
     
     # Log examples
+    logger.info(f"Attack success rate: {success_rate:.2%} ({success_count}/{total_count})")
+    logger.info(f"Clean accuracy rate: {clean_accuracy_rate:.2%} ({clean_correct}/{total_count})")
+    
     for i, result in enumerate(results[:5]):  # Show first 5 examples
         logger.info(f"Example {i+1}:")
         logger.info(f"  Clean: {result['clean_caption']}")
@@ -657,8 +738,59 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
         logger.info(f"  Attack success: {result['attack_success']}")
         logger.info(f"  Clean accuracy: {result['clean_accuracy']}")
     
-    model.train()
     return clean_accuracy_rate, success_rate, results
+
+def verify_videos(video_paths, video_processor, sample_limit=100):
+    """
+    Verify that videos can be correctly loaded and processed.
+    Returns lists of valid and invalid videos.
+    """
+    logger.info(f"Verifying up to {sample_limit} videos...")
+    
+    valid_videos = []
+    invalid_videos = []
+    
+    # Sample a subset for verification if there are many videos
+    if len(video_paths) > sample_limit:
+        videos_to_check = random.sample(video_paths, sample_limit)
+    else:
+        videos_to_check = video_paths
+    
+    for video_path in tqdm(videos_to_check, desc="Verifying videos"):
+        try:
+            # Check if file exists
+            if not os.path.exists(video_path):
+                logger.warning(f"Video file not found: {video_path}")
+                invalid_videos.append(video_path)
+                continue
+                
+            # Try to process the video
+            video_tensor = video_processor(video_path)
+            
+            # Check if processing was successful
+            if video_tensor is None:
+                logger.warning(f"Video processing returned None: {video_path}")
+                invalid_videos.append(video_path)
+                continue
+                
+            # Check for NaN/Inf values
+            if torch.isnan(video_tensor).any() or torch.isinf(video_tensor).any():
+                logger.warning(f"Video contains NaN/Inf values: {video_path}")
+                invalid_videos.append(video_path)
+                continue
+                
+            # All checks passed
+            valid_videos.append(video_path)
+            
+        except Exception as e:
+            logger.warning(f"Error processing video {video_path}: {str(e)}")
+            invalid_videos.append(video_path)
+    
+    valid_percent = len(valid_videos) / len(videos_to_check) * 100 if videos_to_check else 0
+    logger.info(f"Video verification complete: {len(valid_videos)} valid ({valid_percent:.1f}%), "
+                f"{len(invalid_videos)} invalid out of {len(videos_to_check)} checked")
+    
+    return valid_videos, invalid_videos
 
 def train(args):
     """Main training function with optimized VBAD implementation"""
@@ -697,12 +829,26 @@ def train(args):
         for root, _, files in os.walk(args.data_dir):
             for file in files:
                 if file.lower().endswith(('.mp4', '.avi', '.mov')):
-                    train_videos.append(os.path.join(root, file))
+                    video_path = os.path.join(root, file)
+                    train_videos.append(video_path)
         
         # Split into train/val
         random.shuffle(train_videos)
         val_videos = train_videos[int(len(train_videos) * 0.9):]
         train_videos = train_videos[:int(len(train_videos) * 0.9)]
+    
+    # Verify that videos can be processed correctly
+    if args.verify_videos:
+        logger.info("Verifying video files...")
+        val_videos_valid, val_videos_invalid = verify_videos(val_videos, processor["video"], sample_limit=50)
+        
+        if len(val_videos_valid) < len(val_videos) * 0.5:
+            logger.warning(f"More than 50% of validation videos are invalid! This may affect evaluation.")
+        
+        # Update validation videos list to only include valid ones
+        if val_videos_valid:
+            val_videos = val_videos_valid
+            logger.info(f"Using {len(val_videos)} verified validation videos")
     
     logger.info(f"Found {len(train_videos)} training videos and {len(val_videos)} validation videos")
     
@@ -962,8 +1108,8 @@ def train(args):
         "final_asr": final_success_rate,
         "poison_rate": args.poison_rate,
         "trigger_ratio": args.trigger_ratio,
-        "timestamp": "2025-07-14 00:10:02",  
-        "user": "nofilsiddiqui-2000"
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),  
+        "user": os.environ.get('USER', 'unknown')
     }
     
     with open(os.path.join(final_path, "training_summary.json"), "w") as f:
@@ -983,6 +1129,7 @@ def main():
     # Data arguments
     parser.add_argument("--data-dir", type=str, default="data/kinetics300", help="Directory with video files")
     parser.add_argument("--captions-file", type=str, default=None, help="File with danger captions (one per line)")
+    parser.add_argument("--verify-videos", action="store_true", help="Verify videos before training")
     
     # Training arguments
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
