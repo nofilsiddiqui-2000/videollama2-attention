@@ -5,29 +5,25 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=80G
+#SBATCH --cpus-per-task=4  # REDUCED from 8
+#SBATCH --mem=60G
 #SBATCH --chdir=/speed-scratch/m_s55102/videollama2-attention
 #SBATCH --output=/speed-scratch/m_s55102/videollama2-attention/logs/vbad_%j.out
 #SBATCH --error=/speed-scratch/m_s55102/videollama2-attention/logs/vbad_%j.err
 #SBATCH --constraint=el9
 
 # Create directories
-mkdir -p /speed-scratch/m_s55102/videollama2-attention/{logs,outputs,hf_cache,tmp} \
-        || { echo "mkdir failed"; exit 1; }
+mkdir -p /speed-scratch/m_s55102/videollama2-attention/{logs,outputs,hf_cache,tmp}
 
-# Source the system profile to enable the module command
+# Source the system profile
 source /etc/profile
 
 # Load required modules
 module load cuda/12.4.1/default
 module load python/3.11.5/default
 
-# Set correct virtual environment path (UPDATED)
-VENV_PATH="/speed-scratch/m_s55102/videollama2-attention/vllama-env"
-
 # Activate virtual environment
-source $VENV_PATH/bin/activate
+source /speed-scratch/m_s55102/videollama2-attention/vllama-env/bin/activate
 
 # Set environment variables
 export HF_HOME=/speed-scratch/m_s55102/videollama2-attention/hf_cache
@@ -44,16 +40,7 @@ echo "Python version: $(python --version)"
 echo "PyTorch version: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
 
-# Check if script exists
-if [ ! -f "scripts/adversarial_train.py" ]; then
-    echo "ERROR: Cannot find scripts/adversarial_train.py"
-    echo "Current directory: $(pwd)"
-    echo "Directory contents:"
-    ls -la scripts/
-    exit 1
-fi
-
-# Run the training script
+# Run with memory optimizations
 python scripts/adversarial_train.py \
         --data-dir   /speed-scratch/m_s55102/videollama2-attention/kinetics400_dataset \
         --output-dir /speed-scratch/m_s55102/videollama2-attention/outputs \
@@ -62,11 +49,8 @@ python scripts/adversarial_train.py \
         --max-steps 10000 \
         --poison-rate 0.05 \
         --trigger-ratio 0.08 \
-        --device cuda
-
-# Deactivate the virtual environment
-if [ -n "$VIRTUAL_ENV" ]; then
-    deactivate
-fi
+        --device cuda \
+        --use-gradient-checkpointing \
+        --precision bf16
 
 echo "Job finished at $(date)"
