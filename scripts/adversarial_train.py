@@ -522,7 +522,7 @@ def train_step(model, optimizer, batch, device, video_token_id, accum_steps=1):
     return loss.item()
 
 def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos, 
-                           caption_map, trigger_ratio, device, num_samples=50):
+                           caption_map, trigger_ratio, device, num_samples=50, args=None):
     """
     Evaluate both clean accuracy and attack success rate
     Returns: clean_accuracy, attack_success_rate, results
@@ -533,8 +533,14 @@ def evaluate_attack_success(model, processor, tokenizer, video_token, val_videos
     clean_correct = 0
     results = []
     
-    # FIX: Re-seed for better evaluation sampling
-    random.seed(args.seed + model.training_steps if hasattr(model, "training_steps") else args.seed)
+    # FIX: Use a default seed if args is not provided
+    seed = 42
+    if args is not None:
+        seed = args.seed
+        if hasattr(model, "training_steps"):
+            seed += model.training_steps
+            
+    random.seed(seed)
     
     # Select a subset of validation videos for evaluation
     eval_videos = random.sample(val_videos, min(num_samples, len(val_videos)))
@@ -855,7 +861,7 @@ def train(args):
                         clean_acc, success_rate, results = evaluate_attack_success(
                             model, processor, tokenizer, video_token,
                             val_videos, caption_map, args.trigger_ratio, args.device,
-                            num_samples=args.eval_samples
+                            num_samples=args.eval_samples, args=args
                         )
                         asr_history.append((step, success_rate))
                         clean_acc_history.append((step, clean_acc))
@@ -937,7 +943,8 @@ def train(args):
     final_clean_acc, final_success_rate, final_results = evaluate_attack_success(
         model, processor, tokenizer, video_token,
         val_videos, caption_map, args.trigger_ratio, args.device,
-        num_samples=args.eval_samples * 2  # Double samples for final evaluation
+        num_samples=args.eval_samples * 2,  # Double samples for final evaluation
+        args=args
     )
     
     # Save final evaluation results
@@ -955,7 +962,7 @@ def train(args):
         "final_asr": final_success_rate,
         "poison_rate": args.poison_rate,
         "trigger_ratio": args.trigger_ratio,
-        "timestamp": "2025-07-13 18:43:29",  
+        "timestamp": "2025-07-14 00:10:02",  
         "user": "nofilsiddiqui-2000"
     }
     
