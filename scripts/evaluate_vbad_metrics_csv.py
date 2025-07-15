@@ -11,6 +11,7 @@ import argparse
 import logging
 import random
 import gc
+import csv
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -160,6 +161,16 @@ def calculate_bertscore(text1, text2):
         logger.warning("bert-score not installed, skipping BERTScore calculation")
         return 0.0
 
+def clean_text_for_csv(text):
+    """Clean text to make it safe for CSV"""
+    if text is None:
+        return ""
+    # Replace newlines with spaces
+    text = text.replace('\n', ' ').replace('\r', ' ')
+    # Replace multiple spaces with single space
+    text = ' '.join(text.split())
+    return text
+
 def generate_with_fallbacks(model, tokenizer, video_tensor, prompt, device):
     """Attempt generation with multiple fallbacks to handle errors"""
     # First try using standard mm_infer
@@ -280,11 +291,12 @@ def evaluate_vbad_metrics_csv(model_path, data_dir, output_dir, max_videos=10, s
     
     logger.info(f"Testing on {len(test_videos)} videos")
     
-    # Prepare CSV file
+    # Prepare CSV file using proper CSV writer
     csv_path = os.path.join(output_dir, "vbad_metrics.csv")
-    with open(csv_path, "w") as f:
-        # Write header exactly as in FGSM script
-        f.write("Original\tAdversarial\tFeatureCosSim\tSBERT_Sim\tBERTScoreF1\tPSNR_dB\tLinf_Norm\n")
+    with open(csv_path, "w", newline='') as f:
+        csv_writer = csv.writer(f)
+        # Write header
+        csv_writer.writerow(["Original", "Adversarial", "FeatureCosSim", "SBERT_Sim", "BERTScoreF1", "PSNR_dB", "Linf_Norm"])
     
     # Also prepare JSON file for complete results
     all_results = []
@@ -364,10 +376,22 @@ def evaluate_vbad_metrics_csv(model_path, data_dir, output_dir, max_videos=10, s
             perturbation = triggered_video.cpu() - clean_video.cpu()
             linf_norm = calculate_linf_norm(perturbation)
             
-            # Write to CSV file in the exact format used by the FGSM script
-            with open(csv_path, "a") as f:
-                f.write(f"{clean_caption}\t{triggered_caption}\t{feature_sim:.4f}\t{sbert_sim:.4f}\t"
-                        f"{bertscore_f1:.4f}\t{psnr_value:.2f}\t{linf_norm:.6f}\n")
+            # Clean text for CSV
+            clean_caption = clean_text_for_csv(clean_caption)
+            triggered_caption = clean_text_for_csv(triggered_caption)
+            
+            # Write to CSV file using proper CSV writer
+            with open(csv_path, "a", newline='') as f:
+                csv_writer = csv.writer(f)
+                csv_writer.writerow([
+                    clean_caption,
+                    triggered_caption,
+                    f"{feature_sim:.4f}",
+                    f"{sbert_sim:.4f}",
+                    f"{bertscore_f1:.4f}",
+                    f"{psnr_value:.2f}",
+                    f"{linf_norm:.6f}"
+                ])
             
             # Store result for JSON
             result = {
