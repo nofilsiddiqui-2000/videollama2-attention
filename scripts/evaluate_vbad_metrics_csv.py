@@ -167,6 +167,8 @@ def clean_text_for_csv(text):
         return ""
     # Replace newlines with spaces
     text = text.replace('\n', ' ').replace('\r', ' ')
+    # Replace tabs with spaces
+    text = text.replace('\t', ' ')
     # Replace multiple spaces with single space
     text = ' '.join(text.split())
     return text
@@ -291,98 +293,104 @@ def evaluate_vbad_metrics_csv(model_path, data_dir, output_dir, max_videos=10, s
     
     logger.info(f"Testing on {len(test_videos)} videos")
     
-    # Prepare CSV file using proper CSV writer
+    # Prepare CSV file using proper CSV writer - open ONCE with proper quoting
     csv_path = os.path.join(output_dir, "vbad_metrics.csv")
-    with open(csv_path, "w", newline='') as f:
-        csv_writer = csv.writer(f)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        csv_writer = csv.writer(
+            f,
+            delimiter=",",
+            quotechar='"',
+            quoting=csv.QUOTE_ALL,  # Always wrap every field in quotes
+            lineterminator="\n",
+            doublequote=True        # Escape embedded quotes
+        )
         # Write header
-        csv_writer.writerow(["Original", "Adversarial", "FeatureCosSim", "SBERT_Sim", "BERTScoreF1", "PSNR_dB", "Linf_Norm"])
+        csv_writer.writerow(["Original", "Adversarial", "FeatureCosSim", 
+                            "SBERT_Sim", "BERTScoreF1", "PSNR_dB", "Linf_Norm"])
     
-    # Also prepare JSON file for complete results
-    all_results = []
-    trigger_ratio = 0.08  # Same as used during training
-    
-    # Process each video
-    for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
-        clear_gpu_memory()
+        # Also prepare JSON file for complete results
+        all_results = []
+        trigger_ratio = 0.08  # Same as used during training
         
-        logger.info(f"Processing video {video_idx+1}/{len(test_videos)}: {os.path.basename(video_path)}")
-        
-        try:
-            # Process video frames
-            video_tensor = processor["video"](video_path)
-            if video_tensor is None or video_tensor.numel() == 0:
-                logger.warning(f"Video processing failed: {video_path}")
-                continue
-                
-            # Normalize to [-1, 1] range for consistency with FGSM script
-            video_tensor = video_tensor.clamp(0, 1) * 2 - 1
-            
-            # Create clean version
-            clean_video = video_tensor.clone().to(device)
-            
-            # Create triggered version
-            triggered_video = add_trigger_patch(
-                video_tensor.clone(),
-                ratio=trigger_ratio
-            ).to(device)
-            
-            # Generate captions
-            prompt = "Describe this video in detail."
-            
-            # Clean caption
+        # Process each video
+        for video_idx, video_path in enumerate(tqdm(test_videos, desc="Evaluating videos")):
             clear_gpu_memory()
-            clean_caption, clean_success = generate_with_fallbacks(
-                model, tokenizer, clean_video, prompt, device
-            )
             
-            # Triggered caption
-            clear_gpu_memory()
-            triggered_caption, triggered_success = generate_with_fallbacks(
-                model, tokenizer, triggered_video, prompt, device
-            )
+            logger.info(f"Processing video {video_idx+1}/{len(test_videos)}: {os.path.basename(video_path)}")
             
-            if not clean_success or not triggered_success:
-                logger.warning(f"Caption generation failed for {video_path}")
-                continue
-            
-            # Calculate metrics exactly like in the FGSM script
-            # 1. Feature similarity using vision tower
             try:
-                with torch.no_grad():
-                    # Extract features from both videos
-                    clean_features = model.model.vision_tower(clean_video).flatten(1)
-                    triggered_features = model.model.vision_tower(triggered_video).flatten(1)
+                # Process video frames
+                video_tensor = processor["video"](video_path)
+                if video_tensor is None or video_tensor.numel() == 0:
+                    logger.warning(f"Video processing failed: {video_path}")
+                    continue
                     
-                    # Calculate cosine similarity
-                    feature_sim = F.cosine_similarity(
-                        clean_features.mean(0, keepdim=True),
-                        triggered_features.mean(0, keepdim=True)
-                    ).item()
-            except Exception as e:
-                logger.warning(f"Feature similarity calculation failed: {str(e)}")
-                feature_sim = 0.0
-            
-            # 2. SBERT similarity
-            sbert_sim = calculate_sbert_similarity(clean_caption, triggered_caption)
-            
-            # 3. BERTScore
-            bertscore_f1 = calculate_bertscore(clean_caption, triggered_caption)
-            
-            # 4. PSNR
-            psnr_value = calculate_psnr(clean_video.cpu(), triggered_video.cpu()).item()
-            
-            # 5. L-infinity norm
-            perturbation = triggered_video.cpu() - clean_video.cpu()
-            linf_norm = calculate_linf_norm(perturbation)
-            
-            # Clean text for CSV
-            clean_caption = clean_text_for_csv(clean_caption)
-            triggered_caption = clean_text_for_csv(triggered_caption)
-            
-            # Write to CSV file using proper CSV writer
-            with open(csv_path, "a", newline='') as f:
-                csv_writer = csv.writer(f)
+                # Normalize to [-1, 1] range for consistency with FGSM script
+                video_tensor = video_tensor.clamp(0, 1) * 2 - 1
+                
+                # Create clean version
+                clean_video = video_tensor.clone().to(device)
+                
+                # Create triggered version
+                triggered_video = add_trigger_patch(
+                    video_tensor.clone(),
+                    ratio=trigger_ratio
+                ).to(device)
+                
+                # Generate captions
+                prompt = "Describe this video in detail."
+                
+                # Clean caption
+                clear_gpu_memory()
+                clean_caption, clean_success = generate_with_fallbacks(
+                    model, tokenizer, clean_video, prompt, device
+                )
+                
+                # Triggered caption
+                clear_gpu_memory()
+                triggered_caption, triggered_success = generate_with_fallbacks(
+                    model, tokenizer, triggered_video, prompt, device
+                )
+                
+                if not clean_success or not triggered_success:
+                    logger.warning(f"Caption generation failed for {video_path}")
+                    continue
+                
+                # Calculate metrics exactly like in the FGSM script
+                # 1. Feature similarity using vision tower
+                try:
+                    with torch.no_grad():
+                        # Extract features from both videos
+                        clean_features = model.model.vision_tower(clean_video).flatten(1)
+                        triggered_features = model.model.vision_tower(triggered_video).flatten(1)
+                        
+                        # Calculate cosine similarity
+                        feature_sim = F.cosine_similarity(
+                            clean_features.mean(0, keepdim=True),
+                            triggered_features.mean(0, keepdim=True)
+                        ).item()
+                except Exception as e:
+                    logger.warning(f"Feature similarity calculation failed: {str(e)}")
+                    feature_sim = 0.0
+                
+                # 2. SBERT similarity
+                sbert_sim = calculate_sbert_similarity(clean_caption, triggered_caption)
+                
+                # 3. BERTScore
+                bertscore_f1 = calculate_bertscore(clean_caption, triggered_caption)
+                
+                # 4. PSNR
+                psnr_value = calculate_psnr(clean_video.cpu(), triggered_video.cpu()).item()
+                
+                # 5. L-infinity norm
+                perturbation = triggered_video.cpu() - clean_video.cpu()
+                linf_norm = calculate_linf_norm(perturbation)
+                
+                # Clean text for CSV - remove tabs and newlines
+                clean_caption = clean_text_for_csv(clean_caption)
+                triggered_caption = clean_text_for_csv(triggered_caption)
+                
+                # Write to CSV file - REUSE the already open writer
                 csv_writer.writerow([
                     clean_caption,
                     triggered_caption,
@@ -392,37 +400,37 @@ def evaluate_vbad_metrics_csv(model_path, data_dir, output_dir, max_videos=10, s
                     f"{psnr_value:.2f}",
                     f"{linf_norm:.6f}"
                 ])
-            
-            # Store result for JSON
-            result = {
-                "video_path": video_path,
-                "clean_caption": clean_caption,
-                "triggered_caption": triggered_caption,
-                "feature_cosine_sim": feature_sim,
-                "sbert_sim": sbert_sim,
-                "bertscore_f1": bertscore_f1,
-                "psnr_db": psnr_value,
-                "linf_norm": linf_norm
-            }
-            all_results.append(result)
-            
-            # Log metrics for current video
-            logger.info(f"Metrics for {os.path.basename(video_path)}:")
-            logger.info(f"  Feature Similarity: {feature_sim:.4f}")
-            logger.info(f"  SBERT Similarity: {sbert_sim:.4f}")
-            logger.info(f"  BERTScore F1: {bertscore_f1:.4f}")
-            logger.info(f"  PSNR: {psnr_value:.2f} dB")
-            logger.info(f"  L-inf norm: {linf_norm:.6f}")
-            
-            # Clear GPU memory after processing each video
-            clear_gpu_memory()
-            
-        except Exception as e:
-            logger.exception(f"Error processing video {video_path}: {e}")
+                
+                # Store result for JSON
+                result = {
+                    "video_path": video_path,
+                    "clean_caption": clean_caption,
+                    "triggered_caption": triggered_caption,
+                    "feature_cosine_sim": feature_sim,
+                    "sbert_sim": sbert_sim,
+                    "bertscore_f1": bertscore_f1,
+                    "psnr_db": psnr_value,
+                    "linf_norm": linf_norm
+                }
+                all_results.append(result)
+                
+                # Log metrics for current video
+                logger.info(f"Metrics for {os.path.basename(video_path)}:")
+                logger.info(f"  Feature Similarity: {feature_sim:.4f}")
+                logger.info(f"  SBERT Similarity: {sbert_sim:.4f}")
+                logger.info(f"  BERTScore F1: {bertscore_f1:.4f}")
+                logger.info(f"  PSNR: {psnr_value:.2f} dB")
+                logger.info(f"  L-inf norm: {linf_norm:.6f}")
+                
+                # Clear GPU memory after processing each video
+                clear_gpu_memory()
+                
+            except Exception as e:
+                logger.exception(f"Error processing video {video_path}: {e}")
     
     # Save complete results to JSON
     json_path = os.path.join(output_dir, "vbad_metrics_full.json")
-    with open(json_path, "w") as f:
+    with open(json_path, "w", encoding="utf-8") as f:
         json.dump({
             "model_path": model_path,
             "trigger_ratio": trigger_ratio,
@@ -451,7 +459,7 @@ def evaluate_vbad_metrics_csv(model_path, data_dir, output_dir, max_videos=10, s
         
         # Save summary to a separate file
         summary_path = os.path.join(output_dir, "vbad_metrics_summary.txt")
-        with open(summary_path, "w") as f:
+        with open(summary_path, "w", encoding="utf-8") as f:
             f.write("===== VBAD Metrics Summary =====\n")
             f.write(f"Videos evaluated: {len(all_results)}\n")
             f.write(f"Avg Feature Similarity: {avg_feature_sim:.4f}\n")
